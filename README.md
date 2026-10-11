@@ -587,6 +587,7 @@ cargo build --release
 |---|---|
 | [CONTRIBUTING.md](CONTRIBUTING.md) | **改这个仓库的人** —— 构建、测试、打包、编码规范都在这一份里 |
 | [CHANGELOG.md](CHANGELOG.md) | **踩过的坑** —— 现象 → 根因，按症状查 |
+| [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) | 第三方依赖声明（发布时随包分发） |
 | [docs/README.md](docs/README.md) | **设计与计划文档的索引** |
 
 最常被翻的几份：
