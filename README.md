@@ -2,7 +2,13 @@
 
 在游戏里按一个键，队友就听到你选的那段音频——同时你的真实说话声完全不受影响。
 
-**当前状态**：macOS 端**图形界面已跑通** —— 多路音效 + 全局热键 + 实时混音 + 端到端自检。
+**当前状态**
+
+| 平台 | 状态 |
+|---|---|
+| **macOS** | ✅ **已跑通** —— 多路音效 + 全局热键 + 实时混音 + 端到端自检 |
+| **Windows** | ⚠️ **代码就绪，但一次都没运行过** —— 见 [Windows 版](#windows-版代码就绪未实测) |
+
 命令行版与 GUI 共用同一套音频内核。
 
 ---
@@ -22,13 +28,47 @@
 
 ---
 
-## 图形界面（推荐）
+## 构建与运行
+
+### macOS
 
 ```bash
-cd apps/mixer-gui
-../../node_modules/.bin/tauri build          # 产出 .app
-open ../../target/release/bundle/macos/音效板.app
+npm install                        # 只为了拿 Tauri CLI
+./apps/mixer-gui/build-app.sh      # 编译 + 重新签名 + 打 DMG
+open target/release/bundle/macos/音效板.app
 ```
+
+> ⚠️ **必须走 `build-app.sh`，不要直接 `tauri build`。**
+> `tauri build` 合并 Info.plist 后原有签名会失效，而 **TCC 权限绑定代码签名** ——
+> 签名坏了拿不到麦克风权限，表现为"录音全是零、不报错"。
+> 脚本会自动重新签名并校验（签名 / 用途说明 / entitlement / DMG 内一致性），
+> 缺一条直接构建失败。详见[下面那一节](#-签名方式会改变权限行为这条我改错过两次第三次才对)。
+
+### Windows
+
+**在 Windows 机器上**：
+
+```powershell
+npm install
+powershell -ExecutionPolicy Bypass -File apps\mixer-gui\build-app-windows.ps1
+```
+
+脚本自带环境检查（Rust / Node / **WebView2 运行时**）、冒烟测试、NSIS 产物校验，
+以及装完之后怎么配 VB-CABLE 的指引。跑完得到
+`target\release\bundle\nsis\音效板_0.1.0_x64-setup.exe`。
+
+**在 macOS 上不能构建 Windows 版**（实测过，不是推断）：
+
+| 步骤 | 能否 | 卡在哪 |
+|---|---|---|
+| 编译出 `.exe` | ❌ | 缺 `link.exe`（MSVC 链接器，随 Visual Studio 发布） |
+| 打 NSIS 安装包 | ❌ | Tauri 在非 Windows 宿主上**静默跳过**（实测退出码 0、什么都不产出） |
+| 打 MSI | ❌ | WiX 是 .NET + Windows 专有 |
+
+能做的只有**类型检查**（`tools/win-cross-check.sh`，用桩替掉 `llvm-rc`，
+因为 `cargo check` 不链接）。详见 [Windows 版](#windows-版代码就绪未实测)。
+
+### 图形界面（推荐）
 
 界面：顶栏状态灯 + 运行时长；设置区（设备、音效来源、热键、增益，**运行中改增益立即生效**）；
 音效卡片网格（点击或数字键 1-9 触发，播放中高亮并显示进度条）；底栏实时指标（水位/欠载/溢出/限幅）。
@@ -266,6 +306,14 @@ cargo build --release
 
 ### 自检
 
+先跑 `mixer doctor`（秒出、不动音频设备）确认"该有的东西都在"，
+再跑 `mixer selftest` 验证"链路通不通"。分工如下：
+
+| 命令 | 查什么 | 代价 |
+|---|---|---|
+| `mixer doctor` | 设备在不在、虚拟声卡装没装、配置里的设备/文件还在不在、热键配没配 | 秒出，不碰音频 |
+| `mixer selftest` | 送已知信号进虚拟设备，从环回录回来量频率/时长/电平 | 要开音频，两三秒 |
+
 `mixer selftest` 把一段已知的 440Hz 正弦送进虚拟设备，再从它的环回输入侧录回来，
 核对**频率、时长、电平**三项。这是唯一能抓住"只在真实设备上出现"那类故障的手段 ——
 开发中确实遇到过一个：引擎交给声卡的数据完全正确（440Hz），设备实际输出却是 872Hz。
@@ -278,6 +326,98 @@ MIXER_DUMP=/tmp/out.f32 MIXER_DUMP_FRAMES=300000 ./target/release/mixer play --f
 ```
 
 ---
+
+## Windows 版（代码就绪，未实测）
+
+### 交付物的准确说法
+
+**目前没有 Windows 产物。** 存在的是源码 + 配置 + 一个从未运行过的构建脚本：
+
+| | 状态 |
+|---|---|
+| Windows 源码改动 | ✅ 8/8 crate 交叉编译通过（**类型检查级别**） |
+| NSIS 打包配置 | ✅ 通过 Tauri 官方 JSON schema 校验；图标是合法的 6 尺寸 ICO |
+| `build-app-windows.ps1` | ✅ 存在，**从未运行过** |
+| **Windows 可执行文件** | ❌ |
+| **NSIS 安装包** | ❌ |
+| **在 Windows 上运行过任何一次** | ❌ |
+
+「交叉编译通过」的含义要说清楚：`cargo check` **只做类型检查，不生成二进制**。
+`target/x86_64-pc-windows-msvc/debug/` 是空的。它证明的是"代码能编译"，
+**不是**"有个 exe"。
+
+### macOS 上为什么构建不了（实测，非推断）
+
+用一个最小工程排除 Tauri 干扰后直接试：
+
+```
+error: linker `link.exe` not found
+  = note: the msvc targets depend on the msvc linker
+  = note: please ensure that Visual Studio 2017 or later ... were installed
+```
+
+| 步骤 | 能否 | 卡在哪 |
+|---|---|---|
+| 编译出 `.exe` | ❌ | `link.exe` 随 Visual Studio 发布，macOS 上**无法获得** |
+| 打 NSIS 安装包 | ❌ | 实测 `tauri build --bundles nsis` 在 macOS 上**静默跳过**：编译完、退出码 0、无任何报错、不产出安装包 |
+| 打 MSI | ❌ | WiX 是 .NET + Windows 专有 |
+
+唯一理论上的口子是 mingw-w64（`brew` 可得）+ `--target x86_64-pc-windows-gnu`，
+但 Tauri 的 Windows 分发不以 `-gnu` 为目标，而且**即使打出来也验证不了** ——
+不能运行、不能测音频、不能按热键。那正是本项目反复在避免的"看起来做了"。
+
+### 两边复用了多少
+
+**音频引擎一行没改。** `crates/audio-core`（混音、重采样、限幅、解码）
+为 Windows 编译时**零改动通过** —— 这是当初选「纯环回架构 + 后端隔离」的回报：
+换平台只需要换 `backend-cpal` 和驱动，引擎、界面全部复用。
+
+界面（`apps/mixer-gui/dist/`）是**纯静态、两端完全相同**，差异由后端按平台下发
+（比如 Windows 推 VB-CABLE、给出「命名是反的」警告；macOS 推 BlackHole）。
+
+### 移植过程中挖出来的三个真 bug
+
+这三个都是**只在 Windows 上才会犯、在 macOS 上完全看不见**的：
+
+1. **配置路径会跑到当前工作目录** —— `HOME` / `XDG_CONFIG_HOME` 在 Windows 上都不存在，
+   旧实现一路回退到 `"."`。GUI 的 CWD 不可预测，用户看到的是"改完设置下次打开就没了"
+2. **设备掉线检测会卡死** —— 非 macOS 分支用了 cpal 枚举设备，
+   而紧邻的注释里明写着"**绝对不能**这么干（实测卡死）"。那个兜底分支从没被走到过
+3. **`is_main_thread()` 是个返回 `true` 的桩** —— 会让热键建在 tokio 工作线程上，
+   而那个线程不泵消息 → `WM_HOTKEY` 永不派发 → **热键完全失效且不报错**
+
+第 3 个最典型：它不是"没写"，是"写了个看起来处理了的桩"，
+**比没有更危险**。这也解释了为什么移植过程里持续在做同一件事：
+**把看不见的分支变成看得见、能测的**（96 个单测里有 21 个跑在 macOS 上、验的是 Windows 分支）。
+
+### 到 Windows 上怎么验
+
+```powershell
+npm install
+powershell -ExecutionPolicy Bypass -File apps\mixer-gui\build-app-windows.ps1
+```
+
+装完之后**先跑这两条**，不用进游戏就能把环境问题和代码问题分开：
+
+```
+mixer doctor      # 环境体检：设备、虚拟声卡、配置、文件、热键
+mixer selftest    # 链路自检：送信号进虚拟设备，从环回录回来验频率
+```
+
+`doctor` 查"该有的东西在不在"（秒出、不动音频设备），
+`selftest` 验证"链路通不通"（要开音频、两三秒）。两条都是原生命令，两端通用。
+
+### 已知会在首次实测时暴露问题的点
+
+诚实列出来，免得把"编译通过"当成"能用"：
+
+- `Hotkeys` 的 `unsafe impl Send` **只在代码层面论证过**，真实注册/注销没跑过
+- Windows 上容器**故意泄漏**管理器（避免跨线程 `DestroyWindow`），泄漏量很小但没实测
+- 托盘图标、关窗不退的行为在 Windows 上未确认
+- VB-CABLE 到底是 16 位还是 32 位、采样率多少 —— **没见过真机**
+- NSIS 安装包从未构建过
+- 「切回真实麦克风」在 Windows 上**没有**（有意为之：那个功能是回滚 macOS 流程
+  改过的系统默认设备，而 Windows 流程压根不改系统设置）
 
 ## 项目结构
 
@@ -301,12 +441,17 @@ apps/mixer-gui/             Tauri 图形界面
   └── dist/                 纯静态前端（无打包器，靠 withGlobalTauri 调 Rust 命令）
 
 apps/mixer-cli/             命令行入口（与 GUI 共用音频内核）
-  ├── config.rs             配置读写（手写解析器，零依赖）
-  ├── remote.rs             手机遥控：局域网 HTTP 触发
-  └── selftest.rs           端到端自检：送已知信号，从环回量回来
+
+crates/remote/              手机遥控：局域网 HTTP 触发 + 二维码
+crates/selftest/            端到端自检：送已知信号，从环回量回来
 
 m0/                         M0 可行性验证的素材与工具（已结项）
+
+tools/                      跨平台的开发工具（见「开发」一节）
 ```
+
+> 配置、遥控、自检原先都塞在 `apps/mixer-cli/` 里，后来抽成了独立 crate ——
+> 因为 GUI 也要用同一套，放在 CLI 下会形成反向依赖。
 
 ### 为什么这样分层
 
@@ -549,11 +694,16 @@ m0/tools/app_verify.sh      # 用 open 启动（等同双击），检查 11 项
 - ✅ **音效库**：增删改查 / 自定义显示名 / 标签 / 搜索（支持中文逗号、顿号）
 - ✅ **监听**（触发的音效同时放给自己听，三条触发路径都生效）
 - ✅ **「停止」= 待机**：只关音效，**麦克风继续转发** —— 队友不会因为你点了停止就听不到你
-- ✅ **虚拟声卡缺失时的安装引导**（检测不到就给出 BlackHole 的 brew 命令，一键复制）
+- ✅ **虚拟声卡缺失时的安装引导**（**按平台**给：macOS 推 BlackHole + brew 命令，
+  Windows 推 VB-CABLE + 「命名是反的」警告，一键复制）
 - ✅ **麦克风电平校准**（测 5 秒 → 算出该补多少增益 → 应用，省得来回拖滑杆试）
 - ✅ **设备热插拔**（麦克风/虚拟声卡掉了会检测到，自动换到系统默认并报警）
-- ✅ **一键切回真实麦克风**（改回系统默认输入，不用进游戏设置里翻）
+- ✅ **一键切回真实麦克风**（改回系统默认输入，不用进游戏设置里翻）—— **macOS 独有**，
+  Windows 流程不改系统设置所以不需要，原因见 [Windows 版](#windows-版代码就绪未实测)
 - ✅ **前端错误上报**（打包后没有控制台，JS 异常会送回后端打日志）
+- ✅ **崩溃防护**（`panic` 不再杀进程；音频回调内 `catch_unwind` 防止跨 FFI 边界；
+  panic 落盘 `~/Library/Logs/音效板/panic.log`；音频看门狗 —— 回调停 3 秒自动重启）
+- ✅ **环境体检 `mixer doctor`**（设备 / 虚拟声卡 / 配置 / 文件 / 热键，两端通用）
 
 ## 尚未实现
 
@@ -563,16 +713,45 @@ m0/tools/app_verify.sh      # 用 open 启动（等同双击），检查 11 项
 - ⬜ 语音应用配置引导（内置各游戏/语音软件的设置步骤）
 - ⬜ 诊断报告导出
 - ⬜ 稳定性五层防御（launchd 保活 / 看门狗系统通知 / 音频与 UI 进程隔离）
-- ⬜ Windows 后端实测
+- ⬜ **Windows 运行期实测**（代码就绪、8/8 crate 交叉编译通过，但**一次都没运行过**；
+  需要一台 Windows 机器，见 [Windows 版](#windows-版代码就绪未实测)）
+- ⬜ Windows 上「设为默认通信设备」（需要未公开的 `IPolicyConfig` COM，超出当前范围）
 
 ---
 
 ## 开发
 
+**提交前跑这一条就够了：**
+
 ```bash
-cargo test --workspace      # 68 个单元测试
-cargo build --release
+tools/check-all.sh          # 全部检查
+tools/check-all.sh --fast   # 只跑静态 + 单元测试（约 8 秒，不碰音频设备）
 ```
+
+当前结果：
+
+```
+静态：格式 ✅ · clippy 0 条 ✅ · 打包配置 schema ✅
+逻辑：单元测试 96 个 ✅
+端到端：打包 ✅ · 冒烟 37 项 ✅ · 音频自检 ✅ · 环境体检 ✅
+        双击路径 11/11 ✅ · Windows 交叉编译 ✅
+```
+
+### tools/ 里都是什么
+
+| 工具 | 作用 |
+|---|---|
+| `check-all.sh` | 一条命令跑完上面所有检查；`--fast` 跳过端到端 |
+| `check-tauri-config.sh` | 用 **Tauri 官方 JSON schema** 校验打包配置 |
+| `win-cross-check.sh` | Windows 交叉**类型检查**（用桩替掉 `llvm-rc`） |
+| `gen-third-party-notices.py` | 生成 `THIRD-PARTY-NOTICES.md` |
+
+其中前两个解决的是同一类问题：**错误只在"另一个平台/另一个时刻"才暴露**。
+
+- 打包配置写错（键名拼错、枚举值写错）在 macOS 上**完全不会报错** ——
+  那些字段只在真正构建对应平台时才被用到
+- Windows 分支的代码在 macOS 上**完全不可见** —— 交叉编译是唯一能提前发现的手段
+  （实测抓到过两次：我自己的 `Ordering` 未导入，以及一个会让热键完全失效的桩函数）
 
 构建环境（国内网络）：
 
