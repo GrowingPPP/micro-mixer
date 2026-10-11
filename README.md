@@ -583,13 +583,18 @@ cargo build --release
 
 ## 文档
 
+| 文档 | 给谁看 |
+|---|---|
+| [CONTRIBUTING.md](CONTRIBUTING.md) | **改这个仓库的人** —— 构建、测试、打包、编码规范都在这一份里 |
+| [CHANGELOG.md](CHANGELOG.md) | **踩过的坑** —— 现象 → 根因，按症状查 |
+| [docs/README.md](docs/README.md) | **设计与计划文档的索引** |
+
+最常被翻的几份：
+
 | 文档 | 内容 |
 |---|---|
-| [CHANGELOG.md](CHANGELOG.md) | **更新日志 —— 重点记录了踩过的坑与当时的错误判断** |
-| [任务清单.md](docs/planning/任务清单.md) | 逐条可勾选的执行任务 |
 | [技术设计-音频架构与驱动.md](docs/engineering/技术设计-音频架构与驱动.md) | 架构决策、设备拓扑、延迟预算、稳定性设计 |
+| [验证台账.md](docs/engineering/验证台账.md) | **每条结论背后的证据强度**（A/B/C/D 四级） |
+| [任务清单.md](docs/planning/任务清单.md) | 逐条可执行的计划与当前进度 |
 | [产品设计-交互与功能规格.md](docs/product/产品设计-交互与功能规格.md) | 界面、流程、PRD 级功能规格 |
-| [产品方案-Windows与macOS.md](docs/product/产品方案-Windows与macOS.md) | 市场、竞品、定位、风险 |
-| [音频注入麦克风-可行性分析.md](docs/engineering/音频注入麦克风-可行性分析.md) | 平台可行性矩阵 |
-| [M0验证方案.md](docs/planning/M0验证方案.md) · [m0/M0-执行手册.md](docs/planning/M0-执行手册.md) | 可行性验证实验（已结项，H1 成立） |
-| [商业与执行-分发获客与定价.md](docs/product/商业与执行-分发获客与定价.md) | 分发与定价（暂缓） |
+| [M0验证方案.md](docs/planning/M0验证方案.md) | 可行性验证实验（已结项，H1 成立 → GO） |
