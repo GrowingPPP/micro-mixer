@@ -31,10 +31,22 @@ if ! command -v cargo >/dev/null 2>&1; then
 fi
 command -v cargo >/dev/null 2>&1 || { echo "找不到 cargo，请先安装 Rust"; exit 1; }
 
-echo "── 1/3 打包 ──"
+echo "── 1/4 打包 ──"
 ../../node_modules/.bin/tauri build "$@"
 
 APP="../../target/release/bundle/macos/音效板.app"
+
+# ── 把许可证放进 .app ──
+#
+# ⚠️ 必须在**签名之前**做。往已签名的 bundle 里加文件会让签名失效，
+#    而 TCC 权限绑定签名 —— 结果是装上去麦克风录到全零，且不报错。
+#
+# 放 Contents/Resources/ 是 macOS 的惯例（许可证要随二进制一起分发）。
+REPO_ROOT="$(cd ../.. && pwd)"
+mkdir -p "$APP/Contents/Resources"
+cp "$REPO_ROOT/LICENSE" "$APP/Contents/Resources/LICENSE"
+cp "$REPO_ROOT/THIRD-PARTY-NOTICES.md" "$APP/Contents/Resources/THIRD-PARTY-NOTICES.md"
+echo "  已放入 LICENSE 与第三方声明"
 
 echo "── 2/4 重新签名 ──"
 
@@ -113,6 +125,9 @@ STAGE=$(mktemp -d)
 cp -R "$APP" "$STAGE/"
 # 拖拽安装的惯例：旁边放一个 Applications 的快捷方式
 ln -s /Applications "$STAGE/Applications"
+# 盘上再摆一份，用户不用进 app 包就能看到
+cp "$REPO_ROOT/LICENSE" "$STAGE/LICENSE"
+cp "$REPO_ROOT/THIRD-PARTY-NOTICES.md" "$STAGE/第三方依赖声明.md"
 
 # 没公证的 App 直接双击会被 Gatekeeper 拦，用户不知道怎么办 —— 写在盘里
 cat > "$STAGE/首次打开请看这里.txt" <<'NOTE'
@@ -166,8 +181,13 @@ fi
 
 DMG_OK=1
 [ -d "$MP/音效板.app" ] && echo "  ✅ 里面有 App" || { echo "  ❌ 没有 App"; DMG_OK=0; }
+[ -f "$MP/音效板.app/Contents/Resources/LICENSE" ] \
+  && echo "  ✅ App 包内含 LICENSE" \
+  || { echo "  ❌ App 包里没有 LICENSE"; DMG_OK=0; }
 [ -L "$MP/Applications" ] && echo "  ✅ 有 Applications 快捷方式（可拖拽安装）" || { echo "  ⚠ 缺 Applications 快捷方式"; DMG_OK=0; }
 [ -f "$MP/首次打开请看这里.txt" ] && echo "  ✅ 有首次打开说明" || echo "  ⚠ 缺说明文件"
+[ -f "$MP/LICENSE" ] && echo "  ✅ 有 LICENSE（MIT）" || { echo "  ❌ 缺 LICENSE"; DMG_OK=0; }
+[ -f "$MP/第三方依赖声明.md" ] && echo "  ✅ 有第三方依赖声明" || { echo "  ❌ 缺第三方依赖声明"; DMG_OK=0; }
 
 # **最关键的一条**：dmg 里的 App 签名必须仍然有效（TCC 权限绑定签名）
 if codesign -v "$MP/音效板.app" 2>/dev/null; then

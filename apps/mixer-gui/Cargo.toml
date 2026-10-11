@@ -1,6 +1,8 @@
 [package]
 name = "mixer-gui"
 version.workspace = true
+license.workspace = true
+authors.workspace = true
 edition.workspace = true
 
 [build-dependencies]

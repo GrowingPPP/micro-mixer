@@ -37,6 +37,7 @@
       "minimumSystemVersion": "11.0"
     },
     "shortDescription": "把音频播进麦克风，让队友听到",
-    "longDescription": "在游戏里按一个键，队友就听到你选的音频；同时你的真实说话声完全不受影响。"
+    "longDescription": "在游戏里按一个键，队友就听到你选的音频；同时你的真实说话声完全不受影响。",
+    "copyright": "Copyright (c) 2026 zhangguanghui <1003986591@qq.com>"
   }
 }

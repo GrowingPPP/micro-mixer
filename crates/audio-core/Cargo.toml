@@ -1,6 +1,8 @@
 [package]
 name = "audio-core"
 version.workspace = true
+license.workspace = true
+authors.workspace = true
 edition.workspace = true
 
 [dependencies]

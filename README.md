@@ -581,6 +581,19 @@ cargo build --release
 
 ---
 
+## 许可证
+
+**MIT** —— 见 [LICENSE](LICENSE)。
+
+也就是说：你可以自由使用、修改、分发、甚至商用，**只要保留版权声明**。
+第三方依赖的声明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
+（由 `tools/gen-third-party-notices.py` 生成，会随 App 与 DMG 一起分发）。
+
+> ⚠️ 有一点要注意：**虚拟声卡驱动是另外的东西**。
+> 本项目自己不含驱动，用户需要自行安装（如 BlackHole）。
+> 而 BlackHole 是 **GPL-3.0** —— 自己用没问题，
+> 但如果要把驱动**打包进你的产品**分发，就受它的条款约束了。
+
 ## 文档
 
 | 文档 | 给谁看 |

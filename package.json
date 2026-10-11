@@ -1,4 +1,14 @@
 {
+  "name": "yuyinzengqiang-build",
+  "version": "0.1.0",
+  "private": true,
+  "description": "仅用于拉取 Tauri CLI 的构建脚本包，不是要发布的 npm 包",
+  "license": "MIT",
+  "author": "zhangguanghui <1003986591@qq.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/GrowingPPP/yuyinzengqiang.git"
+  },
   "dependencies": {
     "@tauri-apps/cli": "^2.12.1"
   }

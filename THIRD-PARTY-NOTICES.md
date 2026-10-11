@@ -1,6 +1,6 @@
 # 第三方依赖声明
 
-本产品包含以下开源软件。各软件的版权归其各自作者所有，按各自许可证的条款使用。
+本产品本身以 **MIT** 许可证发布（见 [LICENSE](LICENSE)）。它包含以下第三方开源软件，各软件的版权归其各自作者所有，按各自的许可证条款使用。
 
 > 本文件由 `tools/gen-third-party-notices.py` 自动生成，请勿手工编辑。
 > 重新生成：`python3 tools/gen-third-party-notices.py`
@@ -2932,13 +2932,13 @@ DEALINGS IN THE SOFTWARE.
 
 ### 33. MIT
 
-覆盖 2 个 crate：base64 0.21.7, base64 0.22.1
+覆盖 1 个 crate：base64 0.23.1
 
 
 ```text
 The MIT License (MIT)
 
-Copyright (c) 2015 Alice Maz
+Copyright (c) 2025 Alice Maz, Marshall Pierce
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -2962,13 +2962,13 @@ THE SOFTWARE.
 
 ### 34. MIT
 
-覆盖 1 个 crate：base64 0.23.1
+覆盖 2 个 crate：base64 0.21.7, base64 0.22.1
 
 
 ```text
 The MIT License (MIT)
 
-Copyright (c) 2025 Alice Maz, Marshall Pierce
+Copyright (c) 2015 Alice Maz
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -4202,11 +4202,11 @@ SOFTWARE.
 
 ### 72. MIT
 
-覆盖 1 个 crate：getrandom 0.3.4
+覆盖 1 个 crate：getrandom 0.4.3
 
 
 ```text
-Copyright (c) 2018-2025 The rust-random Project Developers
+Copyright (c) 2018-2026 The rust-random Project Developers
 Copyright (c) 2014 The Rust Project Developers
 
 Permission is hereby granted, free of charge, to any
@@ -4237,11 +4237,11 @@ DEALINGS IN THE SOFTWARE.
 
 ### 73. MIT
 
-覆盖 1 个 crate：getrandom 0.4.3
+覆盖 1 个 crate：getrandom 0.3.4
 
 
 ```text
-Copyright (c) 2018-2026 The rust-random Project Developers
+Copyright (c) 2018-2025 The rust-random Project Developers
 Copyright (c) 2014 The Rust Project Developers
 
 Permission is hereby granted, free of charge, to any

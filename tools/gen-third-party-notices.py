@@ -222,8 +222,9 @@ def main() -> int:
     L: list[str] = []
     L.append("# 第三方依赖声明\n")
     L.append(
-        "本产品包含以下开源软件。各软件的版权归其各自作者所有，"
-        "按各自许可证的条款使用。\n"
+        "本产品本身以 **MIT** 许可证发布（见 [LICENSE](LICENSE)）。"
+        "它包含以下第三方开源软件，各软件的版权归其各自作者所有，"
+        "按各自的许可证条款使用。\n"
     )
     L.append(
         "> 本文件由 `tools/gen-third-party-notices.py` 自动生成，请勿手工编辑。\n"

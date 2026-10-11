@@ -1,6 +1,8 @@
 [package]
 name = "app-config"
 version.workspace = true
+license.workspace = true
+authors.workspace = true
 edition.workspace = true
 
 [dependencies]
