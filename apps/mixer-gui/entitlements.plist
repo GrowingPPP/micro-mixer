@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  强化运行时（hardened runtime）下必需的授权声明。
+
+  为什么必需：开启强化运行时（options runtime）之后，macOS 只认这里的声明 ——
+  光有 Info.plist 里的 NSMicrophoneUsageDescription **不够**。
+  缺了这一条的表现极具迷惑性：**不报错、不弹窗、程序照常运行，
+  只是麦克风录回来全是零**（实测 peak 精确等于 -100 dBFS）。
+
+  注意这只影响"开了强化运行时"的签名。ad-hoc 签名（不开强化运行时）
+  时没有它也能录到声音 —— 这正是它容易被忽略的原因。
+-->
+<plist version="1.0">
+<dict>
+    <!-- 采集真实麦克风 -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>

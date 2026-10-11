@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/audio-core",
+    "crates/backend-cpal",
+    "crates/hotkeys",
+    "crates/app-config",
+    "crates/remote",
+    "crates/selftest",
+    "apps/mixer-cli",
+    "apps/mixer-gui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+rtrb = "0.3"
+cpal = "0.15"
+clap = { version = "4", features = ["derive"] }
+global-hotkey = "0.8"
+symphonia = { version = "0.5", default-features = false, features = [
+    # 格式（容器）
+    "wav", "isomp4", "ogg", "aiff", "caf", "mkv",
+    # 编解码器 —— "pcm" 必须显式开启，否则连 WAV 都解不了
+    "pcm", "adpcm", "mp3", "mpa", "aac", "alac", "flac", "vorbis",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+# 音频引擎必须快 —— 调试构建下也要能跑实时
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev]
+opt-level = 1

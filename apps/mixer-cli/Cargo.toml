@@ -1,0 +1,20 @@
+[package]
+name = "mixer-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mixer"
+path = "src/main.rs"
+
+[dependencies]
+audio-core = { path = "../../crates/audio-core" }
+backend-cpal = { path = "../../crates/backend-cpal" }
+hotkeys = { path = "../../crates/hotkeys" }
+app-config = { path = "../../crates/app-config" }
+remote = { path = "../../crates/remote" }
+selftest = { path = "../../crates/selftest" }
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+clap.workspace = true

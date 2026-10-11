@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>音效板</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <span id="dot" class="dot off"></span>
+    <div>
+      <h1>音效板</h1>
+      <p id="headline">未启动</p>
+    </div>
+  </div>
+  <div class="actions">
+    <button id="btnSelfTest" class="ghost" title="把测试音送进虚拟设备再从环回录回来，验证整条链路">自检</button>
+    <button id="btnSetup" class="ghost" title="展开/收起设置">设置</button>
+    <button id="btnToggle" class="primary">启动</button>
+  </div>
+</header>
+
+<section id="setup" class="panel">
+  <div class="row">
+    <label>真实麦克风
+      <select id="selIn"></select>
+    </label>
+    <label>输出到（虚拟声卡）
+      <select id="selOut"></select>
+    </label>
+    <label class="narrow">缓冲
+      <span class="withunit"><input id="inBuf" type="number" value="20" min="5" max="200"><i>ms</i></span>
+    </label>
+  </div>
+
+  <div class="row">
+    <label class="grow">音效<span id="count" class="count"></span>
+      <span class="withbtn">
+        <input id="inDir" type="text" placeholder="~/Sounds（文件夹，或直接用右边按钮挑文件）">
+        <button id="btnBrowse" class="ghost">文件夹…</button>
+        <button id="btnScan" class="ghost">载入</button>
+        <button id="btnAdd" class="ghost">添加文件…</button>
+        <button id="btnClear" class="ghost" title="清空列表">清空</button>
+      </span>
+    </label>
+  </div>
+
+  <div class="row">
+    <label class="grow">热键（逗号分隔，与音效顺序对应）
+      <input id="inKeys" type="text" placeholder="F1,F2,F3">
+    </label>
+    <label class="narrow">麦克风
+      <span class="withunit"><input id="inMicGain" type="number" value="0" step="1"><i>dB</i></span>
+    </label>
+    <label class="narrow">音效
+      <span class="withunit"><input id="inSfxGain" type="number" value="-6" step="1"><i>dB</i></span>
+    </label>
+    <label class="check">
+      <input id="inLoop" type="checkbox"> 循环
+    </label>
+    <label class="check" title="触发的音效同时放给你自己听 —— 游戏里唯一能确认「按下去了」的反馈">
+      <input id="inMonitor" type="checkbox" checked> 监听
+    </label>
+    <label class="check" title="热键被全屏游戏吞掉时的兜底：手机浏览器打开这个地址就能触发音效">
+      <input id="inRemote" type="checkbox" checked> 手机遥控
+    </label>
+  </div>
+
+  <div class="calibrow">
+    <button id="btnCalib" class="ghost" title="测 5 秒，自动算出麦克风该补多少增益，省得你来回拖滑杆试">
+      校准麦克风
+    </button>
+    <span id="calibHint" class="calibhint"></span>
+  </div>
+
+  <p class="hint" style="margin-top:2px">
+    <span id="btnRevertMic" class="linky">切回真实麦克风</span>
+    ·
+    <span id="btnRelease" class="linky">彻底释放音频设备</span>
+    —— 只有你要退出、或把游戏麦克风改回真实麦克风时才需要。
+    平常「停止」不会断掉麦克风转发。
+  </p>
+  <p id="setupHint" class="hint">选好设备与音效文件夹，然后点右上角「启动」。运行中调整增益会立即生效。</p>
+</section>
+
+  <div id="qrPanel" class="qrpanel hidden"></div>
+  <div id="testPanel" class="testpanel hidden"></div>
+
+<div id="vdevHelp" class="vdevhelp hidden">
+  <div class="vdh-title">⚠️ 这台 Mac 上没找到虚拟声卡</div>
+  <p>游戏和语音软件只能从「麦克风」读声音。虚拟声卡的作用就是：
+     <b>我们把音效写进去，游戏从它读出来</b> —— 声音于是进了你的麦克风。</p>
+  <p class="vdh-pick">推荐装 <b>BlackHole</b>（免费、开源，macOS 上最通用的虚拟声卡）：</p>
+  <div class="vdh-cmd">
+    <code id="vdhCmd">brew install --cask blackhole-2ch</code>
+    <button id="btnCopyCmd" class="ghost">复制</button>
+  </div>
+  <p class="vdh-alt">没装 Homebrew？去
+     <a href="https://existential.audio/blackhole/" id="vdhLink">existential.audio/blackhole</a>
+     下载安装包。<b>装完重启一次</b>，回来点「重新检测」。</p>
+  <p class="vdh-alt">其他选择：VB-CABLE for Mac（个人免费）、Loopback（付费，功能最多）。</p>
+  <div class="vdh-actions">
+    <button id="btnRecheck" class="ghost">重新检测</button>
+  </div>
+</div>
+
+<div id="libbar" class="libbar">
+  <input id="inSearch" type="text" placeholder="搜索音效名或标签…">
+  <span id="tagbar" class="tagbar"></span>
+  <button id="btnSort" class="ghost" title="按名称排序（会改变热键对应关系）">按名称排序</button>
+</div>
+
+<main id="grid" class="grid"></main>
+
+<footer>
+  <span id="meter" class="meter" title="送往虚拟麦克风的电平">
+    <i class="zone"></i><i class="bar"></i><i class="peak"></i>
+  </span>
+  <span id="metrics" class="metrics">—</span>
+  <span id="remote" class="remote"></span>
+  <button id="btnQr" class="ghost">二维码</button>
+  <span id="toast" class="toast"></span>
+  <button id="btnStopAll" class="ghost" title="把正在响的音效掐掉（长音效不用等它放完）。不影响麦克风转发，也不影响热键。">停止播放 <kbd>空格</kbd></button>
+</footer>
+
+<script src="main.js"></script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+[package]
+name = "remote"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+qrcode = "0.14"
+log.workspace = true
+audio-core = { path = "../audio-core" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

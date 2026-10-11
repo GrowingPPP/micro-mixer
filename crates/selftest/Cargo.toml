@@ -1,0 +1,9 @@
+[package]
+name = "selftest"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+audio-core = { path = "../audio-core" }
+backend-cpal = { path = "../backend-cpal" }

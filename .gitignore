@@ -1,0 +1,21 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# macOS
+.DS_Store
+
+# 前端依赖（package-lock.json 进版本库，本目录不进 —— 15M 且可 npm ci 重建）
+node_modules/
+
+# M0 实验产物（测试素材与录音，体积大且可重新生成）
+m0/work/
+
+# 打包产物（.app 是 target/ 下的，这里再兜一层以防有人手工拷出来）
+*.app/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp

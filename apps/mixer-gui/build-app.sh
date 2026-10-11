@@ -1,0 +1,107 @@
+#!/bin/bash
+# 打包 macOS .app —— 必须走这个脚本，不要直接 tauri build。
+#
+# 为什么：
+#  1. `tauri build` 把项目里的 Info.plist 合并进 .app 之后，**原来的 ad-hoc 签名会失效**
+#     （codesign 报 "code has no resources but signature indicates they must be present"）。
+#  2. 而 macOS 的**隐私权限（TCC）是绑定代码签名的** —— 签名无效时系统不会弹权限窗，
+#     也不会授权，程序只能录到一片静音（不报错、不崩溃）。
+#  3. 所以打包后**必须重新签名**。
+#
+# 签名的选择（按优先级）：
+#   a) 环境变量 MIXER_SIGN_ID 指定的身份
+#   b) 钥匙串里的 **Developer ID Application** 证书（可公证、可分发给别人）
+#   c) 钥匙串里的任意 Apple 代码签名证书（**TCC 身份稳定**，本机不再反复弹权限）
+#   d) ad-hoc（-）—— 兜底。缺点：**签名指纹每次都不一样**，
+#      而 TCC 权限绑定签名 ⇒ 每次重新打包后麦克风权限都要重新授权一次。
+#
+# 所以能用真证书就别用 ad-hoc。设 MIXER_SIGN_ID 可以强制指定。
+#
+# 另外 Info.plist 里的 NSMicrophoneUsageDescription 是**必需**的：
+# 缺了它 tccd 会直接拒绝（日志原文：
+# "Refusing authorization request for service kTCCServiceMicrophone
+#  ... without NSMicrophoneUsageDescription key"）。
+set -euo pipefail
+cd "$(dirname "$0")"
+
+# 脚本环境里可能没有 cargo（终端才会 source ~/.cargo/env）
+if ! command -v cargo >/dev/null 2>&1; then
+  # shellcheck disable=SC1091
+  [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+fi
+command -v cargo >/dev/null 2>&1 || { echo "找不到 cargo，请先安装 Rust"; exit 1; }
+
+echo "── 1/3 打包 ──"
+../../node_modules/.bin/tauri build "$@"
+
+APP="../../target/release/bundle/macos/音效板.app"
+
+echo "── 2/3 重新签名 ──"
+
+pick_identity() {
+  # 优先用户显式指定
+  if [ -n "${MIXER_SIGN_ID:-}" ]; then echo "$MIXER_SIGN_ID"; return; fi
+  local ids
+  ids=$(security find-identity -v -p codesigning 2>/dev/null || true)
+  # 首选 Developer ID（能公证、能分发）
+  local did
+  did=$(printf '%s\n' "$ids" | grep -o '"Developer ID Application: [^"]*"' | head -1 | tr -d '"')
+  if [ -n "$did" ]; then echo "$did"; return; fi
+  # 退而求其次：任意 Apple 开发/分发证书（本机 TCC 身份稳定）
+  local any
+  any=$(printf '%s\n' "$ids" | grep -oE '"(Apple Development|Apple Distribution|Mac Developer): [^"]*"' | head -1 | tr -d '"')
+  if [ -n "$any" ]; then echo "$any"; return; fi
+  echo "-"   # ad-hoc 兜底
+}
+
+IDENTITY=$(pick_identity)
+if [ "$IDENTITY" = "-" ]; then
+  echo "  ⚠ 没找到代码签名证书 → 用 ad-hoc。"
+  echo "    后果：**每次重新打包后，麦克风权限都要重新授权一次**（TCC 绑定签名）。"
+  echo "    想要稳定：在 Xcode 里登录 Apple ID，或从开发者门户申请 'Developer ID Application' 证书。"
+  codesign --force --deep --sign - "$APP"
+else
+  echo "  用证书：$IDENTITY"
+  # ⚠️ 强化运行时必须带 entitlements —— 否则**麦克风会被静默拒绝**
+  #    （不报错、不弹窗，只是录音全是零，peak 精确等于 -100 dBFS）。
+  #    光有 Info.plist 的 NSMicrophoneUsageDescription 不够。
+  ENT="$(pwd)/entitlements.plist"
+  codesign --force --deep --options runtime \
+           --entitlements "$ENT" --sign "$IDENTITY" "$APP"
+  echo "  已附加 entitlements: audio-input"
+fi
+
+echo "── 3/3 校验 ──"
+codesign -v "$APP" && echo "  ✅ 签名有效"
+# 把签名指纹打出来 —— 它是 TCC 识别"这是同一个 App"的依据，
+# 指纹变了权限就要重新授权。想确认"这次打包会不会又要弹窗"就看它。
+CDHASH=$(codesign -dv --verbose=4 "$APP" 2>&1 | grep -o 'CandidateCDHash sha256=[0-9a-f]*' | head -1 | cut -d= -f2 | cut -c1-16)
+echo "  ℹ 签名指纹 (CDHash): ${CDHASH:-未知}"  
+/usr/libexec/PlistBuddy -c "Print :NSMicrophoneUsageDescription" "$APP/Contents/Info.plist" >/dev/null \
+  && echo "  ✅ 麦克风用途说明存在" \
+  || { echo "  ❌ 缺少 NSMicrophoneUsageDescription —— 系统会拒绝麦克风权限"; exit 1; }
+
+# 三条目录用途说明：开了强化运行时之后，读 ~/Downloads 这类受保护目录**必须有它**，
+# 否则文件读取会**永久阻塞**（不报错、不返回，界面表现为"点了启动没反应"）。
+for k in NSDownloadsFolderUsageDescription NSDesktopFolderUsageDescription NSDocumentsFolderUsageDescription; do
+  /usr/libexec/PlistBuddy -c "Print :$k" "$APP/Contents/Info.plist" >/dev/null 2>&1 \
+    || { echo "  ❌ 缺少 $k —— 开了强化运行时后读受保护目录会卡死"; exit 1; }
+done
+echo "  ✅ 目录用途说明齐全（强化运行时下读 ~/Downloads 必需）"
+
+# 强化运行时的签名必须带 audio-input，否则麦克风静默失效
+if codesign -d --entitlements - "$APP" 2>/dev/null | grep -q "audio-input"; then
+  echo "  ✅ entitlements 含 audio-input（强化运行时下麦克风必需）"
+else
+  echo "  ⚠ 当前签名没有 audio-input entitlement"
+  echo "     —— 如果你用的是 ad-hoc 签名，这不影响；用了真证书 + 强化运行时就会录不到声音。"
+fi
+echo
+if [ "$IDENTITY" != "-" ]; then
+  echo "  💡 用真证书签名 ⇒ **TCC 权限绑定这个身份，重新打包不会重置**，"
+  echo "     麦克风授权只需给一次。"
+else
+  echo "  💡 现在是 ad-hoc 签名 ⇒ 每次重新打包都会换指纹，麦克风权限要重新授权。"
+fi
+echo
+echo "产物: $(cd ../.. && pwd)/target/release/bundle/macos/音效板.app"
