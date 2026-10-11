@@ -89,23 +89,7 @@
   <div id="qrPanel" class="qrpanel hidden"></div>
   <div id="testPanel" class="testpanel hidden"></div>
 
-<div id="vdevHelp" class="vdevhelp hidden">
-  <div class="vdh-title">⚠️ 这台 Mac 上没找到虚拟声卡</div>
-  <p>游戏和语音软件只能从「麦克风」读声音。虚拟声卡的作用就是：
-     <b>我们把音效写进去，游戏从它读出来</b> —— 声音于是进了你的麦克风。</p>
-  <p class="vdh-pick">推荐装 <b>BlackHole</b>（免费、开源，macOS 上最通用的虚拟声卡）：</p>
-  <div class="vdh-cmd">
-    <code id="vdhCmd">brew install --cask blackhole-2ch</code>
-    <button id="btnCopyCmd" class="ghost">复制</button>
-  </div>
-  <p class="vdh-alt">没装 Homebrew？去
-     <a href="https://existential.audio/blackhole/" id="vdhLink">existential.audio/blackhole</a>
-     下载安装包。<b>装完重启一次</b>，回来点「重新检测」。</p>
-  <p class="vdh-alt">其他选择：VB-CABLE for Mac（个人免费）、Loopback（付费，功能最多）。</p>
-  <div class="vdh-actions">
-    <button id="btnRecheck" class="ghost">重新检测</button>
-  </div>
-</div>
+<div id="vdevHelp" class="vdevhelp hidden"></div>
 
 <div id="libbar" class="libbar">
   <input id="inSearch" type="text" placeholder="搜索音效名或标签…">

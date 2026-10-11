@@ -39,7 +39,7 @@ const el = {
   inSearch: $('inSearch'), tagbar: $('tagbar'), btnSort: $('btnSort'),
   btnRelease: $('btnRelease'), btnCalib: $('btnCalib'), calibHint: $('calibHint'),
   btnRevertMic: $('btnRevertMic'),
-  vdevHelp: $('vdevHelp'), btnRecheck: $('btnRecheck'), btnCopyCmd: $('btnCopyCmd'), vdhCmd: $('vdhCmd'),
+  vdevHelp: $('vdevHelp'),
   grid: $('grid'), metrics: $('metrics'), toast: $('toast'),
   btnStopAll: $('btnStopAll'), setup: $('setup'), btnSetup: $('btnSetup'),
 };
@@ -908,29 +908,74 @@ el.btnRelease.addEventListener('click', async () => {
 ///
 /// 没有的话整个软件都用不了（游戏只能从"麦克风"读声音，而虚拟声卡就是那个麦克风），
 /// 所以这种情况必须**主动告诉用户怎么装**，而不是让他对着空的下拉框发愣。
-function checkVirtualDevice() {
+async function checkVirtualDevice() {
   const has = state.devices.some(d => d.is_virtual && d.direction.includes('输出'));
   el.vdevHelp.classList.toggle('hidden', has);
+  if (!has) await renderVdevHelp();
   return has;
 }
-el.btnRecheck.addEventListener('click', async () => {
-  await loadDevices();
-  if (checkVirtualDevice()) toast('检测到虚拟声卡了 ✅');
-  else toast('还是没有 —— 装完 BlackHole 需要重启一次', true);
-});
-el.btnCopyCmd.addEventListener('click', async () => {
-  const cmd = el.vdhCmd.textContent;
+
+/// 按**当前平台**渲染"怎么装虚拟声卡"的引导。
+///
+/// 前端两端共用，但装驱动这件事在 macOS 和 Windows 上完全不一样
+/// （BlackHole vs VB-CABLE），所以由后端告诉它该显示哪一套。
+async function renderVdevHelp() {
+  if (el.vdevHelp.dataset.rendered === '1') return;
+  let info;
   try {
-    await navigator.clipboard.writeText(cmd);
+    info = await invoke('platform_info');
+  } catch {
+    return;
+  }
+  const esc2 = (t) => String(t).replace(/[&<>"]/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+  let html = `<div class="vdh-title">⚠️ ${esc2(info.title)}</div>` +
+    `<p>游戏和语音软件只能从「麦克风」读声音。虚拟声卡的作用就是：` +
+    `<b>我们把音效写进去，游戏从它读出来</b> —— 声音于是进了你的麦克风。</p>` +
+    `<p class="vdh-pick">推荐装 <b>${esc2(info.driver)}</b>：</p>` +
+    `<ol class="vdh-steps">` +
+    info.steps.map(t => `<li>${t.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')}</li>`).join('') +
+    `</ol>`;
+
+  if (info.cmd) {
+    html += `<div class="vdh-cmd"><code id="vdhCmd">${esc2(info.cmd)}</code>` +
+            `<button id="btnCopyCmd" class="ghost">复制</button></div>`;
+  } else {
+    html += `<p class="vdh-alt">下载：<a href="${esc2(info.url)}" id="vdhLink">${esc2(info.url)}</a></p>`;
+  }
+  if (info.naming) html += `<p class="vdh-naming">${esc2(info.naming)}</p>`;
+  if (info.alts) html += `<p class="vdh-alt">${esc2(info.alts)}</p>`;
+  html += `<div class="vdh-actions"><button id="btnRecheck" class="ghost">重新检测</button></div>`;
+
+  el.vdevHelp.innerHTML = html;
+  el.vdevHelp.dataset.rendered = '1';
+
+  // 重新挂事件（内容刚被换掉，原来的监听器没了）
+  const copy = el.vdevHelp.querySelector('#btnCopyCmd');
+  if (copy) copy.addEventListener('click', copyDriverCmd);
+  const recheck = el.vdevHelp.querySelector('#btnRecheck');
+  if (recheck) recheck.addEventListener('click', async () => {
+    el.vdevHelp.dataset.rendered = '';
+    await loadDevices();
+    if (await checkVirtualDevice()) toast('检测到虚拟声卡了 ✅');
+    else toast('还是没有 —— 装完驱动记得重启一次', true);
+  });
+}
+
+async function copyDriverCmd() {
+  const code = el.vdevHelp.querySelector('#vdhCmd');
+  if (!code) return;
+  try {
+    await navigator.clipboard.writeText(code.textContent);
     toast('命令已复制，粘到终端里执行');
   } catch {
-    // 剪贴板可能没有权限：退回到"选中让用户自己复制"
-    const r = document.createRange(); r.selectNodeContents(el.vdhCmd);
+    const r = document.createRange(); r.selectNodeContents(code);
     const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
     document.execCommand?.('copy');
     toast('命令已选中，按 ⌘C 复制');
   }
-});
+}
 el.inSearch.addEventListener('input', render);
 document.addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;

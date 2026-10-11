@@ -234,6 +234,13 @@ label.check input { width: auto; }
   padding: 6px 12px; color: #ffe6a8; user-select: all;
 }
 .vdevhelp .vdh-actions { margin-top: 8px; }
+.vdevhelp .vdh-steps { margin: 6px 0 6px 20px; padding: 0; }
+.vdevhelp .vdh-steps li { margin: 3px 0; }
+/* VB-CABLE 的命名是反的，这条要能一眼看到 */
+.vdevhelp .vdh-naming {
+  margin: 8px 0; padding: 8px 10px; border-radius: 6px;
+  background: #3a2a08; border-left: 3px solid #ffc861; color: #ffe6a8;
+}
 
 /* ───────────── 面板的关闭按钮 ───────────── */
 

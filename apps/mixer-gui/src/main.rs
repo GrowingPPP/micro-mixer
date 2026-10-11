@@ -167,6 +167,48 @@ fn js_error(msg: String, stack: String) {
     }
 }
 
+/// 当前平台，以及推荐的虚拟声卡方案。
+///
+/// 前端是**两端共用**的，但"怎么装虚拟声卡"这件事在两个平台完全不一样 ——
+/// 所以由后端告诉它该显示哪一套，而不是在前端里堆 if。
+#[tauri::command]
+fn platform_info() -> serde_json::Value {
+    if cfg!(target_os = "windows") {
+        serde_json::json!({
+            "os": "windows",
+            "title": "这台电脑上没找到虚拟声卡",
+            "driver": "VB-CABLE",
+            "steps": [
+                "去 vb-audio.com/Cable 下载 VB-CABLE（个人使用免费）",
+                "解压后**右键 → 以管理员身份运行** VBCABLE_Setup_x64.exe，点 Install Driver",
+                "**重启电脑**（驱动要重启才生效）",
+                "回来点下面的「重新检测」",
+            ],
+            "url": "https://vb-audio.com/Cable/",
+            "cmd": null,
+            // Windows 上 VB-CABLE 的命名是**反的**，这是最容易卡住人的地方
+            "naming": "⚠️ 注意 VB-CABLE 的命名是反的：本程序要输出到 **CABLE Input**，\
+                       而游戏里选麦克风要选 **CABLE Output**。名字看着别扭，但就是这样。",
+            "alts": "其他选择：VoiceMeeter（免费，功能更多但更复杂）、Virtual Audio Cable（付费）。",
+        })
+    } else {
+        serde_json::json!({
+            "os": "macos",
+            "title": "这台 Mac 上没找到虚拟声卡",
+            "driver": "BlackHole",
+            "steps": [
+                "用下面的命令装 BlackHole（免费、开源），或去官网下载安装包",
+                "**装完重启一次**",
+                "回来点下面的「重新检测」",
+            ],
+            "url": "https://existential.audio/blackhole/",
+            "cmd": "brew install --cask blackhole-2ch",
+            "naming": null,
+            "alts": "其他选择：VB-CABLE for Mac（个人免费）、Loopback（付费，功能最多）。",
+        })
+    }
+}
+
 /// 手机遥控地址的二维码矩阵。
 ///
 /// 手机上扫一下就能打开遥控页 —— 比手输 `10.220.179.90:8765` 快得多，
@@ -763,6 +805,7 @@ fn main() {
             autostart,
             self_test,
             remote_qr,
+            platform_info,
             js_error,
             open_url,
             status,
