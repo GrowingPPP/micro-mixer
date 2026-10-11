@@ -1,0 +1,36 @@
+# Git 统一处理规则
+#
+# 为什么需要：这个项目**全是中文内容和 shell 脚本**，
+# 一旦有人用 Windows 编辑器保存出 CRLF，shell 脚本会直接跑不起来
+# （报 `bad interpreter: No such file or directory`，而且看不出是行尾问题）。
+# 所以在 git 层面强制统一，不依赖每个人的编辑器设置。
+
+# 默认：按文本处理，检出时统一 LF（配合 .editorconfig）
+* text=auto eol=lf
+
+# 明确按文本处理（diff 才有意义）
+*.rs    text
+*.toml  text
+*.md    text
+*.sh    text
+*.js    text
+*.css   text
+*.html  text
+*.json  text
+*.plist text
+*.yml   text
+
+# 明确按二进制处理（不 diff、不换行转换）
+*.png   binary
+*.jpg   binary
+*.icns  binary
+*.ico   binary
+*.wav   binary
+*.dmg   binary
+
+# 锁文件是自动生成的：在 GitHub 上折叠显示，但**保留 diff**（要能看出依赖变化）
+Cargo.lock        linguist-generated
+package-lock.json linguist-generated
+
+# 生成物也不该出现在语言统计里
+apps/mixer-gui/gen/** linguist-generated

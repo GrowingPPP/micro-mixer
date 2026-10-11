@@ -8,7 +8,6 @@
 //! mixer play --file 笑.mp3 --file 警报.mp3 --hotkeys F1,F2     # 全局热键触发的音效板
 //! ```
 
-
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
@@ -129,7 +128,10 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,symphonia=off")).init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn,symphonia=off"),
+    )
+    .init();
     let cli = Cli::parse();
     let backend = CpalBackend::new();
 
@@ -275,8 +277,12 @@ fn cmd_config(args: &[String]) -> Result<()> {
 fn hotkey_test(keys: Option<String>) -> Result<()> {
     let cfg = Config::load();
     let specs: Vec<String> = match keys {
-        Some(s) => s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
-        None if !cfg.hotkeys.is_empty() => cfg.hotkeys.clone(),
+        Some(s) => s
+            .split(',')
+            .map(|x| x.trim().to_string())
+            .filter(|x| !x.is_empty())
+            .collect(),
+        None if !cfg.hotkeys.is_empty() => cfg.hotkeys,
         None => (1..=5).map(|i| format!("F{i}")).collect(),
     };
 
@@ -309,7 +315,7 @@ fn hotkey_test(keys: Option<String>) -> Result<()> {
     //
     // 实测结论：只跑裸 CFRunLoop（CFRunLoopRunInMode）**收不到** Carbon 热键事件，
     // 必须是完整的应用事件循环。GUI 之所以一直正常，就是因为 tao 在跑 NSApplication。
-    let names = specs.clone();
+    let names = specs;
     std::thread::Builder::new()
         .name("hotkey-poll".into())
         .spawn(move || {
@@ -342,12 +348,7 @@ fn hotkey_test(keys: Option<String>) -> Result<()> {
 // ─────────────────────────────────────────── list
 
 /// 端到端自检：跑一遍链路，把结构化结果排版成表格。
-fn cmd_selftest(
-    backend: &CpalBackend,
-    device: Option<String>,
-    freq: f32,
-    secs: f32,
-) -> Result<()> {
+fn cmd_selftest(backend: &CpalBackend, device: Option<String>, freq: f32, secs: f32) -> Result<()> {
     // 自动重试：这块虚拟声卡偶发抽风，重开一次流通常就好
     let r = selftest::run_with_retry(backend, device, freq, secs, 3)?;
 
@@ -519,7 +520,10 @@ fn run(
             }
         };
         if audio.frames() == 0 {
-            let name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let name = p
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
             println!("  ⏭  跳过 {name}：文件里没有音频数据");
             skipped.push((name, "文件里没有音频数据".into()));
             continue;
@@ -641,10 +645,18 @@ fn run(
     )?;
 
     if in_stream.format() != in_fmt {
-        println!("  ⚠ 实际输入格式 {} 与预期 {} 不一致", in_stream.format(), in_fmt);
+        println!(
+            "  ⚠ 实际输入格式 {} 与预期 {} 不一致",
+            in_stream.format(),
+            in_fmt
+        );
     }
     if out_stream.format() != out_fmt {
-        println!("  ⚠ 实际输出格式 {} 与预期 {} 不一致", out_stream.format(), out_fmt);
+        println!(
+            "  ⚠ 实际输出格式 {} 与预期 {} 不一致",
+            out_stream.format(),
+            out_fmt
+        );
     }
 
     // 手机遥控（可选）
@@ -736,12 +748,12 @@ fn run(
     // Carbon 热键事件只有在完整应用事件循环里才会被派发（真机实测：
     // 裸 CFRunLoop 收不到，GUI 因为有 NSApplication 所以一直正常）。
     // 没有热键时走原路径，脚本（--remote / --duration）行为完全不变。
-    let quit = match hotkeys.clone() {
+    let quit = match hotkeys {
         Some(hk) => {
             APP_LOOP_USED.store(true, Ordering::Relaxed);
             // 必须在起工作线程**之前**清除退出标志，否则可能被提前置位而卡死
             hotkeys::reset_app_event_loop();
-            let ctl = control.clone();
+            let ctl = control;
             let has = !slot_names.is_empty();
             let run2 = running.clone();
             std::thread::Builder::new()
@@ -753,7 +765,7 @@ fn run(
             running.load(Ordering::Relaxed) || duration.is_some()
         }
         None => event_loop(
-            control.clone(),
+            control,
             None,
             !slot_names.is_empty(),
             duration,
@@ -775,7 +787,10 @@ fn run(
 
     println!("\n── 运行报告 ──");
     println!("  时长            : {elapsed:.1}s");
-    println!("  采集 / 渲染帧数 : {} / {}", s.captured_frames, s.rendered_frames);
+    println!(
+        "  采集 / 渲染帧数 : {} / {}",
+        s.captured_frames, s.rendered_frames
+    );
     println!(
         "  稳态欠载 / 溢出 : {st_run} / {st_ovr}   {}",
         if st_run == 0 && st_ovr == 0 {
@@ -928,6 +943,9 @@ fn truncate(s: &str, max: usize) -> String {
     if chars.len() <= max {
         s.to_string()
     } else {
-        format!("{}…", chars[..max.saturating_sub(1)].iter().collect::<String>())
+        format!(
+            "{}…",
+            chars[..max.saturating_sub(1)].iter().collect::<String>()
+        )
     }
 }

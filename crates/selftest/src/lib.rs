@@ -58,7 +58,8 @@ pub struct Report {
 /// 虚拟声卡已知的偶发问题（实测：约 15 次开流出现 1 次音高翻倍，
 /// 也观察到过开流后环回拿不到信号）。多数情况下**重开一次流就正常**。
 /// 所以任何失败都先让用户重试，而不是让他去查代码。
-const RETRY_HINT: &str = "先直接**再点一次「自检」** —— 这个虚拟声卡偶发异常（实测约 15 次开流出现 1 次），\
+const RETRY_HINT: &str =
+    "先直接**再点一次「自检」** —— 这个虚拟声卡偶发异常（实测约 15 次开流出现 1 次），\
      多数情况重开一次流就恢复正常。仍然失败再看下面的排查方向。";
 
 impl Report {
@@ -83,12 +84,7 @@ impl Report {
 }
 
 /// 跑一次自检。`device` 为 None 时自动探测虚拟声卡。
-pub fn run(
-    backend: &CpalBackend,
-    device: Option<String>,
-    freq: f32,
-    secs: f32,
-) -> Result<Report> {
+pub fn run(backend: &CpalBackend, device: Option<String>, freq: f32, secs: f32) -> Result<Report> {
     let id = match device {
         Some(n) => DeviceId::new(n),
         None => backend
@@ -159,7 +155,7 @@ pub fn run(
     // ── 输出：前导静音 → 正弦 → 尾部静音
     // 相位用原子量：**输出回调里绝不能加锁**
     let phase = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let phase_c = phase.clone();
+    let phase_c = phase;
     let step_u = (freq as f64 / sr as f64 * u32::MAX as f64) as u64;
     let lead_frames = (LEAD_SECS * sr as f32) as u64;
     let tone_frames = (secs * sr as f32) as u64;
@@ -263,7 +259,9 @@ pub fn run(
             });
         } else {
             let mono: Vec<f32> = data[..n]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|f| (f[0] + f[1]) * 0.5)
                 .collect();
 
@@ -285,8 +283,7 @@ pub fn run(
                 Some((a, b)) => {
                     let tone = &mono[a..b];
                     let dur = tone.len() as f32 / sr as f32;
-                    let rms =
-                        (tone.iter().map(|s| s * s).sum::<f32>() / tone.len() as f32).sqrt();
+                    let rms = (tone.iter().map(|s| s * s).sum::<f32>() / tone.len() as f32).sqrt();
                     let rms_db = 20.0 * (rms.max(1e-9)).log10();
                     let measured = zerocross(tone, sr);
 
@@ -442,10 +439,7 @@ mod tests {
         for f in [220.0f32, 440.0, 880.0, 1000.0] {
             let s = sine(f, 48_000, 1.0, 0.5);
             let got = zerocross(&s, 48_000);
-            assert!(
-                (got - f).abs() < f * 0.02,
-                "{f}Hz 估成了 {got:.1}Hz"
-            );
+            assert!((got - f).abs() < f * 0.02, "{f}Hz 估成了 {got:.1}Hz");
         }
     }
 

@@ -35,21 +35,22 @@ fn main() -> anyhow::Result<()> {
     println!("峰值      : {:.2} dBFS", 20.0 * a.peak().max(1e-9).log10());
 
     // 取中段做频率分析
-    let mono: Vec<f32> = a.samples.chunks_exact(2).map(|f| f[0]).collect();
+    let mono: Vec<f32> = a.samples.as_chunks::<2>().0.iter().map(|f| f[0]).collect();
     let n = mono.len();
     if n < 4800 {
         println!("样本太少，跳过频谱分析");
         return Ok(());
     }
     let seg = &mono[n / 4..n / 4 + n / 2];
-    let seg_v: Vec<f32> = seg.iter().map(|s| *s - seg.iter().sum::<f32>() / seg.len() as f32).collect();
+    let seg_v: Vec<f32> = seg
+        .iter()
+        .map(|s| *s - seg.iter().sum::<f32>() / seg.len() as f32)
+        .collect();
 
     let zc = zerocross_freq(&seg_v, a.sample_rate);
     let n2 = seg_v.len();
     let win: Vec<f32> = (0..n2)
-        .map(|i| {
-            0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / n2 as f32).cos()
-        })
+        .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / n2 as f32).cos())
         .collect();
     // 简易 DFT 峰值搜索（只扫 50..4000 Hz）
     let sr = a.sample_rate as f32;

@@ -1,0 +1,5 @@
+# Clippy 配置。策略见 Cargo.toml 的 [workspace.lints]。
+#
+# 这个项目里有**手写的 CoreAudio FFI**（apps/mixer-gui/src/macos_audio.rs），
+# 所以 unsafe 相关的检查不能一概关掉。
+avoid-breaking-exported-api = false

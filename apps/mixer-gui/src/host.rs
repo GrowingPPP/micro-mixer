@@ -266,12 +266,7 @@ pub fn cfg_fingerprint(cfg: &StartConfig) -> String {
     //    用户在待机时把某个音效换掉（数量不变）的话，只算个数会走快路用到旧样本。
     format!(
         "in={:?}|out={:?}|buf={:?}|loop={}|files={:?}|names={:?}",
-        cfg.input_device,
-        cfg.output_device,
-        cfg.buffer_ms,
-        cfg.looping,
-        cfg.files,
-        cfg.names
+        cfg.input_device, cfg.output_device, cfg.buffer_ms, cfg.looping, cfg.files, cfg.names
     )
 }
 
@@ -331,7 +326,11 @@ impl AudioHost {
         let guard = self.running.lock().unwrap_or_else(|e| e.into_inner());
         let Some(r) = guard.as_ref() else {
             let mut s = StatusDto::stopped();
-            s.last_error = self.last_error.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            s.last_error = self
+                .last_error
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             // ⚠️ 这条提前返回的路径也必须带上掉线原因 ——
             //    设备掉线导致引擎停掉时，界面正是靠它才知道"为什么没声音了"。
             s.device_lost = self
@@ -371,13 +370,14 @@ impl AudioHost {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
-            monitor_plays: r
-                .monitor
-                .plays
-                .load(std::sync::atomic::Ordering::Relaxed),
+            monitor_plays: r.monitor.plays.load(std::sync::atomic::Ordering::Relaxed),
             skipped: r.skipped_notes.clone(),
-            passthrough: true,   // 走到这里说明引擎还活着
-            device_lost: self.device_lost.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            passthrough: true, // 走到这里说明引擎还活着
+            device_lost: self
+                .device_lost
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
         }
     }
 
@@ -445,9 +445,9 @@ impl AudioHost {
                     d
                 }
             },
-            None => b.guess_virtual_output().context(
-                "没探测到虚拟声卡。请先在设备下拉框里选一个输出设备（例如 VB-Cable）",
-            )?,
+            None => b
+                .guess_virtual_output()
+                .context("没探测到虚拟声卡。请先在设备下拉框里选一个输出设备（例如 VB-Cable）")?,
         };
 
         // 把替换这件事告诉界面（用户得知道"为什么声音从我耳机跑到别处去了"）
@@ -639,10 +639,7 @@ impl AudioHost {
         } else {
             let bound = bind_hotkeys_on_main_thread(app, &cfg.hotkeys);
             match &bound {
-                Ok((_, how)) => println!(
-                    "[热键] 绑定成功（{how}）：{}",
-                    cfg.hotkeys.join(", ")
-                ),
+                Ok((_, how)) => println!("[热键] 绑定成功（{how}）：{}", cfg.hotkeys.join(", ")),
                 Err(e) => println!("[热键] ❌ 绑定失败: {e:#}"),
             }
             match bound.map(|(h, _)| h) {
@@ -694,18 +691,21 @@ impl AudioHost {
                         .unwrap_or_else(|e| e.into_inner())
                         .as_ref()
                     {
-                        sh.set(control.clone(), slots_meta.iter().map(|s| s.name.clone()).collect());
+                        sh.set(
+                            control.clone(),
+                            slots_meta.iter().map(|s| s.name.clone()).collect(),
+                        );
                         // 遥控路径同理：三条触发路径都要监听
                         let mon = monitor.clone();
                         sh.set_hook(Arc::new(move |slot| mon.fire(slot)));
                     }
                     println!("[遥控] 已就绪: {}", urls.join("  "));
                     // 防火墙会拦住未签名程序的入站连接，手机就连不上 —— 直接给出放行命令
-                    if let Some(h) =
-                        remote::firewall_hint(&std::env::current_exe()
+                    if let Some(h) = remote::firewall_hint(
+                        &std::env::current_exe()
                             .map(|p| p.display().to_string())
-                            .unwrap_or_default())
-                    {
+                            .unwrap_or_default(),
+                    ) {
                         println!("[遥控] ⚠ {h}");
                     }
                 }
@@ -736,10 +736,7 @@ impl AudioHost {
             monitor,
             render_slot,
             capture_slot,
-            skipped_notes: skipped
-                .iter()
-                .map(|(n, r)| format!("{n}（{r}）"))
-                .collect(),
+            skipped_notes: skipped.iter().map(|(n, r)| format!("{n}（{r}）")).collect(),
             active,
             hotkeys,
             cfg_key: cfg_fingerprint(&cfg),
@@ -762,10 +759,7 @@ impl AudioHost {
                 .clone());
         }
         let shared = Arc::new(remote::Shared::default());
-        let urls = remote::serve(
-            shared.clone(),
-            remote::RemoteConfig { port, bind },
-        )?;
+        let urls = remote::serve(shared.clone(), remote::RemoteConfig { port, bind })?;
         *g = Some(shared);
         *self.remote_urls.lock().unwrap_or_else(|e| e.into_inner()) = urls.clone();
         Ok(urls)
@@ -794,7 +788,12 @@ impl AudioHost {
             }
         }
         // 遥控那边也断开，避免待机时被人从手机触发
-        if let Some(sh) = self.remote.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if let Some(sh) = self
+            .remote
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             sh.clear();
         }
         println!("[待机] 音效已关闭；麦克风仍在转发（队友照常听得到你）");
@@ -804,7 +803,12 @@ impl AudioHost {
     ///
     /// ⚠️ 调用后虚拟声卡里就没人写了 —— 如果游戏的麦克风还指着它，队友会听不到你。
     pub fn release(&self) {
-        if let Some(sh) = self.remote.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if let Some(sh) = self
+            .remote
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             sh.clear();
         }
         let mut guard = self.running.lock().unwrap_or_else(|e| e.into_inner());
@@ -856,8 +860,6 @@ impl AudioHost {
         Ok(())
     }
 
-
-
     /// 当前运行的启动参数指纹（用来判断「启动」能不能走快路）。
     pub fn running_cfg_key(&self) -> Option<String> {
         self.running
@@ -902,7 +904,10 @@ impl AudioHost {
         // 只检查用户**显式指定**的设备 —— 没指定就是用系统默认，
         // 系统默认变了由系统自己负责，不算"掉线"。
         let in_lost = in_id.as_deref().map(|_| !exists(&in_name)).unwrap_or(false);
-        let out_lost = out_id.as_deref().map(|_| !exists(&out_name)).unwrap_or(false);
+        let out_lost = out_id
+            .as_deref()
+            .map(|_| !exists(&out_name))
+            .unwrap_or(false);
         if in_lost || out_lost {
             let which = if out_lost { &out_name } else { &in_name };
             Some((in_lost, out_lost, which.clone()))
@@ -914,7 +919,6 @@ impl AudioHost {
     pub fn set_device_lost(&self, msg: Option<String>) {
         *self.device_lost.lock().unwrap_or_else(|e| e.into_inner()) = msg;
     }
-
 
     /// 输入设备掉了 → 自动换到系统默认麦克风重开。
     ///
@@ -1002,7 +1006,6 @@ impl AudioHost {
         }
         Ok(ok)
     }
-
 
     pub fn stop_all(&self) -> Result<()> {
         let guard = self.running.lock().unwrap_or_else(|e| e.into_inner());
@@ -1106,7 +1109,11 @@ pub fn request_mic_permission() {
             let dbg = |m: &str| {
                 if let Ok(p) = std::env::var("MIXER_PERM_LOG") {
                     use std::io::Write;
-                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(p)
+                    {
                         let _ = writeln!(f, "{m}");
                     }
                 }
@@ -1171,7 +1178,10 @@ impl MonitorState {
         self.plays.fetch_add(1, Ordering::Relaxed);
         let gen = self.gen.fetch_add(1, Ordering::SeqCst) + 1;
         let gen_arc = Arc::new(std::sync::atomic::AtomicU64::new(gen));
-        println!("[监听] ▶ 送往 {dev}（{} 样本，{gain_db} dB）", samples.len());
+        println!(
+            "[监听] ▶ 送往 {dev}（{} 样本，{gain_db} dB）",
+            samples.len()
+        );
         std::thread::Builder::new()
             .name("monitor".into())
             .spawn(move || {
@@ -1252,14 +1262,14 @@ fn play_samples(
     let g = lin(gain_db);
     let samples = samples_owned;
     let mut pos = 0usize;
-    let src = samples.clone();
+    let src = samples;
 
     // 输出回调：从已解码的缓冲里顺序取，取完就静音
     let stream = b.open_output(
         &dev,
         Some(fmt),
         Box::new(move |out: &mut [f32]| {
-            for frame in out.chunks_exact_mut(2) {
+            for frame in out.as_chunks_mut::<2>().0 {
                 if pos + 1 < src.len() {
                     frame[0] = src[pos] * g;
                     frame[1] = src[pos + 1] * g;

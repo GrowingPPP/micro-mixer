@@ -165,7 +165,6 @@ pub trait AudioBackend: Send + Sync {
     }
 }
 
-
 /// 已知虚拟声卡的名称关键字，**按优先级排列**。
 ///
 /// 顺序有意义：机器上同时装了多个时，靠前的优先。
@@ -188,7 +187,6 @@ pub fn is_virtual_name(name: &str) -> bool {
     let n = name.to_lowercase();
     VIRTUAL_KEYS.iter().any(|k| n.contains(k))
 }
-
 
 #[cfg(test)]
 mod virtual_name_tests {

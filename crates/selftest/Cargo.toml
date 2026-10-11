@@ -7,3 +7,6 @@ edition.workspace = true
 anyhow.workspace = true
 audio-core = { path = "../audio-core" }
 backend-cpal = { path = "../backend-cpal" }
+
+[lints]
+workspace = true

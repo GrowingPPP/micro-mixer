@@ -47,7 +47,12 @@ pub fn run(dir: PathBuf) -> Result<()> {
     let outs = devs.iter().filter(|d| d.direction == "输出").count();
     println!("✅ list_devices      输入 {ins} 个 / 输出 {outs} 个");
     for d in devs.iter().take(3) {
-        println!("     · [{}] {}{}", d.direction, d.name, if d.is_default { " (默认)" } else { "" });
+        println!(
+            "     · [{}] {}{}",
+            d.direction,
+            d.name,
+            if d.is_default { " (默认)" } else { "" }
+        );
     }
 
     // 2. 虚拟声卡探测
@@ -58,20 +63,23 @@ pub fn run(dir: PathBuf) -> Result<()> {
     );
 
     // 3. 文件扫描
-    let files = crate::host::scan_dir(&dir)
-        .with_context(|| format!("scan_dir 失败: {}", dir.display()))?;
+    let files =
+        crate::host::scan_dir(&dir).with_context(|| format!("scan_dir 失败: {}", dir.display()))?;
     if files.is_empty() {
         bail!("目录里没有音频文件: {}", dir.display());
     }
     println!("✅ scan_dir          {} 个音效", files.len());
     for f in files.iter().take(5) {
-        println!("     · {}", f.file_name().unwrap_or_default().to_string_lossy());
+        println!(
+            "     · {}",
+            f.file_name().unwrap_or_default().to_string_lossy()
+        );
     }
 
     // 4. 启动引擎（与 GUI 点「启动」完全同一条代码路径）
     let cfg = StartConfig {
         input_device: None,
-        output_device: out_dev.clone(),
+        output_device: out_dev,
         files: files.iter().map(|p| p.display().to_string()).collect(),
         gains: vec![0.0; files.len()],
         // 顺手覆盖"自定义显示名"这条路径：第一个音效改名，验证引擎用的是它
@@ -105,8 +113,11 @@ pub fn run(dir: PathBuf) -> Result<()> {
         );
     }
     println!("✅ 自定义显示名      第一个槽位显示为「自定义名字」（不是文件名）");
-    println!("     · 槽位 {} 个，热键{}绑定", st.slots.len(),
-        if st.hotkeys_active { "已" } else { "未" });
+    println!(
+        "     · 槽位 {} 个，热键{}绑定",
+        st.slots.len(),
+        if st.hotkeys_active { "已" } else { "未" }
+    );
 
     // 5. 播放第一个音效
     host.play(0).context("play 失败")?;
@@ -162,7 +173,11 @@ pub fn run(dir: PathBuf) -> Result<()> {
     {
         let before = host.status();
         if !before.running || !before.passthrough {
-            bail!("开始时应处于「开启」且转发中：running={} passthrough={}", before.running, before.passthrough);
+            bail!(
+                "开始时应处于「开启」且转发中：running={} passthrough={}",
+                before.running,
+                before.passthrough
+            );
         }
         host.stop();
         let mid = host.status();
@@ -191,9 +206,8 @@ pub fn run(dir: PathBuf) -> Result<()> {
         println!("✅ 彻底释放          passthrough=false（此后再停就必须把游戏麦克风改回去）");
 
         // 收尾：重新启动，好让后面的检查（stop_all / 遥控 / 试听）有引擎可用
-        host.start(cfg.clone(), None).context("重新启动失败")?;
+        host.start(cfg, None).context("重新启动失败")?;
     }
-
 
     // 7. 全部停止
     host.stop_all().context("stop_all 失败")?;
@@ -318,7 +332,9 @@ pub fn run(dir: PathBuf) -> Result<()> {
             .collect();
         if let Some((other_id, other_name)) = others.first().cloned() {
             crate::macos_audio::set_default_input(other_id);
-            let now = crate::macos_audio::default_input().map(|(_, n)| n).unwrap_or_default();
+            let now = crate::macos_audio::default_input()
+                .map(|(_, n)| n)
+                .unwrap_or_default();
             if now == other_name {
                 println!("✅ 模拟默认被改乱      默认输入现在是「{other_name}」");
 
@@ -413,7 +429,10 @@ pub fn run(dir: PathBuf) -> Result<()> {
             if !audio_core::device::is_virtual_name(&st.device) {
                 bail!("❌ 回退到了非虚拟设备「{}」—— 会把音效外放出去", st.device);
             }
-            println!("✅ 不存在的设备          回退到「{}」并留痕（没退到扬声器）", st.device);
+            println!(
+                "✅ 不存在的设备          回退到「{}」并留痕（没退到扬声器）",
+                st.device
+            );
             host.release();
         }
         Err(e) => {
@@ -427,7 +446,8 @@ pub fn run(dir: PathBuf) -> Result<()> {
     // 3. 启动失败后必须还能正常启动（可恢复）
     let mut ok = base.clone();
     ok.remote_port = None;
-    host.start(ok.clone(), None).context("失败后重新启动失败 —— 状态没恢复干净")?;
+    host.start(ok, None)
+        .context("失败后重新启动失败 —— 状态没恢复干净")?;
     println!("✅ 失败后重新启动        成功（状态可恢复）");
     host.stop();
 
@@ -445,7 +465,10 @@ pub fn run(dir: PathBuf) -> Result<()> {
     host.stop();
 
     // 5. 试听不存在的文件 / 损坏的文件 → 报错而不是 panic
-    if host.preview(PathBuf::from("/nonexistent/nope.mp3"), 0.0).is_ok() {
+    if host
+        .preview(PathBuf::from("/nonexistent/nope.mp3"), 0.0)
+        .is_ok()
+    {
         bail!("试听不存在的文件应该报错");
     }
     let junk = std::env::temp_dir().join("mixer_junk.mp3");
@@ -457,10 +480,11 @@ pub fn run(dir: PathBuf) -> Result<()> {
     println!("✅ 试听坏文件            不存在的与损坏的都正确报错");
 
     // 6. 连续两次启动（应自己 stop 再 start，而不是报"设备被占用"）
-    let mut again = base.clone();
+    let mut again = base;
     again.remote_port = None;
     host.start(again.clone(), None).context("第一次启动失败")?;
-    host.start(again.clone(), None).context("连续第二次启动失败 —— 没有先 stop 干净")?;
+    host.start(again.clone(), None)
+        .context("连续第二次启动失败 —— 没有先 stop 干净")?;
     println!("✅ 连续两次启动          正常（内部先停后起）");
     host.stop();
 
@@ -502,7 +526,8 @@ pub fn run(dir: PathBuf) -> Result<()> {
     if rss_before > 0 && leak {
         bail!(
             "反复启停 {cycles} 次后内存仍在持续增长（{} → {} KB，总增长 {grown} KB）—— 疑似泄漏",
-            rss_before, rss_after
+            rss_before,
+            rss_after
         );
     }
     println!(

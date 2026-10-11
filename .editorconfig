@@ -1,0 +1,30 @@
+# 编辑器统一配置 —— 让不同编辑器/IDE 打开同一份代码时行为一致。
+# https://editorconfig.org
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+# Rust / TOML 都是 4 空格
+[*.{rs,toml}]
+indent_size = 4
+
+# 前端与配置
+[*.{js,mjs,json,html,css,yml,yaml}]
+indent_size = 2
+
+[*.md]
+# Markdown 里行尾两个空格是「强制换行」，不能删
+trim_trailing_whitespace = false
+
+[*.sh]
+indent_size = 2
+
+# 这些是二进制，别当文本处理
+[*.{png,icns,ico,wav,dmg}]
+insert_final_newline = false

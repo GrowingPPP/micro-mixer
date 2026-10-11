@@ -118,7 +118,8 @@ fn device_name(id: AudioObjectID) -> String {
     }
     let mut buf = [0i8; 256];
     // kCFStringEncodingUTF8 = 0x08000100
-    let ok = unsafe { CFStringGetCString(cfstr, buf.as_mut_ptr(), buf.len() as isize, 0x0800_0100) };
+    let ok =
+        unsafe { CFStringGetCString(cfstr, buf.as_mut_ptr(), buf.len() as isize, 0x0800_0100) };
     if !ok {
         return String::new();
     }
@@ -129,11 +130,7 @@ fn device_name(id: AudioObjectID) -> String {
 
 /// 系统当前默认输入设备。
 pub fn default_input() -> Option<(u32, String)> {
-    let id = get_u32(
-        K_AUDIO_OBJECT_SYSTEM_OBJECT,
-        b"dIn ",
-        SCOPE_GLOBAL,
-    )?;
+    let id = get_u32(K_AUDIO_OBJECT_SYSTEM_OBJECT, b"dIn ", SCOPE_GLOBAL)?;
     Some((id, device_name(id)))
 }
 
@@ -178,9 +175,7 @@ pub fn input_devices() -> Vec<(u32, String)> {
 pub fn has_input_stream(id: AudioObjectID) -> bool {
     let addr = AudioObjectPropertyAddress::new(fourcc(b"stm#"), SCOPE_INPUT);
     let mut size: u32 = 0;
-    let rc = unsafe {
-        AudioObjectGetPropertyDataSize(id, &addr, 0, std::ptr::null(), &mut size)
-    };
+    let rc = unsafe { AudioObjectGetPropertyDataSize(id, &addr, 0, std::ptr::null(), &mut size) };
     rc == 0 && size > 0
 }
 
@@ -228,14 +223,9 @@ pub fn output_devices() -> Vec<(u32, String)> {
 
 /// 设备有没有输出流。
 pub fn has_output_stream(id: AudioObjectID) -> bool {
-    let addr = AudioObjectPropertyAddress::new(
-        fourcc(b"stm#"),
-        u32::from_be_bytes(*b"outp"),
-    );
+    let addr = AudioObjectPropertyAddress::new(fourcc(b"stm#"), u32::from_be_bytes(*b"outp"));
     let mut size: u32 = 0;
-    let rc = unsafe {
-        AudioObjectGetPropertyDataSize(id, &addr, 0, std::ptr::null(), &mut size)
-    };
+    let rc = unsafe { AudioObjectGetPropertyDataSize(id, &addr, 0, std::ptr::null(), &mut size) };
     rc == 0 && size > 0
 }
 

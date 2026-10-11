@@ -1,0 +1,8 @@
+# 格式化规则。跑 `cargo fmt --all` 统一，`cargo fmt --all --check` 校验。
+#
+# 大部分用默认值 —— 本项目不引入花哨的 nightly-only 选项，
+# 保证任何人用稳定版工具链都能得到**完全一样**的结果。
+edition = "2021"
+max_width = 100
+use_field_init_shorthand = true
+use_try_shorthand = true

@@ -49,8 +49,8 @@ impl DecodedAudio {
 ///
 /// 支持 mp3 / aac(m4a) / flac / ogg-vorbis / wav / alac。
 pub fn decode_file(path: &Path, target_rate: u32) -> Result<DecodedAudio> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("打不开文件: {}", path.display()))?;
+    let file =
+        std::fs::File::open(path).with_context(|| format!("打不开文件: {}", path.display()))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
     let mut hint = Hint::new();

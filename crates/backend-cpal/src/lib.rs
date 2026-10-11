@@ -48,11 +48,7 @@ impl CpalBackend {
         };
         // 先精确匹配，再包含匹配
         devs.iter()
-            .find(|d| {
-                d.name()
-                    .map(|n| n.to_lowercase() == want)
-                    .unwrap_or(false)
-            })
+            .find(|d| d.name().map(|n| n.to_lowercase() == want).unwrap_or(false))
             .or_else(|| {
                 devs.iter().find(|d| {
                     d.name()
@@ -86,9 +82,9 @@ fn pick_config(
     let mut consider = |range: cpal::SupportedStreamConfigRange| {
         let (min, max) = (range.min_sample_rate().0, range.max_sample_rate().0);
         let cfg = if prefer.sample_rate >= min && prefer.sample_rate <= max {
-            range.clone().with_sample_rate(cpal::SampleRate(prefer.sample_rate))
+            range.with_sample_rate(cpal::SampleRate(prefer.sample_rate))
         } else {
-            range.clone().with_max_sample_rate()
+            range.with_max_sample_rate()
         };
         if prefer.sample_rate >= min
             && prefer.sample_rate <= max
@@ -210,7 +206,11 @@ impl AudioBackend for CpalBackend {
     fn input_format(&self, id: &DeviceId, prefer: Option<StreamFormat>) -> Result<StreamFormat> {
         let host = Self::host();
         let dev = Self::resolve(&host, id, Direction::Input)?;
-        let cfg = pick_config(&dev, Direction::Input, prefer.unwrap_or(StreamFormat::new(48_000, 1)))?;
+        let cfg = pick_config(
+            &dev,
+            Direction::Input,
+            prefer.unwrap_or(StreamFormat::new(48_000, 1)),
+        )?;
         Ok(StreamFormat::new(cfg.sample_rate().0, cfg.channels()))
     }
 
@@ -233,7 +233,11 @@ impl AudioBackend for CpalBackend {
     ) -> Result<Box<dyn AudioStream>> {
         let host = Self::host();
         let dev = Self::resolve(&host, id, Direction::Input)?;
-        let cfg = pick_config(&dev, Direction::Input, prefer.unwrap_or(StreamFormat::new(48_000, 1)))?;
+        let cfg = pick_config(
+            &dev,
+            Direction::Input,
+            prefer.unwrap_or(StreamFormat::new(48_000, 1)),
+        )?;
         let fmt = StreamFormat::new(cfg.sample_rate().0, cfg.channels());
         let sc = stream_config(&cfg);
         let name = dev.name().unwrap_or_else(|_| id.to_string());

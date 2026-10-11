@@ -79,7 +79,11 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
-            .or_else(|| std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(".config")))
+            .or_else(|| {
+                std::env::var("HOME")
+                    .ok()
+                    .map(|h| PathBuf::from(h).join(".config"))
+            })
             .unwrap_or_else(|| PathBuf::from("."));
         base.join("mixer").join("config.toml")
     }
@@ -130,12 +134,10 @@ impl Config {
                 "sound_dirs" => c.sound_dirs = parse_list(val).into_iter().map(expand).collect(),
                 "sound_names" => c.sound_names = parse_list(val),
                 "sound_tags" => c.sound_tags = parse_list(val),
-                "sound_files" => {
-                    c.sound_files = parse_list(val).into_iter().map(expand).collect()
-                }
+                "sound_files" => c.sound_files = parse_list(val).into_iter().map(expand).collect(),
                 "monitor" => c.monitor = parse_bool(val),
                 "monitor_device" => c.monitor_device = parse_str(val),
-            "sound_gains" => {
+                "sound_gains" => {
                     c.sound_gains = parse_list(val)
                         .iter()
                         .map(|x| x.parse::<f32>().unwrap_or(0.0))
@@ -186,7 +188,11 @@ impl Config {
             s += &format!("sound_files = [{}]\n", items.join(", "));
         }
         if !self.sound_gains.is_empty() {
-            let items: Vec<String> = self.sound_gains.iter().map(|g| format!("\"{g}\"")).collect();
+            let items: Vec<String> = self
+                .sound_gains
+                .iter()
+                .map(|g| format!("\"{g}\""))
+                .collect();
             s += &format!("sound_gains = [{}]\n", items.join(", "));
         }
         if !self.sound_names.is_empty() {
@@ -252,17 +258,9 @@ impl Config {
             "monitor" => self.monitor = parse_bool(v),
             "monitor_device" => self.monitor_device = parse_str(v),
             "sound_names" => {
-                self.sound_names = v
-                    .split('\n')
-                    .map(|x| x.trim().to_string())
-                    .collect()
+                self.sound_names = v.split('\n').map(|x| x.trim().to_string()).collect()
             }
-            "sound_tags" => {
-                self.sound_tags = v
-                    .split('\n')
-                    .map(|x| x.trim().to_string())
-                    .collect()
-            }
+            "sound_tags" => self.sound_tags = v.split('\n').map(|x| x.trim().to_string()).collect(),
             "sound_gains" => {
                 self.sound_gains = v
                     .split(',')
@@ -371,13 +369,14 @@ fn parse_str(v: &str) -> Option<String> {
     }
 }
 
-/// 解析 `["a", "b"]` 或 `a, b` 两种写法
 /// 解析布尔值。缺失或无法识别时按 `true`（`monitor` 键的缺省即开启）。
+///
+/// 认这几种"假"的写法：`false` / `0` / `no` / `off`（大小写不敏感）。
 fn parse_bool(v: &str) -> bool {
-    match v.trim().to_ascii_lowercase().as_str() {
-        "false" | "0" | "no" | "off" => false,
-        _ => true,
-    }
+    !matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "false" | "0" | "no" | "off"
+    )
 }
 
 fn parse_list(v: &str) -> Vec<String> {
@@ -493,9 +492,11 @@ sfx_gain_db = -9
 
     #[test]
     fn 显式文件列表优先于目录() {
-        let mut c = Config::default();
-        c.sound_dirs = vec![PathBuf::from("/nonexistent_dir_xyz")];
-        c.sound_files = vec![PathBuf::from("/tmp/whatever.mp3")];
+        let c = Config {
+            sound_dirs: vec![PathBuf::from("/nonexistent_dir_xyz")],
+            sound_files: vec![PathBuf::from("/tmp/whatever.mp3")],
+            ..Default::default()
+        };
         let got = c.collect_sounds().unwrap();
         assert_eq!(got, c.sound_files, "有显式列表时不应去扫目录");
     }
@@ -520,14 +521,13 @@ sfx_gain_db = -9
 
     #[test]
     fn 音效库条目应能从并行数组组合出来并写回() {
-        let mut c = Config::default();
-        c.sound_files = vec![
-            PathBuf::from("/a/笑声.mp3"),
-            PathBuf::from("/a/b.wav"),
-        ];
-        c.sound_gains = vec![-3.0];
-        c.sound_names = vec!["大笑".into()];
-        c.sound_tags = vec!["笑声|常用".into()];
+        let mut c = Config {
+            sound_files: vec![PathBuf::from("/a/笑声.mp3"), PathBuf::from("/a/b.wav")],
+            sound_gains: vec![-3.0],
+            sound_names: vec!["大笑".into()],
+            sound_tags: vec!["笑声|常用".into()],
+            ..Default::default()
+        };
 
         let items = c.sound_items();
         assert_eq!(items.len(), 2);
@@ -551,10 +551,12 @@ sfx_gain_db = -9
 
     #[test]
     fn 名称与标签应能往返序列化() {
-        let mut c = Config::default();
-        c.sound_files = vec![PathBuf::from("/a.mp3")];
-        c.sound_names = vec!["带空格 的名字".into()];
-        c.sound_tags = vec!["标签一|标签二".into()];
+        let c = Config {
+            sound_files: vec![PathBuf::from("/a.mp3")],
+            sound_names: vec!["带空格 的名字".into()],
+            sound_tags: vec!["标签一|标签二".into()],
+            ..Default::default()
+        };
         let round = Config::parse(&c.to_text());
         assert_eq!(round.sound_names, c.sound_names);
         assert_eq!(round.sound_tags, c.sound_tags);
@@ -631,8 +633,11 @@ mod scan_tests {
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
-        assert_eq!(names, vec!["a.mp3", "b.wav", "c.WAV", "d.flac"],
-                   "应只保留音频、忽略大小写、按名排序");
+        assert_eq!(
+            names,
+            vec!["a.mp3", "b.wav", "c.WAV", "d.flac"],
+            "应只保留音频、忽略大小写、按名排序"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

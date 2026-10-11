@@ -25,11 +25,15 @@ fn main() {
     println!("\n[A] 闭包不捕获任何数据");
     for i in 1..=6 {
         let s = b
-            .open_output(&dev, Some(fmt), Box::new(|d: &mut [f32]| {
-                for x in d.iter_mut() {
-                    *x = 0.0;
-                }
-            }))
+            .open_output(
+                &dev,
+                Some(fmt),
+                Box::new(|d: &mut [f32]| {
+                    for x in d.iter_mut() {
+                        *x = 0.0;
+                    }
+                }),
+            )
             .expect("开流失败");
         std::thread::sleep(Duration::from_millis(120));
         drop(s);

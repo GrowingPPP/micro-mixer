@@ -339,7 +339,7 @@ impl FilePlayer {
         }
         let g = db_to_lin(self.gain.get());
 
-        for frame in out.chunks_exact_mut(2) {
+        for frame in out.as_chunks_mut::<2>().0 {
             // 淡变推进（每帧一次，而不是每样本）
             if self.fade_dir > 0.0 {
                 self.fade = (self.fade + self.fade_step).min(1.0);
@@ -519,7 +519,7 @@ impl RenderProcessor {
         // 1. 从环形缓冲取麦克风数据（立体声）
         let mic = &mut self.mic[..used];
         let mut underrun = false;
-        for f in mic.chunks_exact_mut(2) {
+        for f in mic.as_chunks_mut::<2>().0 {
             match (self.ring.pop(), self.ring.pop()) {
                 (Ok(l), Ok(r)) => {
                     f[0] = l;
@@ -561,9 +561,7 @@ impl RenderProcessor {
             }
         }
         self.stats.playing.store(any_active, Ordering::Relaxed);
-        self.stats
-            .active_slot
-            .store(active_slot, Ordering::Relaxed);
+        self.stats.active_slot.store(active_slot, Ordering::Relaxed);
         self.stats.playhead.store(playhead, Ordering::Relaxed);
 
         // 3. 混音（增益在实时线程读取，无锁）
@@ -803,7 +801,7 @@ mod tests {
         e.render.process(&mut out);
         let peak = out.iter().fold(0f32, |m, s| m.max(s.abs()));
         assert!((peak - 0.5).abs() < 0.05, "透传峰值应约 0.5，实际 {peak}");
-        for f in out.chunks_exact(2).take(100) {
+        for f in out.as_chunks::<2>().0.iter().take(100) {
             assert!((f[0] - f[1]).abs() < 1e-6, "左右声道应一致（单声道兼容）");
         }
     }
@@ -817,7 +815,7 @@ mod tests {
             20,
         );
         let mut input = vec![0f32; 4800];
-        for f in input.chunks_exact_mut(2) {
+        for f in input.as_chunks_mut::<2>().0 {
             f[0] = 0.5;
         }
         e.capture.process(&input);
@@ -903,13 +901,19 @@ mod tests {
         ctl.sfx_gain_db.set(0.0); // 断言原始幅度，绕开默认 -6dB
 
         ctl.play(0);
-        assert!((渲染取峰值(&mut e, 6) - 0.3).abs() < 0.05, "槽位 0 应独立可播");
+        assert!(
+            (渲染取峰值(&mut e, 6) - 0.3).abs() < 0.05,
+            "槽位 0 应独立可播"
+        );
 
         ctl.stop(0);
         let _ = 渲染取峰值(&mut e, 6);
 
         ctl.play(1);
-        assert!((渲染取峰值(&mut e, 6) - 0.4).abs() < 0.05, "槽位 1 应独立可播");
+        assert!(
+            (渲染取峰值(&mut e, 6) - 0.4).abs() < 0.05,
+            "槽位 1 应独立可播"
+        );
 
         // 叠加：槽位 1 + 2 应约为 0.6
         ctl.play(2);
@@ -1008,7 +1012,11 @@ mod tests {
             e.render.process(&mut out);
         }
         let st = e.control.stats();
-        assert!(st.out_peak_db < -80.0, "静音时峰值应 < -80dBFS，实际 {}", st.out_peak_db);
+        assert!(
+            st.out_peak_db < -80.0,
+            "静音时峰值应 < -80dBFS，实际 {}",
+            st.out_peak_db
+        );
     }
 
     #[test]
@@ -1028,7 +1036,11 @@ mod tests {
             "限幅上限是 -1dBFS，电平表不应读到更高：{:.2}",
             st.out_peak_db
         );
-        assert!(st.out_peak_db > -6.0, "限幅后应接近 -1dBFS，实际 {:.2}", st.out_peak_db);
+        assert!(
+            st.out_peak_db > -6.0,
+            "限幅后应接近 -1dBFS，实际 {:.2}",
+            st.out_peak_db
+        );
     }
 
     #[test]
@@ -1063,7 +1075,10 @@ mod tests {
         ctl.play(0); // 重触发
         let _ = 渲染取峰值(&mut e, 8);
         let after = ctl.playhead_frames();
-        assert!(after < before + 200, "重触发后播放位置应回到开头附近，before={before} after={after}");
+        assert!(
+            after < before + 200,
+            "重触发后播放位置应回到开头附近，before={before} after={after}"
+        );
         // 重触发后仍在正常发声
         assert!(渲染取峰值(&mut e, 6) > 0.5, "重触发后应继续发声");
     }
@@ -1115,7 +1130,11 @@ mod tests {
         ctl.play(1);
         let _ = 渲染取峰值(&mut e, 8);
         let s = ctl.stats();
-        assert!(s.limiter_gain_db < -0.5, "两路 0.9 叠加应触发限幅，实际增益 {}dB", s.limiter_gain_db);
+        assert!(
+            s.limiter_gain_db < -0.5,
+            "两路 0.9 叠加应触发限幅，实际增益 {}dB",
+            s.limiter_gain_db
+        );
         let peak = 渲染取峰值(&mut e, 4);
         assert!(peak <= 0.92, "限幅后峰值应受限，实际 {peak}");
     }
@@ -1131,7 +1150,10 @@ mod tests {
         e.control.play(0);
         let peak = 渲染取峰值(&mut e, 6);
         // -6dB ≈ 0.501
-        assert!((peak - 0.501).abs() < 0.03, "默认增益应约 -6dB，实际峰值 {peak}");
+        assert!(
+            (peak - 0.501).abs() < 0.03,
+            "默认增益应约 -6dB，实际峰值 {peak}"
+        );
     }
 
     /// 播放音高必须与源文件一致 —— 用零交叉法独立测量。
@@ -1169,7 +1191,7 @@ mod tests {
             let mut mono: Vec<f32> = Vec::new();
             for _ in 0..12 {
                 e.render.process(&mut out);
-                mono.extend(out.chunks_exact(2).map(|f| f[0]));
+                mono.extend(out.as_chunks::<2>().0.iter().map(|f| f[0]));
             }
             let measured = 测量频率(&mono, sr);
             assert!(

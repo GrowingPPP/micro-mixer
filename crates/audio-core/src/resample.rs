@@ -63,7 +63,11 @@ impl LinearResampler {
             }
             let next = idx + 1;
             let frac = (self.pos - idx as f64) as f32;
-            let a = if idx < 0 { self.prev } else { input[idx as usize] };
+            let a = if idx < 0 {
+                self.prev
+            } else {
+                input[idx as usize]
+            };
             let b = input[next as usize];
             out[written] = a + (b - a) * frac;
             written += 1;

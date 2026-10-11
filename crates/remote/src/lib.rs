@@ -58,7 +58,11 @@ impl Shared {
         *self.on_play.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
     }
     fn fire_hook(&self, slot: usize) {
-        let h = self.on_play.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let h = self
+            .on_play
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if let Some(h) = h {
             h(slot);
         }
@@ -75,9 +79,7 @@ pub fn serve(shared: Arc<Shared>, cfg: RemoteConfig) -> Result<Vec<String>> {
     let addr = format!("{}:{}", cfg.bind, cfg.port);
     let listener = TcpListener::bind(&addr)
         .with_context(|| format!("监听 {addr} 失败（端口被占用？换 --remote <端口>）"))?;
-    listener
-        .set_nonblocking(false)
-        .ok();
+    listener.set_nonblocking(false).ok();
 
     let port = cfg.port;
 
@@ -108,8 +110,16 @@ pub fn serve(shared: Arc<Shared>, cfg: RemoteConfig) -> Result<Vec<String>> {
 }
 
 fn handle(mut s: TcpStream, shared: &Shared) -> Result<()> {
-    let ctl = shared.control.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let slots: Vec<String> = shared.slots.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let ctl = shared
+        .control
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let slots: Vec<String> = shared
+        .slots
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     let ctl = match ctl {
         Some(c) => c,
         None => {
@@ -153,15 +163,25 @@ function pct(db){{return Math.max(0,Math.min(100,(db+60)/60*100));}}setTimeout((
         }
         "/stop" => {
             ctl.stop_all();
-            respond(&mut s, 200, "application/json", r#"{"ok":true,"action":"stop_all"}"#)
+            respond(
+                &mut s,
+                200,
+                "application/json",
+                r#"{"ok":true,"action":"stop_all"}"#,
+            )
         }
         "/status" => {
             let st = ctl.stats();
             // 带上电平：手机上也能看到"队友听到的声音有多大"
             let body = format!(
                 r#"{{"playing":{},"slot":{},"playhead":{},"underruns":{},"overruns":{},"peak_db":{:.1},"rms_db":{:.1}}}"#,
-                st.playing, st.active_slot, st.playhead, st.underruns, st.overruns,
-                st.out_peak_db, st.out_rms_db
+                st.playing,
+                st.active_slot,
+                st.playhead,
+                st.underruns,
+                st.overruns,
+                st.out_peak_db,
+                st.out_rms_db
             );
             respond(&mut s, 200, "application/json", &body)
         }
@@ -196,7 +216,7 @@ fn respond(s: &mut TcpStream, code: u16, ctype: &str, body: &str) -> Result<()> 
     let resp = format!(
         "HTTP/1.1 {code} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n\
          Cache-Control: no-store\r\nConnection: close\r\n\r\n{body}",
-        body.as_bytes().len()
+        body.len()
     );
     s.write_all(resp.as_bytes())?;
     s.flush()?;
@@ -290,7 +310,13 @@ pub fn qr_matrix(text: &str) -> Option<(usize, Vec<bool>)> {
     let code = QrCode::new(text.as_bytes()).ok()?;
     let w = code.width();
     let colors = code.to_colors();
-    Some((w, colors.into_iter().map(|c| c == qrcode::Color::Dark).collect()))
+    Some((
+        w,
+        colors
+            .into_iter()
+            .map(|c| c == qrcode::Color::Dark)
+            .collect(),
+    ))
 }
 
 /// macOS 应用防火墙开着时，返回一句**可操作**的提示（手机可能连不上）。
@@ -370,12 +396,12 @@ fn local_ipv4_addrs() -> Vec<String> {
                 raw & 0xff
             );
             // 有线/无线网卡排最前，其余靠后
-            let prio = if name.starts_with("en") || name.starts_with("eth") || name.starts_with("wl")
-            {
-                0
-            } else {
-                1
-            };
+            let prio =
+                if name.starts_with("en") || name.starts_with("eth") || name.starts_with("wl") {
+                    0
+                } else {
+                    1
+                };
             out.push((prio, ip));
         }
         libc::freeifaddrs(ifap);

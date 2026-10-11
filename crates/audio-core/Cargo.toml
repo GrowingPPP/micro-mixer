@@ -9,3 +9,6 @@ thiserror.workspace = true
 log.workspace = true
 rtrb.workspace = true
 symphonia.workspace = true
+
+[lints]
+workspace = true

@@ -37,7 +37,7 @@ fn main() -> anyhow::Result<()> {
 
     // 相位累加器 —— 严格按协商到的采样率推进
     let phase = Arc::new(AtomicU64::new(0));
-    let phase_cb = phase.clone();
+    let phase_cb = phase;
     let sr = fmt.sample_rate as f32;
     let step = (freq / sr * (u32::MAX as f32)) as u64; // 每帧的相位增量
 
@@ -46,7 +46,7 @@ fn main() -> anyhow::Result<()> {
         Some(fmt),
         Box::new(move |out: &mut [f32]| {
             let mut p = phase_cb.load(Ordering::Relaxed);
-            for frame in out.chunks_exact_mut(2) {
+            for frame in out.as_chunks_mut::<2>().0 {
                 let s = ((p as f64 / u32::MAX as f64) as f32 * 2.0 * PI).sin() * 0.5;
                 frame[0] = s;
                 frame[1] = s;

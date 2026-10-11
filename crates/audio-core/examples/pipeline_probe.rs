@@ -61,11 +61,24 @@ fn main() -> anyhow::Result<()> {
     // 1. 解码
     let mut audio = decode_file(Path::new(&path), sr)?;
     audio.normalize_peak(0.708);
-    println!("源文件解码后：{:.3}s  峰值 {:.1} dBFS", audio.duration_secs, 20.0 * audio.peak().max(1e-9).log10());
-    let src_mono: Vec<f32> = audio.samples.chunks_exact(2).map(|f| f[0]).collect();
+    println!(
+        "源文件解码后：{:.3}s  峰值 {:.1} dBFS",
+        audio.duration_secs,
+        20.0 * audio.peak().max(1e-9).log10()
+    );
+    let src_mono: Vec<f32> = audio
+        .samples
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|f| f[0])
+        .collect();
     let mid = &src_mono[src_mono.len() / 4..src_mono.len() / 4 + src_mono.len() / 2];
-    println!("  解码后频率: 零交叉 {:.1} Hz / DFT {:.0} Hz",
-        zerocross_freq(mid, sr), dft_peak(mid, sr, 50.0, 4000.0));
+    println!(
+        "  解码后频率: 零交叉 {:.1} Hz / DFT {:.0} Hz",
+        zerocross_freq(mid, sr),
+        dft_peak(mid, sr, 50.0, 4000.0)
+    );
 
     // 2. 引擎
     let slot = SfxSlot {
@@ -92,17 +105,24 @@ fn main() -> anyhow::Result<()> {
     let mut rendered = 0usize;
     while rendered < total_frames {
         parts.render.process(&mut out);
-        mono.extend(out.chunks_exact(2).map(|f| f[0]));
+        mono.extend(out.as_chunks::<2>().0.iter().map(|f| f[0]));
         rendered += FRAMES;
     }
 
-    println!("\n引擎输出：{} 帧 ({:.3}s)", mono.len(), mono.len() as f32 / sr as f32);
+    println!(
+        "\n引擎输出：{} 帧 ({:.3}s)",
+        mono.len(),
+        mono.len() as f32 / sr as f32
+    );
     // 跳过淡入，取中段
     let a = mono.len() / 4;
     let b = a + mono.len() / 2;
     let seg = &mono[a..b];
-    println!("  引擎输出频率: 零交叉 {:.1} Hz / DFT {:.0} Hz",
-        zerocross_freq(seg, sr), dft_peak(seg, sr, 50.0, 4000.0));
+    println!(
+        "  引擎输出频率: 零交叉 {:.1} Hz / DFT {:.0} Hz",
+        zerocross_freq(seg, sr),
+        dft_peak(seg, sr, 50.0, 4000.0)
+    );
 
     // 4. 检查是否有削波（会引入谐波）
     let peak = mono.iter().fold(0f32, |m, s| m.max(s.abs()));

@@ -32,6 +32,22 @@ symphonia = { version = "0.5", default-features = false, features = [
     "pcm", "adpcm", "mp3", "mpa", "aac", "alac", "flac", "vorbis",
 ] }
 
+# ── 集中式 lint 策略 ──────────────────────────────────────────────
+# 各 crate 用 `[lints] workspace = true` 继承，规则只在这里维护一份。
+# 项目当前是 **0 告警**状态，改动请保持。
+[workspace.lints.rust]
+# 2024 edition 会默认开启；提前用上，避免以后迁移时集中爆问题
+unsafe_op_in_unsafe_fn = "warn"
+# 别让 `let _ = foo()` 悄悄吞掉 Result
+unused_must_use = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# 手写 FFI 的地方多，把这几条打开
+not_unsafe_ptr_arg_deref = "warn"
+# 音频回调之类的热路径上，别写出无意义的 clone/alloc
+redundant_clone = "warn"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

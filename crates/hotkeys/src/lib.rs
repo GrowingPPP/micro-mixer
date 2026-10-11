@@ -64,9 +64,9 @@
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Context, Result};
-use std::sync::Arc;
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+use std::sync::Arc;
 
 // ─────────────────────────────────────────── 平台：事件循环
 
@@ -125,8 +125,7 @@ pub fn pump_carbon_events(timeout_secs: f64) -> bool {
     false
 }
 
-static APP_LOOP_QUIT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static APP_LOOP_QUIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 运行**应用事件循环**（阻塞，直到 [`quit_app_event_loop`]）。
 ///
@@ -431,7 +430,10 @@ impl CodeExt for Code {
             return Ok(c);
         }
         // Numpad1 / NumpadAdd 之类的驼峰名
-        if let Some(rest) = s.strip_prefix("numpad").or_else(|| s.strip_prefix("Numpad")) {
+        if let Some(rest) = s
+            .strip_prefix("numpad")
+            .or_else(|| s.strip_prefix("Numpad"))
+        {
             let cand = format!("Numpad{}", capitalize(rest));
             if let Ok(c) = Code::from_str(&cand) {
                 return Ok(c);

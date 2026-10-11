@@ -267,7 +267,12 @@ fn stop_preview(host: State<'_, AudioHost>) {
 fn add_files() -> Vec<String> {
     rfd::FileDialog::new()
         .set_title("添加音效")
-        .add_filter("音频", &["mp3", "wav", "ogg", "m4a", "flac", "aac", "aiff", "caf", "opus"])
+        .add_filter(
+            "音频",
+            &[
+                "mp3", "wav", "ogg", "m4a", "flac", "aac", "aiff", "caf", "opus",
+            ],
+        )
         .pick_files()
         .map(|v| v.into_iter().map(|p| p.display().to_string()).collect())
         .unwrap_or_default()
@@ -347,11 +352,8 @@ fn save_config(
     c.set("sound_dirs", &dir).map_err(err)?;
     c.set("monitor", if monitor { "true" } else { "false" })
         .map_err(err)?;
-    c.set(
-        "monitor_device",
-        monitor_device.as_deref().unwrap_or(""),
-    )
-    .map_err(err)?;
+    c.set("monitor_device", monitor_device.as_deref().unwrap_or(""))
+        .map_err(err)?;
 
     // 音效库：整组覆盖（路径/音量/名字/标签），保持并行数组一一对应
     let parsed: Vec<app_config::SoundItem> = items
@@ -381,15 +383,24 @@ fn save_config(
                 .map(|t| t.trim().to_string())
                 .filter(|t| !t.is_empty())
                 .collect();
-            Some(app_config::SoundItem { path, name, gain_db: gain, tags })
+            Some(app_config::SoundItem {
+                path,
+                name,
+                gain_db: gain,
+                tags,
+            })
         })
         .collect();
     c.set_sound_items(&parsed);
-    c.set("input_device", input_device.as_deref().unwrap_or("none")).map_err(err)?;
-    c.set("output_device", output_device.as_deref().unwrap_or("none")).map_err(err)?;
+    c.set("input_device", input_device.as_deref().unwrap_or("none"))
+        .map_err(err)?;
+    c.set("output_device", output_device.as_deref().unwrap_or("none"))
+        .map_err(err)?;
     c.set("buffer_ms", &buffer_ms.to_string()).map_err(err)?;
-    c.set("mic_gain_db", &mic_gain_db.to_string()).map_err(err)?;
-    c.set("sfx_gain_db", &sfx_gain_db.to_string()).map_err(err)?;
+    c.set("mic_gain_db", &mic_gain_db.to_string())
+        .map_err(err)?;
+    c.set("sfx_gain_db", &sfx_gain_db.to_string())
+        .map_err(err)?;
     c.set("hotkeys", &hotkeys).map_err(err)?;
     c.save().map(|_| ()).map_err(err)
 }
@@ -487,7 +498,10 @@ fn acquire_single_instance() -> Option<std::net::TcpListener> {
 }
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,symphonia=off")).init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn,symphonia=off"),
+    )
+    .init();
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -577,7 +591,9 @@ fn main() {
                                 println!("[热插拔] ❌ {msg}");
                                 host.set_device_lost(Some(msg));
                             } else if in_lost {
-                                println!("[热插拔] ⚠ 麦克风「{name}」已断开，自动切到系统默认麦克风…");
+                                println!(
+                                    "[热插拔] ⚠ 麦克风「{name}」已断开，自动切到系统默认麦克风…"
+                                );
                                 match host.recover_input_device(Some(&h)) {
                                     Ok(old) => {
                                         println!("[热插拔] ✅ 已从「{old}」切到系统默认麦克风");
@@ -631,8 +647,12 @@ fn main() {
                         "关窗前 : running={} 设备={} 槽位={}\n\
                          关窗后 : running={} 设备={} 槽位={}  可见={visible} 存在={alive}\n\
                          {verdict}",
-                        before.running, before.device, before.slots.len(),
-                        after.running, after.device, after.slots.len()
+                        before.running,
+                        before.device,
+                        before.slots.len(),
+                        after.running,
+                        after.device,
+                        after.slots.len()
                     );
                     println!("[探针] {msg}");
                     let _ = std::fs::write("/tmp/close_probe.txt", &msg);
