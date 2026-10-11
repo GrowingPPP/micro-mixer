@@ -164,11 +164,45 @@ impl CpalBackend {
 }
 
 /// 为方向 `dir` 挑选最接近 `prefer` 的配置。
+/// 设备的默认格式能不能直接用？
+///
+/// 抽出来是为了能测 —— "优先用默认格式"这条策略的边界条件
+/// （单声道设备、0 采样率）不该只靠读代码确认。
+fn acceptable_default(cfg: &cpal::SupportedStreamConfig, prefer: StreamFormat) -> bool {
+    cfg.sample_rate().0 > 0 && cfg.channels() >= prefer.channels
+}
+
 fn pick_config(
     dev: &cpal::Device,
     dir: Direction,
     prefer: StreamFormat,
 ) -> Result<cpal::SupportedStreamConfig> {
+    // ── ① 优先用设备**自己的默认格式** ──────────────────────────────
+    //
+    // 为什么不直接用我们想要的 48000：
+    //
+    // · **Windows / WASAPI**：共享模式下只有一个格式是**保证**支持的，就是
+    //   `GetMixFormat()` 返回的那个。`supported_output_configs()` 是拿 mix format
+    //   去"变造"出各种采样率（cpal 源码里的注释明说了），所以请求 48000 而设备
+    //   混音格式是 44100 时，系统的音频引擎会**隐式重采样** —— 多一层延迟。
+    //   这正是 M3-02 要避免的。
+    //
+    // · **macOS / CoreAudio**：同理。实测这台机器的默认输出就是 44100，
+    //   而我们一直在请求 48000 —— 也就是说 macOS 上其实也一直在重采样，
+    //   只是 CoreAudio 不报错、听感上也听不出来，所以一直没发现。
+    //
+    // 设备默认格式拿不到时，再退回下面的挑挑选选。
+    let default_cfg = match dir {
+        Direction::Input => dev.default_input_config().ok(),
+        Direction::Output => dev.default_output_config().ok(),
+    };
+    if let Some(d) = default_cfg {
+        if acceptable_default(&d, prefer) {
+            return Ok(d);
+        }
+    }
+
+    // ── ② 回退：在设备支持的配置里挑 ──
     let mut exact: Option<cpal::SupportedStreamConfig> = None;
     let mut relaxed: Option<cpal::SupportedStreamConfig> = None;
 
@@ -334,6 +368,21 @@ impl AudioBackend for CpalBackend {
         let fmt = StreamFormat::new(cfg.sample_rate().0, cfg.channels());
         let sc = stream_config(&cfg);
         let name = dev.name().unwrap_or_else(|_| id.to_string());
+        // 用设备默认格式（不重采样）还是我们挑的格式？出问题时这行很关键
+        let is_default = match dev.default_input_config() {
+            Ok(d) => d.sample_rate().0 == cfg.sample_rate().0 && d.channels() == cfg.channels(),
+            Err(_) => false,
+        };
+        log::info!(
+            "[audio] 输入流 {}Hz/{}ch（{}）",
+            cfg.sample_rate().0,
+            cfg.channels(),
+            if is_default {
+                "设备默认格式，无重采样"
+            } else {
+                "协商后的格式"
+            }
+        );
         let err_fn = |e: cpal::StreamError| {
             log::error!("[audio] 输入流错误: {e}");
             record_stream_error("输入", &e.to_string());
@@ -401,6 +450,20 @@ impl AudioBackend for CpalBackend {
         let fmt = StreamFormat::new(cfg.sample_rate().0, cfg.channels());
         let sc = stream_config(&cfg);
         let name = dev.name().unwrap_or_else(|_| id.to_string());
+        let is_default = match dev.default_output_config() {
+            Ok(d) => d.sample_rate().0 == cfg.sample_rate().0 && d.channels() == cfg.channels(),
+            Err(_) => false,
+        };
+        log::info!(
+            "[audio] 输出流 {}Hz/{}ch（{}）",
+            cfg.sample_rate().0,
+            cfg.channels(),
+            if is_default {
+                "设备默认格式，无重采样"
+            } else {
+                "协商后的格式"
+            }
+        );
         let err_fn = |e: cpal::StreamError| {
             log::error!("[audio] 输出流错误: {e}");
             record_stream_error("输出", &e.to_string());
@@ -451,5 +514,48 @@ impl AudioBackend for CpalBackend {
             format: fmt,
             name,
         }))
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    fn cfg(rate: u32, ch: u16) -> cpal::SupportedStreamConfig {
+        cpal::SupportedStreamConfig::new(
+            ch,
+            cpal::SampleRate(rate),
+            cpal::SupportedBufferSize::Range { min: 0, max: 0 },
+            cpal::SampleFormat::F32,
+        )
+    }
+
+    #[test]
+    fn 默认格式够用就直接用_避免系统重采样() {
+        // 立体声输出设备给 44100 —— 我们要的就是它，不该硬要 48000
+        assert!(acceptable_default(
+            &cfg(44100, 2),
+            StreamFormat::new(48000, 2)
+        ));
+        // 单声道输入设备
+        assert!(acceptable_default(
+            &cfg(48000, 1),
+            StreamFormat::new(48000, 1)
+        ));
+    }
+
+    #[test]
+    fn 声道不够就退回协商() {
+        // 输出要立体声，设备默认只有单声道 → 不能用
+        assert!(!acceptable_default(
+            &cfg(48000, 1),
+            StreamFormat::new(48000, 2)
+        ));
+    }
+
+    #[test]
+    fn 零采样率必须拒掉() {
+        // 有些驱动在设备刚插上时会返回 0，直接拿去开流会失败得很莫名
+        assert!(!acceptable_default(&cfg(0, 2), StreamFormat::new(48000, 2)));
     }
 }
