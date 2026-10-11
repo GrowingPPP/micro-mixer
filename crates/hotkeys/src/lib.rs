@@ -232,18 +232,70 @@ impl HotkeyPoller {
 }
 
 /// 热键管理器：把一组键位绑定到音效槽位。
-///
-/// **不需要 `Send`** —— 它只在创建它的那个线程上用。
-/// 需要跨线程轮询时用 [`Hotkeys::poller`] 拿一个 [`HotkeyPoller`]。
 pub struct Hotkeys {
     /// 必须持有 —— Drop 时会注销所有热键
-    _manager: Arc<GlobalHotKeyManager>,
+    _manager: ManagerOwner,
     /// 系统热键 id → 槽位索引
     id_to_slot: HashMap<u32, usize>,
     /// 便于日志与报错
     bindings: Vec<(String, usize)>,
     /// 已注册的键对象 —— 待机时要拿它去注销
     keys: Vec<HotKey>,
+}
+
+/// 管理器的持有者。
+///
+/// ## 为什么需要这一层
+///
+/// `GlobalHotKeyManager` 在 **Windows 上不实现 `Send`**（它就是个 `HWND` 包装），
+/// 而我们的架构里 `Hotkeys` 必须能跨线程传递：
+/// 它在主线程创建（两个平台都要求），然后通过 channel 送回调用方，
+/// 还要存进 Tauri 的 `State<AudioHost>`（要求 `Send + Sync`）。
+///
+/// ## 为什么断言 `Send` 是成立的
+///
+/// 逐个操作核对过线程亲和性：
+///
+/// | 操作 | 线程亲和性 |
+/// |---|---|
+/// | `RegisterHotKey(hwnd, …)` | **无** —— 关联表是进程全局的；`WM_HOTKEY` 仍然投递到**创建窗口那个线程**的消息队列 |
+/// | `UnregisterHotKey(hwnd, …)` | **无** |
+/// | `Drop` → `DestroyWindow(hwnd)` | ⚠️ **有** —— 必须在创建窗口的线程上调用 |
+///
+/// 所以前两个跨线程没问题（消息的派发线程由窗口决定，而我们本来就在主线程泵消息），
+/// **只有析构是问题** —— 见下面 `Drop` 里的处理。
+///
+/// > macOS 上不需要这套：global-hotkey 自己写了 `unsafe impl Send`。
+struct ManagerOwner(Option<Arc<GlobalHotKeyManager>>);
+
+// SAFETY: 依据见上面那张表。
+// · register / unregister 无线程亲和性，跨线程调用安全；
+// · 唯一有亲和性的 DestroyWindow 被下面的 Drop 显式绕开了。
+#[cfg(target_os = "windows")]
+unsafe impl Send for ManagerOwner {}
+#[cfg(target_os = "windows")]
+unsafe impl Sync for ManagerOwner {}
+
+impl Drop for ManagerOwner {
+    fn drop(&mut self) {
+        #[cfg(target_os = "windows")]
+        {
+            // Windows 的 `GlobalHotKeyManager::drop` 会调 `DestroyWindow`，
+            // 而那个**必须**在创建窗口的线程上做。我们保证不了析构发生在那里
+            // （`Hotkeys` 会随 `AudioHost` 一起被释放，那可能在任何线程）。
+            //
+            // 与其在错误的线程上析构（`DestroyWindow` 会失败，行为未定义），
+            // 不如**故意泄漏**：代价是一个隐藏窗口，进程退出时由系统回收。
+            // 触发频率很低 —— 只在待机↔开启切换、重新绑定时发生。
+            if let Some(m) = self.0.take() {
+                std::mem::forget(m);
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.0.take();
+        }
+    }
 }
 
 impl Hotkeys {
@@ -287,7 +339,7 @@ impl Hotkeys {
         }
 
         Ok(Self {
-            _manager: manager,
+            _manager: ManagerOwner(Some(manager)),
             id_to_slot,
             bindings,
             keys: raw,
@@ -303,7 +355,7 @@ impl Hotkeys {
         if self.keys.is_empty() {
             return Ok(());
         }
-        self._manager
+        self.manager()?
             .unregister_all(&self.keys)
             .context("注销热键失败")?;
         self.keys.clear();
@@ -329,7 +381,7 @@ impl Hotkeys {
         for (slot, spec) in keys.iter().enumerate() {
             let hk = parse_hotkey(spec)
                 .with_context(|| format!("热键「{spec}」无法解析（第 {} 个）", slot + 1))?;
-            self._manager
+            self.manager()?
                 .register(hk)
                 .with_context(|| format!("热键「{spec}」重新注册失败"))?;
             id_to_slot.insert(hk.id(), slot);
@@ -340,6 +392,11 @@ impl Hotkeys {
         self.bindings = bindings;
         self.keys = raw;
         Ok(())
+    }
+
+    /// 取管理器。正常路径上它一定在 —— `None` 只可能出现在析构过程中。
+    fn manager(&self) -> Result<&GlobalHotKeyManager> {
+        self._manager.0.as_deref().context("热键管理器已被释放")
     }
 
     /// 拿一个可以跨线程用的轮询句柄。

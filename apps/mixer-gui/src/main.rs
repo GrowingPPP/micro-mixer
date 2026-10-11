@@ -462,6 +462,9 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
     let stop = MenuItem::with_id(app, "stop", "全部停止音效", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
+    // 「切回真实麦克风」目前只有 macOS 实现（改的是系统默认输入设备）。
+    // Windows 上要改的是"默认通信设备"，那是另一套 API —— 见 TODO。
+    #[cfg(target_os = "macos")]
     let revert = MenuItem::with_id(
         app,
         "revert",
@@ -470,7 +473,10 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         None::<&str>,
     )?;
     let quit = MenuItem::with_id(app, "quit", "退出（停止音频）", true, None::<&str>)?;
+    #[cfg(target_os = "macos")]
     let menu = Menu::with_items(app, &[&show, &stop, &revert, &sep, &quit])?;
+    #[cfg(not(target_os = "macos"))]
+    let menu = Menu::with_items(app, &[&show, &stop, &sep, &quit])?;
 
     let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray44.png"))?;
 
@@ -486,6 +492,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                 let _ = app.state::<AudioHost>().stop_all();
                 println!("[菜单栏] 已全部停止");
             }
+            #[cfg(target_os = "macos")]
             "revert" => {
                 // 用户点这个就说明他不想再用虚拟麦克风了 —— 把系统默认输入切回真实麦克风。
                 // ⚠️ 显式指定了麦克风的游戏改不了，要提醒用户自己进去改。
