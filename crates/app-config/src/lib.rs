@@ -48,6 +48,16 @@ pub struct Config {
     pub monitor_device: Option<String>,
     /// 热键列表（与音效槽位一一对应）
     pub hotkeys: Vec<String>,
+
+    /// 解析时不认识的行，原样留着。
+    ///
+    /// 为什么要留：这是个**用户可以直接编辑**的文本文件。早先保存时只写自己认识的键，
+    /// 结果是用户手加的配置（或未来版本才有的键）在下次界面保存时**被静默抹掉** ——
+    /// 表现是"我的设置莫名其妙没了"，极难查。
+    ///
+    /// 留着它们，保存就是**无损往返**的。注释不保留（每次重新生成）。
+    #[doc(hidden)]
+    pub unknown_lines: Vec<String>,
 }
 
 impl Default for Config {
@@ -68,24 +78,69 @@ impl Default for Config {
             monitor: true,
             monitor_device: None,
             hotkeys: Vec::new(),
+            unknown_lines: Vec::new(),
         }
     }
 }
 
-impl Config {
-    /// 配置文件路径。遵循 `XDG_CONFIG_HOME`。
-    pub fn path() -> PathBuf {
-        let base = std::env::var("XDG_CONFIG_HOME")
-            .ok()
+/// 用户主目录。**Windows 上没有 `HOME`**，要用 `USERPROFILE`。
+pub fn home_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("USERPROFILE")
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var("HOME")
-                    .ok()
-                    .map(|h| PathBuf::from(h).join(".config"))
-            })
-            .unwrap_or_else(|| PathBuf::from("."));
-        base.join("mixer").join("config.toml")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::env::var_os("HOME")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    }
+}
+
+/// 配置的根目录。按平台选约定位置。
+pub fn base_dir() -> PathBuf {
+    // Windows：%APPDATA%\  （Roaming —— 设置跟着用户漫游）
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(v) = std::env::var_os("APPDATA").filter(|s| !s.is_empty()) {
+            return PathBuf::from(v);
+        }
+        // 极少数情况下 APPDATA 没设（服务账户等）——退回用户目录下的标准位置
+        if let Some(v) = std::env::var_os("USERPROFILE").filter(|s| !s.is_empty()) {
+            return PathBuf::from(v).join("AppData").join("Roaming");
+        }
+    }
+
+    // macOS / Linux：XDG 约定
+    #[cfg(not(target_os = "windows"))]
+    {
+        if let Some(v) = std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
+            return PathBuf::from(v);
+        }
+        if let Some(v) = std::env::var_os("HOME").filter(|s| !s.is_empty()) {
+            return PathBuf::from(v).join(".config");
+        }
+    }
+
+    // 都拿不到 —— 用一个**固定**的临时位置，而不是 "."。
+    // "." 会随启动方式漂移，用户会看到"设置时好时坏"这种最难查的现象。
+    std::env::temp_dir().join("mixer-config")
+}
+
+impl Config {
+    /// 配置文件路径。
+    ///
+    /// - **macOS / Linux**：遵循 `XDG_CONFIG_HOME`，回退到 `~/.config`
+    /// - **Windows**：`%APPDATA%`（Roaming，设置跟着用户走）
+    ///
+    /// ⚠️ Windows 上**没有** `HOME` 也没有 `XDG_CONFIG_HOME` ——
+    /// 早先的实现在那儿会一路回退到 `"."`，也就是**当前工作目录**。
+    /// GUI 应用的 CWD 是不可预测的（可能是 `C:\Windows\System32`），
+    /// 结果是用户每次改完设置、下次打开就没了。这是个必须在移植时修掉的坑。
+    pub fn path() -> PathBuf {
+        base_dir().join("mixer").join("config.toml")
     }
 
     /// 读取配置。文件不存在时返回默认值（不是错误）。
@@ -144,7 +199,12 @@ impl Config {
                         .collect()
                 }
                 "hotkeys" => c.hotkeys = parse_list(val),
-                _ => {} // 未知键忽略，保持向前兼容
+                // 不认识的键**原样留着**，保存时写回去。
+                //
+                // 早先这里是 `_ => {}`（丢掉）—— 解析上"向前兼容"了，
+                // 但保存时会把用户手加的内容和未来版本的键**静默抹掉**。
+                // 丢数据比不认识一个键糟糕得多。
+                _ => c.unknown_lines.push(raw.trim_end().to_string()),
             }
         }
         c
@@ -214,6 +274,15 @@ impl Config {
         if !self.hotkeys.is_empty() {
             let items: Vec<String> = self.hotkeys.iter().map(|h| format!("\"{h}\"")).collect();
             s += &format!("hotkeys = [{}]\n", items.join(", "));
+        }
+
+        // 把不认识的行原样写回去 —— 保证用户手改的内容不会因为我们保存而丢失
+        if !self.unknown_lines.is_empty() {
+            s += "\n# 以下内容本程序不认识，原样保留\n";
+            for l in &self.unknown_lines {
+                s += l;
+                s += "\n";
+            }
         }
         s
     }
@@ -439,9 +508,16 @@ sfx_gain_db = -9
     }
 
     #[test]
-    fn 未知键与畸形行应被忽略而不是报错() {
+    fn 未知键不报错且被保留_畸形行直接丢弃() {
         let c = Config::parse("future_key = 1\n这是一行垃圾\nbuffer_ms = 25\n");
+        // 已知项照常解析
         assert_eq!(c.buffer_ms, Some(25));
+        // 不认识的**键值行**保留下来（保存时写回去，避免抹掉用户手改的内容）
+        assert_eq!(c.unknown_lines, vec!["future_key = 1".to_string()]);
+        // 连 `=` 都没有的行是垃圾，丢掉 —— 保留它没有意义
+        let out = c.to_text();
+        assert!(out.contains("future_key = 1"));
+        assert!(!out.contains("这是一行垃圾"));
     }
 
     #[test]
@@ -460,6 +536,7 @@ sfx_gain_db = -9
             monitor: false,
             monitor_device: None,
             hotkeys: vec!["F1".into(), "F2".into()],
+            unknown_lines: Vec::new(),
         };
         let round = Config::parse(&c.to_text());
         assert_eq!(round, c, "序列化再解析应完全一致");
@@ -644,6 +721,31 @@ mod scan_tests {
     #[test]
     fn 不存在的目录应报错而不是静默返回空() {
         assert!(scan_dir(Path::new("/nonexistent/xyz")).is_err());
+    }
+
+    #[test]
+    fn 未知键在保存后仍然存在() {
+        // 这是个用户可以直接编辑的文本文件。早先保存时只写自己认识的键，
+        // 结果手加的内容和未来版本的键会被**静默抹掉** —— 丢数据比不认识一个键糟糕得多。
+        let text = r#"
+output_device = "豆包"
+buffer_ms = 20
+some_future_key = 123
+手写的键 = "别弄丢我"
+"#;
+        let c = Config::parse(text);
+        assert_eq!(c.unknown_lines.len(), 2, "两个未知键都该被记下来");
+
+        let out = c.to_text();
+        assert!(out.contains("some_future_key = 123"), "未知键丢了：\n{out}");
+        assert!(
+            out.contains("手写的键 = \"别弄丢我\""),
+            "中文键丢了：\n{out}"
+        );
+
+        // 再解析一遍，未知键不能变多（否则每存一次就长一截）
+        let again = Config::parse(&out);
+        assert_eq!(again.unknown_lines.len(), 2, "往返之后未知键变多了");
     }
 
     #[test]

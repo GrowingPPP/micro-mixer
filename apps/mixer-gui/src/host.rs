@@ -339,12 +339,20 @@ pub fn probe_sound_file_access(paths: &[PathBuf]) {
 
 /// panic 日志文件路径（macOS 惯例：`~/Library/Logs/<App>/`）。
 pub fn panic_log_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(
-        std::path::PathBuf::from(home)
-            .join("Library/Logs/音效板")
-            .join("panic.log"),
-    )
+    // Windows 上没有 HOME，日志按惯例放 %LOCALAPPDATA%
+    #[cfg(target_os = "windows")]
+    let dir = std::env::var_os("LOCALAPPDATA")
+        .filter(|s| !s.is_empty())
+        .map(|v| std::path::PathBuf::from(v).join("音效板").join("logs"))?;
+
+    // macOS 惯例：~/Library/Logs/<App>/
+    #[cfg(not(target_os = "windows"))]
+    let dir = {
+        let home = std::env::var("HOME").ok()?;
+        std::path::PathBuf::from(home).join("Library/Logs/音效板")
+    };
+
+    Some(dir.join("panic.log"))
 }
 
 /// 装上 panic hook：**落盘 + 上报界面**。

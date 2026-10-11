@@ -16,13 +16,71 @@ use anyhow::{bail, Context, Result};
 
 use crate::host::{AudioHost, StartConfig};
 
-/// 读当前进程的常驻内存（KB）。macOS 没有 /proc，走 ps。
+/// 读当前进程的常驻内存（KB）。
+///
+/// 反复启停的音效引擎最容易泄漏（历史上真漏过：cpal 的闭包没释放，
+/// 30 轮涨到 106MB）。所以这条检查在**两个平台上都要有** ——
+/// 不能因为 Windows 上没有 `ps` 就把它跳过。
+#[cfg(not(target_os = "windows"))]
 fn rss_kb() -> Option<u64> {
+    // macOS 没有 /proc，走 ps；Linux 上 ps 也有
     let out = std::process::Command::new("ps")
         .args(["-o", "rss=", "-p", &std::process::id().to_string()])
         .output()
         .ok()?;
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// 读当前进程的工作集大小（KB）—— Windows 版。
+///
+/// Windows 既没有 `/proc` 也没有 `ps`，走 `GetProcessMemoryInfo`。
+/// 手写 FFI 而不是引依赖：只为这一个调用拉一个 windows-sys 进来不值当，
+/// 而且这个结构体的布局是**稳定**的（Win32 从 NT4 起没变过）。
+#[cfg(target_os = "windows")]
+fn rss_kb() -> Option<u64> {
+    #[repr(C)]
+    struct ProcessMemoryCounters {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+
+    #[link(name = "psapi")]
+    unsafe extern "system" {
+        fn GetProcessMemoryInfo(
+            process: *mut core::ffi::c_void,
+            counters: *mut ProcessMemoryCounters,
+            cb: u32,
+        ) -> i32;
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+    }
+
+    let mut pmc = ProcessMemoryCounters {
+        cb: std::mem::size_of::<ProcessMemoryCounters>() as u32,
+        page_fault_count: 0,
+        peak_working_set_size: 0,
+        working_set_size: 0,
+        quota_peak_paged_pool_usage: 0,
+        quota_paged_pool_usage: 0,
+        quota_peak_non_paged_pool_usage: 0,
+        quota_non_paged_pool_usage: 0,
+        pagefile_usage: 0,
+        peak_pagefile_usage: 0,
+    };
+    // SAFETY: pmc 是按 Win32 文档定义的结构体，cb 已填对；
+    // GetCurrentProcess 返回的是伪句柄，不需要释放。
+    let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) };
+    if ok == 0 {
+        return None;
+    }
+    Some((pmc.working_set_size / 1024) as u64)
 }
 
 /// 极简 HTTP GET（只用于冒烟测试，不处理 chunked 等复杂情况）。

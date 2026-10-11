@@ -58,8 +58,8 @@ fn pick_dir() -> Option<String> {
 
 fn shellexpand_tilde(p: &str) -> String {
     if let Some(rest) = p.strip_prefix("~/") {
-        if let Ok(h) = std::env::var("HOME") {
-            return format!("{h}/{rest}");
+        if let Some(h) = app_config::home_dir() {
+            return h.join(rest).display().to_string();
         }
     }
     p.to_string()
@@ -660,9 +660,9 @@ fn main() {
             .and_then(|i| args.get(i + 1))
             .map(PathBuf::from)
             .unwrap_or_else(|| {
-                std::env::var("HOME")
-                    .map(|h| PathBuf::from(h).join("Sounds"))
-                    .unwrap_or_else(|_| PathBuf::from("."))
+                app_config::home_dir()
+                    .map(|h| h.join("Sounds"))
+                    .unwrap_or_else(|| std::env::temp_dir().join("mixer-smoke"))
             });
         match smoke::run(dir) {
             Ok(()) => std::process::exit(0),
