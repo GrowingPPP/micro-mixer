@@ -36,7 +36,7 @@ echo "── 1/3 打包 ──"
 
 APP="../../target/release/bundle/macos/音效板.app"
 
-echo "── 2/3 重新签名 ──"
+echo "── 2/4 重新签名 ──"
 
 pick_identity() {
   # 优先用户显式指定
@@ -71,7 +71,7 @@ else
   echo "  已附加 entitlements: audio-input"
 fi
 
-echo "── 3/3 校验 ──"
+echo "── 3/4 校验 ──"
 codesign -v "$APP" && echo "  ✅ 签名有效"
 # 把签名指纹打出来 —— 它是 TCC 识别"这是同一个 App"的依据，
 # 指纹变了权限就要重新授权。想确认"这次打包会不会又要弹窗"就看它。
@@ -96,6 +96,101 @@ else
   echo "  ⚠ 当前签名没有 audio-input entitlement"
   echo "     —— 如果你用的是 ad-hoc 签名，这不影响；用了真证书 + 强化运行时就会录不到声音。"
 fi
+# ── 4/4 打 DMG ────────────────────────────────────────────────
+#
+# ⚠️ 顺序很关键：**必须在重新签名之后**做 dmg。
+#    如果交给 `tauri build` 顺手打包，dmg 里装的会是签名失效的那个版本
+#    （tauri build 合并 Info.plist 之后原签名就废了），用户装上去拿不到麦克风权限。
+echo
+echo "── 4/4 打 DMG ──"
+
+VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist" 2>/dev/null || echo "0.0.0")
+DMG_DIR="$(cd ../.. && pwd)/target/release/bundle/dmg"
+DMG="$DMG_DIR/音效板_${VERSION}.dmg"
+mkdir -p "$DMG_DIR"
+
+STAGE=$(mktemp -d)
+cp -R "$APP" "$STAGE/"
+# 拖拽安装的惯例：旁边放一个 Applications 的快捷方式
+ln -s /Applications "$STAGE/Applications"
+
+# 没公证的 App 直接双击会被 Gatekeeper 拦，用户不知道怎么办 —— 写在盘里
+cat > "$STAGE/首次打开请看这里.txt" <<'NOTE'
+首次打开请这样做
+=================
+
+这个 App 没有经过 Apple 公证（公证需要付费的开发者账号），
+所以**直接双击会被系统拦住**，提示"无法验证开发者"。
+
+正确做法：
+  1. 把「音效板」拖进旁边的 Applications 文件夹
+  2. 打开「应用程序」，**按住 Control 键点它 → 选「打开」**
+  3. 弹窗里再点一次「打开」
+做完这一次，以后就能正常双击启动了（系统会记住）。
+
+
+还有一件事：这个 App 需要系统里有一个「虚拟声卡」
+================================================
+
+游戏和语音软件只能从「麦克风」读声音。虚拟声卡扮演的就是那个麦克风 ——
+我们把音效写进去，游戏从它读出来。
+
+macOS 系统自带的没有，所以要装一个。**推荐 BlackHole（免费、开源）**：
+
+    brew install --cask blackhole-2ch
+
+没装 Homebrew 的话，去 https://existential.audio/blackhole/ 下载安装包。
+装完**重启一次**。
+
+App 启动后会自己检测：没装的话界面上会直接给出安装命令，点一下就能复制。
+NOTE
+
+rm -f "$DMG"
+hdiutil create -quiet -volname "音效板 $VERSION" \
+  -srcfolder "$STAGE" -ov -format UDZO "$DMG" \
+  || { echo "  ❌ 生成 DMG 失败"; rm -rf "$STAGE"; exit 1; }
+echo "  已生成: $(basename "$DMG")（$(du -h "$DMG" | cut -f1)）"
+
+# ── 验 DMG ──
+# 光看"文件生成了"不算数 —— 要挂起来确认里面的 App 签名**仍然有效**，
+# 以及拖拽安装需要的东西都在。
+echo
+echo "── 验证 DMG ──"
+# ⚠️ 别去解析 `hdiutil attach` 的输出 —— 加了 -quiet 它**什么都不打印**，
+#    而卷名里带空格（"音效板 0.1.0"）又会让按字段切分变得很脆。
+#    直接指定挂载点，稳。
+MP=$(mktemp -d)
+if ! hdiutil attach -quiet -nobrowse -readonly -mountpoint "$MP" "$DMG"; then
+  echo "  ❌ 挂载失败"; rm -rf "$STAGE" "$MP"; exit 1
+fi
+
+DMG_OK=1
+[ -d "$MP/音效板.app" ] && echo "  ✅ 里面有 App" || { echo "  ❌ 没有 App"; DMG_OK=0; }
+[ -L "$MP/Applications" ] && echo "  ✅ 有 Applications 快捷方式（可拖拽安装）" || { echo "  ⚠ 缺 Applications 快捷方式"; DMG_OK=0; }
+[ -f "$MP/首次打开请看这里.txt" ] && echo "  ✅ 有首次打开说明" || echo "  ⚠ 缺说明文件"
+
+# **最关键的一条**：dmg 里的 App 签名必须仍然有效（TCC 权限绑定签名）
+if codesign -v "$MP/音效板.app" 2>/dev/null; then
+  echo "  ✅ DMG 里的 App 签名有效"
+else
+  echo "  ❌ DMG 里的 App 签名无效 —— 装上去拿不到麦克风权限"; DMG_OK=0
+fi
+if codesign -d --entitlements - "$MP/音效板.app" 2>/dev/null | grep -q "audio-input"; then
+  echo "  ✅ DMG 里的 App 带 audio-input entitlement"
+else
+  echo "  ❌ DMG 里的 App 缺 audio-input entitlement"; DMG_OK=0
+fi
+if /usr/libexec/PlistBuddy -c "Print :NSMicrophoneUsageDescription" \
+     "$MP/音效板.app/Contents/Info.plist" >/dev/null 2>&1; then
+  echo "  ✅ DMG 里的 Info.plist 用途说明齐全"
+else
+  echo "  ❌ DMG 里的 Info.plist 缺用途说明"; DMG_OK=0
+fi
+
+hdiutil detach -quiet "$MP" 2>/dev/null
+rm -rf "$STAGE" "$MP"
+[ "$DMG_OK" = "1" ] || { echo "  ❌ DMG 校验未通过"; exit 1; }
+
 echo
 if [ "$IDENTITY" != "-" ]; then
   echo "  💡 用真证书签名 ⇒ **TCC 权限绑定这个身份，重新打包不会重置**，"
@@ -104,4 +199,6 @@ else
   echo "  💡 现在是 ad-hoc 签名 ⇒ 每次重新打包都会换指纹，麦克风权限要重新授权。"
 fi
 echo
-echo "产物: $(cd ../.. && pwd)/target/release/bundle/macos/音效板.app"
+echo "产物:"
+echo "  App: $(cd ../.. && pwd)/target/release/bundle/macos/音效板.app"
+echo "  DMG: $DMG   ← 把这个发给别人"
