@@ -414,6 +414,46 @@ pub fn run(dir: PathBuf) -> Result<()> {
         }
     }
 
+    // ── 设备掉线检测：靠的是**音频流自己报的错** ──
+    //
+    // 为什么不是"去枚举一遍设备列表"：那样要在另一个线程另起一个 cpal 后端，
+    // 实测会和主线程开流撞死（macOS 上直接卡住）。流错误是平台无关的信号 ——
+    // CoreAudio 和 WASAPI 在设备失效时都会回调。
+    //
+    // 真机上这条路没法自动化测（总不能在测试里真拔设备），所以用钩子注入一次。
+    {
+        host.start(base.clone(), None).context("启动失败")?;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // 注入一条"输入侧失效" —— 应当被判定为麦克风掉线
+        backend_cpal::report_stream_error("输入", "自测注入：设备已失效");
+        let r = host.check_devices();
+        match r {
+            Some((in_lost, out_lost, which)) => {
+                if !in_lost || out_lost {
+                    bail!("判定方向错了：in_lost={in_lost} out_lost={out_lost}");
+                }
+                println!("✅ 设备掉线检测      流报错 → 判定「{which}」掉线（输入侧）");
+            }
+            None => bail!("流报错没有被判定为设备掉线"),
+        }
+        // 信号只能消费一次 —— 否则会一直误报
+        if backend_cpal::take_stream_error().is_some() {
+            bail!("流错误信号被重复消费了，会一直误报掉线");
+        }
+
+        // 反向：输出侧
+        backend_cpal::report_stream_error("输出", "自测注入：设备已失效");
+        match host.check_devices() {
+            Some((in_lost, out_lost, _)) if !in_lost && out_lost => {
+                println!("✅ 设备掉线检测      输出侧也能正确判定");
+            }
+            other => bail!("输出侧的判定不对：{other:?}"),
+        }
+        backend_cpal::take_stream_error();
+        host.release();
+    }
+
     // ── 打开系统设置：只认白名单 ──
     //
     // 这条命令能拉起系统设置窗口，所以做成"前端传语义名、后端拼 URL"，

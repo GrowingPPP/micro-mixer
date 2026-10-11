@@ -17,6 +17,40 @@ use audio_core::device::{
 /// 上层（看门狗）应当把音频重启一遍。
 static CALLBACK_PANICKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// 最近一次**音频流错误**。
+///
+/// 为什么需要它：设备被拔掉时，最可靠的信号不是"去枚举一遍设备列表"
+/// （那样既慢又要另起一个后端，实测会和主线程开流撞死），
+/// 而是**流自己报的错** —— CoreAudio 和 WASAPI 都会在设备失效时回调错误。
+///
+/// 这个信号是平台无关的，看门狗读它就能知道"哪个方向断了"。
+static LAST_STREAM_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// 取走最近一次流错误（读一次就清）。返回值形如 `"输入: 设备已失效"`。
+pub fn take_stream_error() -> Option<String> {
+    LAST_STREAM_ERROR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+}
+
+/// 手动上报一次流错误。**仅用于自测** —— 真机上这条路是
+/// CoreAudio / WASAPI 在设备失效时回调进来的，没法在自动化测试里真的拔设备。
+///
+/// 不做成测试钩子的话，"设备掉线检测"就只是"接上了但没验过"。
+#[doc(hidden)]
+pub fn report_stream_error(direction: &str, msg: &str) {
+    record_stream_error(direction, msg);
+}
+
+fn record_stream_error(direction: &str, msg: &str) {
+    let mut g = LAST_STREAM_ERROR.lock().unwrap_or_else(|e| e.into_inner());
+    // 只留第一条 —— 设备掉了之后错误会连着刷，后面的没有信息量
+    if g.is_none() {
+        *g = Some(format!("{direction}: {msg}"));
+    }
+}
+
 /// 音频回调里是否 panic 过。看门狗据此决定要不要重启音频。
 pub fn engine_panicked() -> bool {
     CALLBACK_PANICKED.load(std::sync::atomic::Ordering::Relaxed)
@@ -300,7 +334,10 @@ impl AudioBackend for CpalBackend {
         let fmt = StreamFormat::new(cfg.sample_rate().0, cfg.channels());
         let sc = stream_config(&cfg);
         let name = dev.name().unwrap_or_else(|_| id.to_string());
-        let err_fn = |e| log::error!("[audio] 输入流错误: {e}");
+        let err_fn = |e: cpal::StreamError| {
+            log::error!("[audio] 输入流错误: {e}");
+            record_stream_error("输入", &e.to_string());
+        };
 
         // 在分派到各采样格式之前先包一层 —— 6 条分支就都受保护了
         let mut cb = guard_input(cb);
@@ -364,7 +401,10 @@ impl AudioBackend for CpalBackend {
         let fmt = StreamFormat::new(cfg.sample_rate().0, cfg.channels());
         let sc = stream_config(&cfg);
         let name = dev.name().unwrap_or_else(|_| id.to_string());
-        let err_fn = |e| log::error!("[audio] 输出流错误: {e}");
+        let err_fn = |e: cpal::StreamError| {
+            log::error!("[audio] 输出流错误: {e}");
+            record_stream_error("输出", &e.to_string());
+        };
 
         // 同上：先包一层 panic 兜底
         let mut cb = guard_output(cb);

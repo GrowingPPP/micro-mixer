@@ -1070,6 +1070,20 @@ impl AudioHost {
         };
         // ⚠️ 这里**绝对不能**用 cpal 枚举设备：在另一个线程创建第二个 cpal 后端
         //    会和主线程"开音频流"撞死（实测 start() 直接卡住）。用自己的 CoreAudio 查询。
+        //
+        // 而**流自己的错误回调**是更好的信号，且平台无关：设备失效时 CoreAudio 和
+        // WASAPI 都会回调报错。所以顺序是：
+        //   ① 有流错误 → 直接用（两个平台都走这条，最可靠）
+        //   ② 没有 → 再用平台自己的枚举复查（目前只有 macOS 有这套查询）
+        //
+        // 早先非 macOS 分支用的是 `CpalBackend::new().devices()` ——
+        // **正是上面警告的那种写法**。macOS 上实测会卡死，Windows 上同样可疑。
+        if let Some(err) = backend_cpal::take_stream_error() {
+            let is_in = err.starts_with("输入");
+            let which = if is_in { in_name } else { out_name };
+            println!("[热插拔] 音频流报错（{err}）→ 判定「{which}」掉线");
+            return Some((is_in, !is_in, which));
+        }
         #[cfg(target_os = "macos")]
         let exists = {
             let ins = crate::macos_audio::input_devices();
@@ -1078,11 +1092,11 @@ impl AudioHost {
                 ins.iter().any(|(_, n)| n == name) || outs.iter().any(|(_, n)| n == name)
             }
         };
+        // 其他平台：没有自己的枚举查询，**就不做这一步轮询**。
+        // 设备真掉了的话，上面那条流错误一定会先到 —— 不值得为了兜底
+        // 去冒"另起一个后端把主线程卡死"的风险（那正是 macOS 上踩过的坑）。
         #[cfg(not(target_os = "macos"))]
-        let exists = {
-            let devs = CpalBackend::new().devices().ok()?;
-            move |name: &str| devs.iter().any(|d| d.name == name)
-        };
+        let exists = |_: &str| true;
 
         // 只检查用户**显式指定**的设备 —— 没指定就是用系统默认，
         // 系统默认变了由系统自己负责，不算"掉线"。
