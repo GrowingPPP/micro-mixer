@@ -82,6 +82,30 @@ lint 策略集中在根 `Cargo.toml` 的 `[workspace.lints]`，各 crate 用
   原子量传增益。这条没有例外。
 - **异步/回调里不许让 panic 跑出去。** 见下。
 
+### 平台相关的逻辑要写成能测的
+
+**交叉编译只证明"能编译"，证明不了"算得对"。** 而平台相关的逻辑一旦算错，
+表现往往是"设置莫名其妙丢了""日志找不到"这类最难查的问题。
+
+所以规则是：**把平台当参数传，别到处写 `#[cfg]`。**
+
+```rust
+// ❌ 这段在 macOS 上完全不可见，只能靠人工检查
+#[cfg(target_os = "windows")]
+{ std::env::var_os("APPDATA") }
+
+// ✅ 平台和环境变量都注入，Windows 分支就能在 macOS 上跑测试
+fn base_dir_on(p: Platform, env: EnvFn, tmp: &Path) -> PathBuf { … }
+```
+
+`app_config::Platform` 就是为此存在的。已有的例子：
+- `app_config::base_dir_on` / `home_dir_on` —— 配置与主目录
+- `host::panic_log_path_on` —— panic 日志位置
+- `main::platform_info_for` / `settings_url_for` —— 平台引导文案、系统设置白名单
+
+配套的测试都在文件末尾（`path_tests` / `panic_path_tests` / `platform_info_tests`），
+**它们跑在 macOS 上，验证的却是 Windows 的分支**。
+
 ### panic 策略（改之前先读完这段）
 
 release 用的是 `panic = "unwind"` 而**不是** `abort` —— 因为菜单栏常驻程序

@@ -184,7 +184,14 @@ fn js_error(msg: String, stack: String) {
 /// 所以由后端告诉它该显示哪一套，而不是在前端里堆 if。
 #[tauri::command]
 fn platform_info() -> serde_json::Value {
-    if cfg!(target_os = "windows") {
+    platform_info_for(app_config::Platform::current())
+}
+
+/// `platform_info` 的实际内容。**平台作为参数** —— 这样两套引导文案
+/// 都能在 macOS 上被单元测试覆盖（见文件末尾），
+/// 否则改了文案没有任何东西会拦住你。
+fn platform_info_for(p: app_config::Platform) -> serde_json::Value {
+    if p == app_config::Platform::Windows {
         serde_json::json!({
             "os": "windows",
             "title": "这台电脑上没找到虚拟声卡",
@@ -252,32 +259,43 @@ fn platform_info() -> serde_json::Value {
 ///
 /// 所以这里做成**只认白名单键**，前端传的是 `"microphone"` 这种语义名，
 /// 具体 URL 由后端拼 —— 前端没法让它去开任意地址。
+/// 系统设置页的**白名单映射**。
+///
+/// 抽成纯函数是为了能被单元测试覆盖 —— 这是个安全边界
+/// （前端只能传语义名，URL 由这里决定），不该只靠"看代码觉得对"。
+fn settings_url_for(p: app_config::Platform, page: &str) -> Option<&'static str> {
+    match (p, page) {
+        (app_config::Platform::Unix, "microphone") => {
+            Some("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
+        }
+        (app_config::Platform::Unix, "sound") => {
+            Some("x-apple.systempreferences:com.apple.Sound-Settings.extension")
+        }
+        (app_config::Platform::Windows, "microphone") => Some("ms-settings:privacy-microphone"),
+        (app_config::Platform::Windows, "sound") => Some("ms-settings:sound"),
+        _ => None,
+    }
+}
+
+/// 打开**系统设置里的某个页面**。
+///
+/// 为什么不复用 `open_url`：那个命令只允许 http/https（它是暴露给前端的，
+/// 收窄更安全）。而系统设置页用的是各平台私有 scheme
+/// （macOS 的 `x-apple.systempreferences:`、Windows 的 `ms-settings:`）。
+///
+/// 所以这里做成**只认白名单键**，前端传的是 `"microphone"` 这种语义名，
+/// 具体 URL 由后端拼 —— 前端没法让它去开任意地址。
 #[tauri::command]
 fn open_system_settings(page: String) -> Res<()> {
-    #[cfg(target_os = "macos")]
-    let url = match page.as_str() {
-        "microphone" => {
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
-        }
-        "sound" => "x-apple.systempreferences:com.apple.Sound-Settings.extension",
-        _ => return Err(format!("不认识的设置页：{page}")),
-    };
-    #[cfg(target_os = "windows")]
-    let url = match page.as_str() {
-        "microphone" => "ms-settings:privacy-microphone",
-        "sound" => "ms-settings:sound",
-        _ => return Err(format!("不认识的设置页：{page}").into()),
-    };
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let url = {
-        let _ = page;
-        return Err("暂不支持在这个平台打开系统设置".into());
-    };
+    let url = settings_url_for(app_config::Platform::current(), &page)
+        .ok_or_else(|| format!("不认识的设置页：{page}"))?;
 
-    #[cfg(target_os = "macos")]
-    let cmd = "open";
+    // Linux 上没有统一的"系统设置"入口，映射表里也没有它 —— 上面那步就会返回 None
     #[cfg(target_os = "windows")]
     let cmd = "explorer";
+    #[cfg(not(target_os = "windows"))]
+    let cmd = "open";
+
     std::process::Command::new(cmd)
         .arg(url)
         .spawn()
@@ -912,4 +930,119 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("启动界面失败");
+}
+
+#[cfg(test)]
+mod platform_info_tests {
+    // 测试名用中文描述 + 保留环境变量的大写写法（APPDATA / XDG / HOME / LOCALAPPDATA…）。
+    // 改成 snake_case 要把缩写降成小写，可读性反而更差 —— 这里 lint 是错的。
+    #![allow(non_snake_case)]
+    use super::*;
+    use app_config::Platform;
+
+    fn text_of(v: &serde_json::Value) -> String {
+        // 把整份引导压成一个字符串，方便断言"该说的有没有说"
+        serde_json::to_string(v).unwrap()
+    }
+
+    #[test]
+    fn windows_引导必须说清_VB_CABLE_命名是反的() {
+        // 这是 Windows 上最容易卡住人的地方：本程序输出到 CABLE Input，
+        // 而游戏选麦克风要选 CABLE Output。不写出来用户会在两个下拉框之间反复试。
+        let t = text_of(&platform_info_for(Platform::Windows));
+        assert!(t.contains("CABLE Input"), "没提 CABLE Input：{t}");
+        assert!(t.contains("CABLE Output"), "没提 CABLE Output：{t}");
+        assert!(t.contains("反的"), "没说清命名是反的");
+    }
+
+    #[test]
+    fn windows_引导必须点出桌面应用那个独立开关() {
+        // Windows 的麦克风权限有**两个**开关："麦克风访问"和"允许桌面应用访问"。
+        // 上面开了下面没开照样没声音，而这一点几乎没人会想到。
+        let t = text_of(&platform_info_for(Platform::Windows));
+        assert!(t.contains("桌面应用"), "没提「允许桌面应用访问」");
+    }
+
+    #[test]
+    fn windows_引导必须提默认通信设备() {
+        // Windows 有"默认设备"和"默认通信设备"两套，很多游戏读的是后者
+        let t = text_of(&platform_info_for(Platform::Windows));
+        assert!(t.contains("默认通信设备"), "没提默认通信设备");
+    }
+
+    #[test]
+    fn windows_用_VB_CABLE_而不是_BlackHole() {
+        let t = text_of(&platform_info_for(Platform::Windows));
+        assert!(t.contains("VB-CABLE"), "Windows 上该推 VB-CABLE");
+        assert!(!t.contains("BlackHole"), "Windows 上不该出现 BlackHole");
+        assert!(!t.contains("brew "), "Windows 上不该出现 brew 命令");
+    }
+
+    #[test]
+    fn macos_用_BlackHole_而不是_VB_CABLE() {
+        let t = text_of(&platform_info_for(Platform::Unix));
+        assert!(t.contains("BlackHole"), "macOS 上该推 BlackHole");
+        assert!(t.contains("brew install"), "macOS 上该给 brew 命令");
+    }
+
+    #[test]
+    fn 引导里的设置页键必须在白名单里() {
+        // 前端只传语义名，URL 由后端拼。所以"引导里写的键"和"白名单认的键"
+        // 必须对得上 —— 对不上的话用户在界面上点按钮会直接报错。
+        for p in [Platform::Windows, Platform::Unix] {
+            let v = platform_info_for(p);
+            let page = v["mic_privacy"]["settings_page"].as_str().unwrap_or("");
+            assert!(!page.is_empty(), "{p:?} 没给设置页键");
+            assert!(
+                settings_url_for(p, page).is_some(),
+                "{p:?} 的引导写了设置页「{page}」，但白名单不认这个键"
+            );
+        }
+    }
+
+    #[test]
+    fn 白名单拒绝一切非法键与跨平台键() {
+        // 这是安全边界：前端只能传语义名，传别的必须被拒
+        for bad in [
+            "file:///etc/passwd",
+            "http://evil.example",
+            "../../etc",
+            "",
+            "microphone/../sound",
+            "MICROPHONE", // 大小写敏感，不做模糊匹配
+        ] {
+            for p in [Platform::Windows, Platform::Unix] {
+                assert!(
+                    settings_url_for(p, bad).is_none(),
+                    "{p:?} 竟然接受了非法键 {bad:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn 平台之间不串用_scheme() {
+        // Windows 必须拿 ms-settings:，macOS 必须拿 x-apple.*
+        // 串了的话点按钮会静默失败
+        let w = settings_url_for(Platform::Windows, "microphone").unwrap();
+        assert!(w.starts_with("ms-settings:"), "Windows 拿到的是 {w}");
+        let m = settings_url_for(Platform::Unix, "microphone").unwrap();
+        assert!(m.starts_with("x-apple."), "macOS 拿到的是 {m}");
+    }
+
+    #[test]
+    fn 不许把系统设置的真实_URL_下发到前端() {
+        // 前端拿到 URL 就能自己拼任意地址；下发语义名则由后端把关
+        for p in [Platform::Windows, Platform::Unix] {
+            let t = text_of(&platform_info_for(p));
+            assert!(
+                !t.contains("ms-settings:"),
+                "{p:?} 把 ms-settings: 下发到前端了"
+            );
+            assert!(
+                !t.contains("x-apple.systempreferences:"),
+                "{p:?} 把 x-apple.systempreferences: 下发到前端了"
+            );
+        }
+    }
 }

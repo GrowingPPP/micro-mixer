@@ -337,22 +337,36 @@ pub fn probe_sound_file_access(paths: &[PathBuf]) {
         .ok();
 }
 
-/// panic 日志文件路径（macOS 惯例：`~/Library/Logs/<App>/`）。
+/// panic 日志文件路径。
+///
+/// - **Windows**：`%LOCALAPPDATA%\音效板\logs\panic.log`（Windows 惯例）
+/// - **macOS / Linux**：`~/Library/Logs/音效板/panic.log`（macOS 惯例）
+///
+/// 拆成"平台 + 环境变量注入"的纯函数，是为了**让 Windows 分支能在 macOS 上被测到** ——
+/// 交叉编译只证明能编译，证不了算得对。
 pub fn panic_log_path() -> Option<std::path::PathBuf> {
-    // Windows 上没有 HOME，日志按惯例放 %LOCALAPPDATA%
-    #[cfg(target_os = "windows")]
-    let dir = std::env::var_os("LOCALAPPDATA")
-        .filter(|s| !s.is_empty())
-        .map(|v| std::path::PathBuf::from(v).join("音效板").join("logs"))?;
+    panic_log_path_on(app_config::Platform::current(), &|k| std::env::var_os(k))
+}
 
-    // macOS 惯例：~/Library/Logs/<App>/
-    #[cfg(not(target_os = "windows"))]
-    let dir = {
-        let home = std::env::var("HOME").ok()?;
-        std::path::PathBuf::from(home).join("Library/Logs/音效板")
+fn panic_log_path_on(
+    p: app_config::Platform,
+    env: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    use std::ffi::OsString;
+    let get = |k: &str| -> Option<std::path::PathBuf> {
+        env(k).filter(|s: &OsString| !s.is_empty()).map(Into::into)
     };
-
-    Some(dir.join("panic.log"))
+    match p {
+        app_config::Platform::Windows => Some(
+            get("LOCALAPPDATA")?
+                .join("音效板")
+                .join("logs")
+                .join("panic.log"),
+        ),
+        app_config::Platform::Unix => {
+            Some(get("HOME")?.join("Library/Logs/音效板").join("panic.log"))
+        }
+    }
 }
 
 /// 装上 panic hook：**落盘 + 上报界面**。
@@ -1502,4 +1516,57 @@ fn play_samples(
     }
     drop(stream);
     Ok(())
+}
+
+#[cfg(test)]
+mod panic_path_tests {
+    // 测试名用中文描述 + 保留环境变量的大写写法（APPDATA / XDG / HOME / LOCALAPPDATA…）。
+    // 改成 snake_case 要把缩写降成小写，可读性反而更差 —— 这里 lint 是错的。
+    #![allow(non_snake_case)]
+    use super::*;
+    use std::ffi::OsString;
+
+    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+        move |k: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| OsString::from(v))
+        }
+    }
+
+    #[test]
+    fn windows_下日志走_LOCALAPPDATA() {
+        let env = env_of(&[("LOCALAPPDATA", "/LOCALAPPDATA"), ("HOME", "/HOME")]);
+        let p = panic_log_path_on(app_config::Platform::Windows, &env).unwrap();
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/LOCALAPPDATA/音效板/logs/panic.log")
+        );
+    }
+
+    #[test]
+    fn windows_上没有_LOCALAPPDATA_就是_None_不能退回_HOME() {
+        let env = env_of(&[("HOME", "/HOME")]);
+        assert!(
+            panic_log_path_on(app_config::Platform::Windows, &env).is_none(),
+            "Windows 上不该去读 HOME"
+        );
+    }
+
+    #[test]
+    fn unix_下日志走_HOME_的_Library_Logs() {
+        let env = env_of(&[("HOME", "/HOME")]);
+        let p = panic_log_path_on(app_config::Platform::Unix, &env).unwrap();
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/HOME/Library/Logs/音效板/panic.log")
+        );
+    }
+
+    #[test]
+    fn 空字符串不算有值() {
+        let env = env_of(&[("LOCALAPPDATA", "")]);
+        assert!(panic_log_path_on(app_config::Platform::Windows, &env).is_none());
+    }
 }

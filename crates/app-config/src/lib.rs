@@ -83,50 +83,93 @@ impl Default for Config {
     }
 }
 
+/// 目标平台。
+///
+/// ## 为什么做成运行时值，而不是到处写 `#[cfg]`
+///
+/// 平台相关的**路径逻辑**在 macOS 上完全不可见 —— 交叉编译只能证明它
+/// **能编译**，证明不了它**算得对**。而配置路径算错的表现是
+/// "设置莫名其妙丢了"，属于最难查的一类。
+///
+/// 把"平台判断"和"读环境变量"都变成参数之后，Windows 的分支就能在 macOS 上
+/// 跑单元测试了（见文件末尾那组测试）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    Windows,
+    Unix,
+}
+
+impl Platform {
+    /// 当前编译目标。
+    pub const fn current() -> Self {
+        if cfg!(target_os = "windows") {
+            Self::Windows
+        } else {
+            Self::Unix
+        }
+    }
+}
+
+/// 环境变量读取器。生产代码传 `std::env::var_os`，测试传假的。
+pub type EnvFn<'a> = &'a dyn Fn(&str) -> Option<std::ffi::OsString>;
+
+fn non_empty(v: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    v.filter(|s| !s.is_empty()).map(PathBuf::from)
+}
+
 /// 用户主目录。**Windows 上没有 `HOME`**，要用 `USERPROFILE`。
 pub fn home_dir() -> Option<PathBuf> {
-    #[cfg(target_os = "windows")]
-    {
-        std::env::var_os("USERPROFILE")
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        std::env::var_os("HOME")
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
+    home_dir_on(Platform::current(), &|k| std::env::var_os(k))
+}
+
+fn home_dir_on(p: Platform, env: EnvFn) -> Option<PathBuf> {
+    match p {
+        Platform::Windows => non_empty(env("USERPROFILE")),
+        Platform::Unix => non_empty(env("HOME")),
     }
 }
 
 /// 配置的根目录。按平台选约定位置。
+///
+/// - **Windows**：`%APPDATA%`（Roaming，设置跟着用户走）
+/// - **macOS / Linux**：`XDG_CONFIG_HOME`，回退 `~/.config`
+///
+/// ⚠️ Windows 上**没有** `HOME` 也没有 `XDG_CONFIG_HOME` ——
+/// 早先的实现在那儿会一路回退到 `"."`，也就是**当前工作目录**。
+/// GUI 应用的 CWD 是不可预测的（可能是 `C:\Windows\System32`），
+/// 结果是用户每次改完设置、下次打开就没了。这是个必须在移植时修掉的坑。
 pub fn base_dir() -> PathBuf {
-    // Windows：%APPDATA%\  （Roaming —— 设置跟着用户漫游）
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(v) = std::env::var_os("APPDATA").filter(|s| !s.is_empty()) {
-            return PathBuf::from(v);
-        }
-        // 极少数情况下 APPDATA 没设（服务账户等）——退回用户目录下的标准位置
-        if let Some(v) = std::env::var_os("USERPROFILE").filter(|s| !s.is_empty()) {
-            return PathBuf::from(v).join("AppData").join("Roaming");
-        }
-    }
+    base_dir_on(
+        Platform::current(),
+        &|k| std::env::var_os(k),
+        &std::env::temp_dir(),
+    )
+}
 
-    // macOS / Linux：XDG 约定
-    #[cfg(not(target_os = "windows"))]
-    {
-        if let Some(v) = std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
-            return PathBuf::from(v);
+fn base_dir_on(p: Platform, env: EnvFn, tmp: &std::path::Path) -> PathBuf {
+    match p {
+        Platform::Windows => {
+            if let Some(v) = non_empty(env("APPDATA")) {
+                return v;
+            }
+            // 极少数情况下 APPDATA 没设（服务账户等）——退回用户目录下的标准位置
+            if let Some(v) = non_empty(env("USERPROFILE")) {
+                return v.join("AppData").join("Roaming");
+            }
         }
-        if let Some(v) = std::env::var_os("HOME").filter(|s| !s.is_empty()) {
-            return PathBuf::from(v).join(".config");
+        Platform::Unix => {
+            if let Some(v) = non_empty(env("XDG_CONFIG_HOME")) {
+                return v;
+            }
+            if let Some(v) = non_empty(env("HOME")) {
+                return v.join(".config");
+            }
         }
     }
 
     // 都拿不到 —— 用一个**固定**的临时位置，而不是 "."。
     // "." 会随启动方式漂移，用户会看到"设置时好时坏"这种最难查的现象。
-    std::env::temp_dir().join("mixer-config")
+    tmp.join("mixer-config")
 }
 
 impl Config {
@@ -466,6 +509,123 @@ fn expand(p: String) -> PathBuf {
         }
     }
     PathBuf::from(p)
+}
+
+/// 路径解析的单元测试。
+///
+/// **这组测试的价值在于：它们在 macOS 上跑，验证的却是 Windows 的分支。**
+/// 交叉编译只能证明那些代码能编译；这里证明它算得对。
+/// 动机是实际踩到的坑：Windows 上没有 `HOME`/`XDG_CONFIG_HOME`，
+/// 旧实现一路回退到 `"."`（当前工作目录），用户的设置会莫名其妙丢失。
+#[cfg(test)]
+mod path_tests {
+    // 测试名用中文描述 + 保留环境变量的大写写法（APPDATA / XDG / HOME / LOCALAPPDATA…）。
+    // 改成 snake_case 要把缩写降成小写，可读性反而更差 —— 这里 lint 是错的。
+    #![allow(non_snake_case)]
+    use super::*;
+    use std::ffi::OsString;
+
+    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsString> + 'a {
+        move |k: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| OsString::from(v))
+        }
+    }
+
+    #[test]
+    fn windows_配置路径优先用_APPDATA() {
+        let env = env_of(&[
+            ("APPDATA", "/APPDATA"),
+            ("USERPROFILE", "/USERPROFILE"),
+            ("HOME", "/HOME"),
+            ("XDG_CONFIG_HOME", "/XDG"),
+        ]);
+        let got = base_dir_on(Platform::Windows, &env, std::path::Path::new("/TMP"));
+        assert_eq!(got, PathBuf::from("/APPDATA"), "Windows 上必须优先 APPDATA");
+    }
+
+    #[test]
+    fn windows_没有_APPDATA_时退回_USERPROFILE() {
+        let env = env_of(&[("USERPROFILE", "/USERPROFILE"), ("HOME", "/HOME")]);
+        let got = base_dir_on(Platform::Windows, &env, std::path::Path::new("/TMP"));
+        assert_eq!(got, PathBuf::from("/USERPROFILE/AppData/Roaming"));
+    }
+
+    #[test]
+    fn windows_环境变量全空时_绝不能落到当前目录() {
+        // 这一条是整个模块存在的理由：旧实现会返回 "."（当前工作目录），
+        // GUI 的 CWD 不可预测，用户会看到"设置时好时坏"。
+        let env = env_of(&[]);
+        let got = base_dir_on(Platform::Windows, &env, std::path::Path::new("/TMP"));
+        assert_eq!(got, PathBuf::from("/TMP/mixer-config"));
+        assert_ne!(got, PathBuf::from("."));
+        assert_ne!(got, PathBuf::from(""));
+    }
+
+    #[test]
+    fn unix_配置路径优先用_XDG() {
+        let env = env_of(&[("XDG_CONFIG_HOME", "/XDG"), ("HOME", "/HOME")]);
+        assert_eq!(
+            base_dir_on(Platform::Unix, &env, std::path::Path::new("/TMP")),
+            PathBuf::from("/XDG")
+        );
+    }
+
+    #[test]
+    fn unix_没有_XDG_时用_HOME_下的_config() {
+        let env = env_of(&[("HOME", "/HOME")]);
+        assert_eq!(
+            base_dir_on(Platform::Unix, &env, std::path::Path::new("/TMP")),
+            PathBuf::from("/HOME/.config")
+        );
+    }
+
+    #[test]
+    fn 空字符串等同于没设置() {
+        // 有些环境会把变量设成空串。当成"有值"的话路径会变成相对路径。
+        let env = env_of(&[("APPDATA", ""), ("USERPROFILE", "/USERPROFILE")]);
+        assert_eq!(
+            base_dir_on(Platform::Windows, &env, std::path::Path::new("/TMP")),
+            PathBuf::from("/USERPROFILE/AppData/Roaming")
+        );
+    }
+
+    #[test]
+    fn 主目录在_windows_上认_USERPROFILE_而不是_HOME() {
+        let env = env_of(&[("USERPROFILE", "/USERPROFILE"), ("HOME", "/HOME")]);
+        assert_eq!(
+            home_dir_on(Platform::Windows, &env),
+            Some(PathBuf::from("/USERPROFILE"))
+        );
+        // 反过来：Windows 上**没有** USERPROFILE 就是 None，不能去读 HOME
+        let env2 = env_of(&[("HOME", "/HOME")]);
+        assert_eq!(home_dir_on(Platform::Windows, &env2), None);
+    }
+
+    #[test]
+    fn 当前平台能被正确识别() {
+        let p = Platform::current();
+        if cfg!(target_os = "windows") {
+            assert_eq!(p, Platform::Windows);
+        } else {
+            assert_eq!(p, Platform::Unix);
+        }
+        // 配置文件的**相对结构**两个平台必须一致（根目录不同，但下面这截相同）
+        let full = Config::path();
+        assert!(
+            full.ends_with("mixer/config.toml"),
+            "配置文件路径结构不对：{}",
+            full.display()
+        );
+        // 而且必须真的是绝对路径 —— 相对路径会随启动方式漂移
+        assert!(
+            full.is_absolute(),
+            "配置文件路径必须是绝对的，实际是：{}",
+            full.display()
+        );
+    }
 }
 
 #[cfg(test)]
