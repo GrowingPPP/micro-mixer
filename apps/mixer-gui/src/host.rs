@@ -256,8 +256,12 @@ struct Running {
     /// 这是**故意**的 —— 用户大多数时候不用音效，但游戏麦克风一直指着虚拟声卡，
     /// 一旦停止就断掉转发，队友会突然听不到他。
     active: Arc<AtomicBool>,
-    /// 热键句柄放共享槽里，待机时能注销掉（把 F1/F2 还给游戏）
+    /// 热键管理器。**只在创建它的线程上用**（Windows 上它不 Send，
+    /// 而且 Drop 会跨线程 DestroyWindow）—— 所以不共享给轮询线程。
     hotkeys: Arc<Mutex<Option<Hotkeys>>>,
+    /// 给轮询线程用的句柄。`HotkeyPoller` 是天然 Send 的：
+    /// 它只读 global-hotkey 的全局事件通道，不碰管理器。
+    poller: Arc<Mutex<Option<hotkeys::HotkeyPoller>>>,
     /// 启动参数指纹 —— 一样的话「启动」可以走快路：不重开设备，只是重新激活
     cfg_key: String,
     /// 本次运行的完整启动参数（热插拔恢复时要照着它重建）
@@ -733,6 +737,7 @@ impl AudioHost {
         // 6. 热键轮询线程
         let active = Arc::new(AtomicBool::new(true));
         let hotkeys: Arc<Mutex<Option<Hotkeys>>> = Arc::new(Mutex::new(None));
+        let poller: Arc<Mutex<Option<hotkeys::HotkeyPoller>>> = Arc::new(Mutex::new(None));
         let hotkey_thread = if cfg.hotkeys.is_empty() || cfg.hotkeys.len() != slots_meta.len() {
             None
         } else {
@@ -743,6 +748,8 @@ impl AudioHost {
             }
             match bound.map(|(h, _)| h) {
                 Ok(hk) => {
+                    // 轮询线程只拿 poller —— 见 HotkeyPoller 的注释
+                    *poller.lock().unwrap_or_else(|e| e.into_inner()) = Some(hk.poller());
                     *hotkeys.lock().unwrap_or_else(|e| e.into_inner()) = Some(hk);
                     let ctl = control.clone();
                     let sd = shutdown.clone();
@@ -750,7 +757,7 @@ impl AudioHost {
                     //    早期只有界面点击那条路会监听，导致"按了热键自己听不到"。
                     let mon = monitor.clone();
                     let act = active.clone();
-                    let hks = hotkeys.clone();
+                    let hks = poller.clone();
                     Some(
                         std::thread::Builder::new()
                             .name("hotkeys".into())
@@ -838,6 +845,7 @@ impl AudioHost {
             skipped_notes: skipped.iter().map(|(n, r)| format!("{n}（{r}）")).collect(),
             active,
             hotkeys,
+            poller,
             cfg_key: cfg_fingerprint(&cfg),
             cfg,
         });
@@ -886,6 +894,8 @@ impl AudioHost {
                 }
             }
         }
+        // 轮询线程那边也断掉 —— 双保险，确保待机时按 F1/F2 什么都不做
+        *r.poller.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // 遥控那边也断开，避免待机时被人从手机触发
         if let Some(sh) = self
             .remote
@@ -939,19 +949,29 @@ impl AudioHost {
         let specs: Vec<String> = r.slots_meta.iter().map(|s| s.hotkey.clone()).collect();
         if !specs.is_empty() && specs.iter().all(|k| !k.is_empty()) {
             let mut slot = r.hotkeys.lock().unwrap_or_else(|e| e.into_inner());
+            let mut poller_ok = false;
             match slot.as_mut() {
                 // 复用已有的管理器重新注册（新建一个会超时，见 Hotkeys::rebind 注释）
                 Some(h) => match h.rebind(&specs) {
-                    Ok(()) => println!("[热键] 重新绑定成功：{}", specs.join(", ")),
+                    Ok(()) => {
+                        println!("[热键] 重新绑定成功：{}", specs.join(", "));
+                        poller_ok = true;
+                    }
                     Err(e) => println!("[热键] ❌ 重新绑定失败: {e:#}"),
                 },
                 None => match bind_hotkeys_on_main_thread(app, &specs) {
                     Ok((h, how)) => {
                         println!("[热键] 绑定成功（{how}）：{}", specs.join(", "));
                         *slot = Some(h);
+                        poller_ok = true;
                     }
                     Err(e) => println!("[热键] ❌ 绑定失败: {e:#}"),
                 },
+            }
+            // 绑定成功才把轮询句柄放回去 —— 否则按了也没人处理
+            if poller_ok {
+                let p = slot.as_ref().map(|h| h.poller());
+                *r.poller.lock().unwrap_or_else(|e| e.into_inner()) = p;
             }
         }
         r.active.store(true, Ordering::Relaxed);

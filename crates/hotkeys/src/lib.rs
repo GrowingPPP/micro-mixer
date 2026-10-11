@@ -188,7 +188,53 @@ pub fn is_main_thread() -> bool {
     true
 }
 
+/// 轮询句柄：**只读 global-hotkey 的全局事件通道 + 一张 id→槽位表**。
+///
+/// 为什么要从 [`Hotkeys`] 里拆出来：
+/// `GlobalHotKeyManager` 在 **Windows 上不实现 `Send`**（它就是个 `HWND` 包装，
+/// 而且 `Drop` 会调 `DestroyWindow` —— 那个**必须**在创建窗口的线程上做）。
+/// 但事件走的是 global-hotkey 的**全局通道**，轮询线程压根不需要碰管理器。
+///
+/// 拆开之后：轮询线程只拿 `HotkeyPoller`（天然 `Send`），管理器留在创建它的线程上 ——
+/// **两边都不需要 `unsafe impl Send`**。macOS 上本来靠 global-hotkey 的
+/// `unsafe impl Send` 蒙混过关，Windows 上没有那个 impl，问题才暴露出来。
+#[derive(Clone, Default)]
+pub struct HotkeyPoller {
+    /// 系统热键 id → 槽位索引
+    id_to_slot: HashMap<u32, usize>,
+}
+
+impl HotkeyPoller {
+    /// 非阻塞取出一个被按下的槽位。没有则返回 None。
+    ///
+    /// 读的是 global-hotkey 的**全局通道** —— 这正是它可以跨线程用的原因。
+    pub fn poll(&self) -> Option<usize> {
+        let rx = GlobalHotKeyEvent::receiver();
+        let mut hit = None;
+        while let Ok(ev) = rx.try_recv() {
+            if ev.state != HotKeyState::Pressed {
+                continue;
+            }
+            if let Some(&slot) = self.id_to_slot.get(&ev.id()) {
+                hit = Some(slot);
+            }
+        }
+        hit
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.id_to_slot.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.id_to_slot.len()
+    }
+}
+
 /// 热键管理器：把一组键位绑定到音效槽位。
+///
+/// **不需要 `Send`** —— 它只在创建它的那个线程上用。
+/// 需要跨线程轮询时用 [`Hotkeys::poller`] 拿一个 [`HotkeyPoller`]。
 pub struct Hotkeys {
     /// 必须持有 —— Drop 时会注销所有热键
     _manager: Arc<GlobalHotKeyManager>,
@@ -296,19 +342,16 @@ impl Hotkeys {
         Ok(())
     }
 
-    /// 非阻塞取出一个被按下的槽位。没有则返回 None。
-    pub fn poll(&self) -> Option<usize> {
-        let rx = GlobalHotKeyEvent::receiver();
-        let mut hit = None;
-        while let Ok(ev) = rx.try_recv() {
-            if ev.state != HotKeyState::Pressed {
-                continue;
-            }
-            if let Some(&slot) = self.id_to_slot.get(&ev.id()) {
-                hit = Some(slot);
-            }
+    /// 拿一个可以跨线程用的轮询句柄。
+    pub fn poller(&self) -> HotkeyPoller {
+        HotkeyPoller {
+            id_to_slot: self.id_to_slot.clone(),
         }
-        hit
+    }
+
+    /// 非阻塞取出一个被按下的槽位（本线程内直接用，等价于 `self.poller().poll()`）。
+    pub fn poll(&self) -> Option<usize> {
+        self.poller().poll()
     }
 
     /// 已绑定的键位数。

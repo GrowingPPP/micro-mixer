@@ -316,13 +316,19 @@ fn hotkey_test(keys: Option<String>) -> Result<()> {
     // 实测结论：只跑裸 CFRunLoop（CFRunLoopRunInMode）**收不到** Carbon 热键事件，
     // 必须是完整的应用事件循环。GUI 之所以一直正常，就是因为 tao 在跑 NSApplication。
     let names = specs;
+    // ⚠️ 只把 **poller** 移进线程，`hk` 本身留在主线程作用域里活着。
+    //
+    // 原因：`Hotkeys` 持有 `GlobalHotKeyManager`，而它在 **Windows 上不是 `Send`**
+    // （就是个 `HWND`，Drop 还会跨线程 `DestroyWindow`）。但事件走的是
+    // global-hotkey 的全局通道，轮询线程压根不需要管理器 —— 拿 poller 就够。
+    let poller = hk.poller();
     std::thread::Builder::new()
         .name("hotkey-poll".into())
         .spawn(move || {
             let t0 = Instant::now();
             let mut count = 0usize;
             loop {
-                if let Some(slot) = hk.poll() {
+                if let Some(slot) = poller.poll() {
                     count += 1;
                     println!(
                         "  ✅ [{:>6.2}s] 收到 → {:<18} 槽位 {}   （累计 {} 次）",
@@ -571,6 +577,9 @@ fn run(
         None if !slots.is_empty() => (1..=slots.len()).map(|i| format!("F{i}")).collect(),
         None => Vec::new(),
     };
+    // RAII 保活：`Hotkeys` 一旦 Drop 就会注销所有热键，所以它必须活到程序结束。
+    // 下划线开头是**故意的** —— 这个变量就是不该被读，它的作用只是"别被释放"。
+    let mut _hotkey_owner: Option<Hotkeys> = None;
     let hotkeys = if specs.is_empty() {
         None
     } else if specs.len() != slots.len() {
@@ -587,7 +596,12 @@ fn run(
                 for (spec, slot) in h.bindings() {
                     println!("    {:<18} → [{}] {}", spec, slot + 1, slot_names[*slot]);
                 }
-                Some(Arc::new(h))
+                // 线程只拿 poller（Windows 上 `Hotkeys` 不是 Send）
+                let poller = Arc::new(h.poller());
+                // ⚠️ 管理器必须**一直活着** —— Drop 会注销所有热键。
+                //    存进外层变量，别让它在这个 match 分支结束时就掉了。
+                _hotkey_owner = Some(h);
+                Some(poller)
             }
             Err(e) => {
                 println!("  ⚠ 热键绑定失败：{e}");
@@ -816,7 +830,7 @@ fn run(
 /// 事件循环：同时处理**全局热键**与终端输入。
 fn event_loop(
     control: Arc<PlaybackControl>,
-    hotkeys: Option<Arc<Hotkeys>>,
+    hotkeys: Option<Arc<hotkeys::HotkeyPoller>>,
     has_slots: bool,
     duration: Option<u64>,
     running: Arc<AtomicBool>,
@@ -838,7 +852,7 @@ fn app_loop_used() -> bool {
 
 fn event_loop_inner(
     control: Arc<PlaybackControl>,
-    hotkeys: Option<Arc<Hotkeys>>,
+    hotkeys: Option<Arc<hotkeys::HotkeyPoller>>,
     has_slots: bool,
     duration: Option<u64>,
     running: Arc<AtomicBool>,
