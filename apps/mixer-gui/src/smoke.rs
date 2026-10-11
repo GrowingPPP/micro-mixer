@@ -356,6 +356,18 @@ pub fn run(dir: PathBuf) -> Result<()> {
         }
     }
 
+    // ── 打开系统设置：只认白名单 ──
+    //
+    // 这条命令能拉起系统设置窗口，所以做成"前端传语义名、后端拼 URL"，
+    // 前端没法让它去开任意地址。这里验证白名单确实拦得住 ——
+    // **只测拒绝路径**，免得冒烟的时候真弹出一堆系统设置窗口。
+    for bad in ["file:///etc/passwd", "http://evil.example", "../../etc", ""] {
+        if crate::open_system_settings(bad.to_string()).is_ok() {
+            bail!("open_system_settings 接受了不该接受的参数：{bad:?}");
+        }
+    }
+    println!("✅ 系统设置白名单     4 个非法参数全部被拒（含 file:// 与相对路径）");
+
     // ── 音频回调里的 panic 必须被就地兜住 ────────────────────────────
     //
     // 这条是**对抗性测试**：故意在渲染回调里 panic 一次，验证

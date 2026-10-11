@@ -39,14 +39,15 @@ const el = {
   inSearch: $('inSearch'), tagbar: $('tagbar'), btnSort: $('btnSort'),
   btnRelease: $('btnRelease'), btnCalib: $('btnCalib'), calibHint: $('calibHint'),
   btnRevertMic: $('btnRevertMic'),
-  vdevHelp: $('vdevHelp'),
+  vdevHelp: $('vdevHelp'), micHelp: $('micHelp'), btnMicHelp: $('btnMicHelp'),
   grid: $('grid'), metrics: $('metrics'), toast: $('toast'),
   btnStopAll: $('btnStopAll'), setup: $('setup'), btnSetup: $('btnSetup'),
 };
 
 let state = { running: false, slots: [], items: [], lastStatus: null,
                monitorDevice: null, remoteUrl: null, activeTag: null, devices: [],
-               lastDeviceLost: null, lastPanicSeen: null, lastStalled: null };
+               lastDeviceLost: null, lastPanicSeen: null, lastStalled: null,
+               silentSecs: 0, micHelpShown: false, micHelpDismissed: false };
 
 // ── 音效库条目：{ file, name, gain, tags }
 //    标签用逗号分隔的字符串存（与配置一致），用时再拆成数组。
@@ -652,6 +653,26 @@ async function poll() {
       : `${st.device} · 已运行 ${fmtTime(st.uptime_secs)}` +
         (st.hotkeys_active ? ' · 热键已绑定' : ' · 热键未绑定');
 
+    // ── 麦克风一直没声音？ ──
+    //
+    // 这是最典型的"无声失败"：引擎在跑、界面一切正常，但队友就是听不到。
+    // 原因通常是权限或"默认通信设备"选错了 —— 用户自己很难想到。
+    //
+    // 判定条件保守一点，避免误报：
+    //   · 引擎在跑、当前没在放音效
+    //   · 输出电平**正好**是数字静音的地板（真实麦克风总有底噪，不会正好 -100）
+    //   · 连续 10 秒都这样
+    if (st.running && !st.playing && !state.micHelpDismissed) {
+      const silent = (st.out_peak_db ?? -100) <= -99.9;
+      state.silentSecs = silent ? (state.silentSecs || 0) + 1 : 0;
+      if (state.silentSecs >= 10 && !state.micHelpShown) {
+        state.micHelpShown = true;
+        showMicHelp();
+      }
+    } else if (!st.running) {
+      state.silentSecs = 0;
+    }
+
     // 程序内部 panic：必须让用户知道 —— 打包后没有控制台，不说就等于没发生
     if (st.last_panic && st.last_panic !== state.lastPanicSeen) {
       state.lastPanicSeen = st.last_panic;
@@ -792,6 +813,12 @@ el.btnClear.addEventListener('click', () => {
 });
 el.inDir.addEventListener('keydown', e => { if (e.key === 'Enter') scanDir(); });
 el.btnSelfTest.addEventListener('click', runSelfTest);
+
+// 手动打开麦克风排查（自动面板被关掉之后还能再打开）
+el.btnMicHelp.addEventListener('click', () => {
+  state.micHelpDismissed = false;
+  showMicHelp();
+});
 el.btnCalib.addEventListener('click', calibrateMic);
 el.btnRevertMic.addEventListener('click', async () => {
   try {
@@ -935,7 +962,7 @@ async function renderVdevHelp() {
     `<b>我们把音效写进去，游戏从它读出来</b> —— 声音于是进了你的麦克风。</p>` +
     `<p class="vdh-pick">推荐装 <b>${esc2(info.driver)}</b>：</p>` +
     `<ol class="vdh-steps">` +
-    info.steps.map(t => `<li>${t.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')}</li>`).join('') +
+    info.steps.map(t => `<li>${mdBold(t)}</li>`).join('') +
     `</ol>`;
 
   if (info.cmd) {
@@ -961,6 +988,56 @@ async function renderVdevHelp() {
     if (await checkVirtualDevice()) toast('检测到虚拟声卡了 ✅');
     else toast('还是没有 —— 装完驱动记得重启一次', true);
   });
+}
+
+/// 麦克风收不到声音时，按平台给出排查步骤。
+///
+/// 内容是后端给的（`platform_info.mic_privacy`）—— macOS 和 Windows 的设置路径
+/// 完全不一样，不该在前端里堆 if。
+/// 把 `**粗体**` 转成 <b>。引导文案和步骤都要用，所以抽出来。
+function mdBold(t) {
+  return String(t).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+}
+
+async function showMicHelp() {
+  if (el.micHelp.dataset.rendered !== '1') {
+    let info;
+    try {
+      info = await invoke('platform_info');
+    } catch {
+      return;
+    }
+    const mp = info.mic_privacy;
+    if (!mp) return;
+    const esc2 = (t) => String(t).replace(/[&<>"]/g, c =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+    el.micHelp.innerHTML =
+      `<div class="vdh-title">🔇 ${esc2(mp.title)}</div>` +
+      `<p>${mdBold('引擎在跑，但送进麦克风的信号一直是**完全没有声音**（真实麦克风总有一点底噪）。' +
+                    '队友现在听不到你。按下面几步查一下：')}</p>` +
+      `<ol class="vdh-steps">` +
+      mp.steps.map(t => `<li>${mdBold(t)}</li>`).join('') +
+      `</ol>` +
+      `<div class="vdh-actions">` +
+      (mp.settings_page ? `<button id="btnOpenMicSet" class="ghost">${esc2(mp.url_label || '打开设置')}</button>` : '') +
+      `<button id="btnMicHelpLater" class="vdh-dismiss">我知道了，先不管</button>` +
+      `</div>`;
+    el.micHelp.dataset.rendered = '1';
+
+    const open = el.micHelp.querySelector('#btnOpenMicSet');
+    if (open) open.addEventListener('click', async () => {
+      try { await invoke('open_system_settings', { page: mp.settings_page }); }
+      catch (e) { toast('打不开设置页（' + e + '），手动进系统设置找一下', true); }
+    });
+    const later = el.micHelp.querySelector('#btnMicHelpLater');
+    if (later) later.addEventListener('click', () => {
+      state.micHelpDismissed = true;
+      el.micHelp.classList.add('hidden');
+      toast('好，不再提示。真没声音的话点上面的「麦克风」按钮可以再打开');
+    });
+  }
+  el.micHelp.classList.remove('hidden');
 }
 
 async function copyDriverCmd() {

@@ -201,6 +201,20 @@ fn platform_info() -> serde_json::Value {
             "naming": "⚠️ 注意 VB-CABLE 的命名是反的：本程序要输出到 **CABLE Input**，\
                        而游戏里选麦克风要选 **CABLE Output**。名字看着别扭，但就是这样。",
             "alts": "其他选择：VoiceMeeter（免费，功能更多但更复杂）、Virtual Audio Cable（付费）。",
+            "mic_privacy": {
+                "title": "麦克风收不到声音？",
+                "steps": [
+                    "打开 设置 → 隐私和安全性 → 麦克风，确认「麦克风访问」是**开**的",
+                    "往下拉到「允许桌面应用访问你的麦克风」—— **这一条最容易漏**。\
+                     音效板属于桌面应用，这个开关和上面那个是分开的，上面开了下面没开照样没声音。",
+                    "如果游戏或语音软件里听不到：Windows 有**两套**默认设备 —— \
+                     「默认设备」和「默认通信设备」。很多游戏读的是后者。\
+                     去 设置 → 系统 → 声音 → 更多声音设置 → 录制，\
+                     右键你的设备 → 设为默认通信设备。",
+                ],
+                "settings_page": "microphone",
+                "url_label": "打开麦克风隐私设置",
+            },
         })
     } else {
         serde_json::json!({
@@ -216,8 +230,59 @@ fn platform_info() -> serde_json::Value {
             "cmd": "brew install --cask blackhole-2ch",
             "naming": null,
             "alts": "其他选择：VB-CABLE for Mac（个人免费）、Loopback（付费，功能最多）。",
+            "mic_privacy": {
+                "title": "麦克风收不到声音？",
+                "steps": [
+                    "打开 系统设置 → 隐私与安全性 → 麦克风",
+                    "确认「音效板」在列表里并且是**勾上**的",
+                    "如果列表里没有它：把 App 删掉重新拖进去一次（签名变了系统会当成新 App）",
+                ],
+                "settings_page": "microphone",
+                "url_label": "打开麦克风隐私设置",
+            },
         })
     }
+}
+
+/// 打开**系统设置里的某个页面**。
+///
+/// 为什么不复用 `open_url`：那个命令只允许 http/https（它是暴露给前端的，
+/// 收窄更安全）。而系统设置页用的是各平台私有 scheme
+/// （macOS 的 `x-apple.systempreferences:`、Windows 的 `ms-settings:`）。
+///
+/// 所以这里做成**只认白名单键**，前端传的是 `"microphone"` 这种语义名，
+/// 具体 URL 由后端拼 —— 前端没法让它去开任意地址。
+#[tauri::command]
+fn open_system_settings(page: String) -> Res<()> {
+    #[cfg(target_os = "macos")]
+    let url = match page.as_str() {
+        "microphone" => {
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+        }
+        "sound" => "x-apple.systempreferences:com.apple.Sound-Settings.extension",
+        _ => return Err(format!("不认识的设置页：{page}")),
+    };
+    #[cfg(target_os = "windows")]
+    let url = match page.as_str() {
+        "microphone" => "ms-settings:privacy-microphone",
+        "sound" => "ms-settings:sound",
+        _ => return Err(format!("不认识的设置页：{page}").into()),
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let url = {
+        let _ = page;
+        return Err("暂不支持在这个平台打开系统设置".into());
+    };
+
+    #[cfg(target_os = "macos")]
+    let cmd = "open";
+    #[cfg(target_os = "windows")]
+    let cmd = "explorer";
+    std::process::Command::new(cmd)
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("打开系统设置失败：{e}"))
 }
 
 /// 手机遥控地址的二维码矩阵。
@@ -837,6 +902,7 @@ fn main() {
             self_test,
             remote_qr,
             platform_info,
+            open_system_settings,
             js_error,
             open_url,
             status,
