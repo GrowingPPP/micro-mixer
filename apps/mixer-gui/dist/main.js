@@ -46,7 +46,7 @@ const el = {
 
 let state = { running: false, slots: [], items: [], lastStatus: null,
                monitorDevice: null, remoteUrl: null, activeTag: null, devices: [],
-               lastDeviceLost: null };
+               lastDeviceLost: null, lastPanicSeen: null, lastStalled: null };
 
 // ── 音效库条目：{ file, name, gain, tags }
 //    标签用逗号分隔的字符串存（与配置一致），用时再拆成数组。
@@ -651,6 +651,25 @@ async function poll() {
           : '未启动')
       : `${st.device} · 已运行 ${fmtTime(st.uptime_secs)}` +
         (st.hotkeys_active ? ' · 热键已绑定' : ' · 热键未绑定');
+
+    // 程序内部 panic：必须让用户知道 —— 打包后没有控制台，不说就等于没发生
+    if (st.last_panic && st.last_panic !== state.lastPanicSeen) {
+      state.lastPanicSeen = st.last_panic;
+      hint('💥 程序内部出错了：' + st.last_panic +
+           ' —— 已记录到 ~/Library/Logs/音效板/panic.log，音频会在几秒内自动恢复。', 'error');
+      toast('程序内部出错（已兜住，正在自动恢复）', true);
+    }
+
+    // 音频卡死 / 已自动重启
+    if (st.audio_stalled && st.audio_stalled !== state.lastStalled) {
+      state.lastStalled = st.audio_stalled;
+      hint('🎧 ' + st.audio_stalled, 'error');
+      toast('音频卡了一下，已自动处理', true);
+    } else if (!st.audio_stalled && state.lastStalled) {
+      state.lastStalled = null;
+    } else if (!st.last_panic) {
+      state.lastPanicSeen = null;
+    }
 
     // 设备掉线：这是**正在游戏里也必须要看到**的报警
     if (st.device_lost && st.device_lost !== state.lastDeviceLost) {

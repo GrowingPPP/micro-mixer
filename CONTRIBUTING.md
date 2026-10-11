@@ -80,6 +80,31 @@ lint 策略集中在根 `Cargo.toml` 的 `[workspace.lints]`，各 crate 用
 - **音效/用户可见的文案用中文**；日志前缀用 `[模块]`，如 `[待机]`、`[热插拔]`。
 - **实时音频回调里不许分配、不许加锁、不许 IO。** 用 SPSC 环形缓冲传数据、
   原子量传增益。这条没有例外。
+- **异步/回调里不许让 panic 跑出去。** 见下。
+
+### panic 策略（改之前先读完这段）
+
+release 用的是 `panic = "unwind"` 而**不是** `abort` —— 因为菜单栏常驻程序
+最怕"悄无声息地死掉"：用户正在游戏里，队友突然听不到他，屏幕上却毫无提示。
+
+但 unwind 有个**硬前提**：
+
+> **cpal 的音频回调是从 `extern "C" fn` 里调过来的**（coreaudio-rs 的
+> `input_proc` / render proc）。panic 一旦 unwind 出去就是**跨 FFI 边界 = 未定义行为**。
+
+所以 `crates/backend-cpal` 里给两个回调都套了 `catch_unwind`（`guard_input` /
+`guard_output`）。**动回调相关代码时不要把这两层去掉。**
+
+配套的另外三层：
+
+| 层 | 在哪 | 作用 |
+|---|---|---|
+| panic hook | `apps/mixer-gui/src/host.rs` | 落盘 `~/Library/Logs/音效板/panic.log` + 上报界面（打包后没有控制台） |
+| 音频看门狗 | `apps/mixer-gui/src/main.rs` | `rendered_frames` 3 秒不涨，或回调 panic 过 → 自动重启音频 |
+| 自测钩子 | `MIXER_PANIC_AFTER=<秒>` | **真的诱发一次 panic** 来验证上面这套还有效 |
+
+> 最后一条别删。这套兜底如果不真的诱发一次，就只是"看起来做了" ——
+> 冒烟测试里已经固化了这个检查。
 
 ---
 

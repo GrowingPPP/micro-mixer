@@ -498,6 +498,10 @@ fn acquire_single_instance() -> Option<std::net::TcpListener> {
 }
 
 fn main() {
+    // 最先装 —— 越早装，越不会漏掉启动阶段的 panic
+    host::install_panic_hook();
+    // 自测钩子：只有设了 MIXER_PANIC_AFTER 才生效
+    audio_core::engine::arm_panic_hook_from_env();
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("warn,symphonia=off"),
     )
@@ -609,6 +613,75 @@ fn main() {
                                     }
                                 }
                             }
+                        }
+                    })
+                    .ok();
+            }
+
+            // ── 音频看门狗 ──────────────────────────────────────────
+            //
+            // 为什么需要：这个程序大部分时间在后台跑，而**"没声音"是它最糟的失败模式** ——
+            // 用户正在游戏里，队友突然听不到他，屏幕上却什么提示都没有。
+            //
+            // 检测两件事：
+            //   ① 渲染回调不再被推进（流死了）—— 用 rendered_frames 是否还在涨判断
+            //   ② 回调里 panic 过（backend-cpal 会置位）—— 被 catch_unwind 兜住了，
+            //      但引擎内部状态已不可信，必须重开
+            // 两者都靠**重启音频**自救，并把原因写到界面上。
+            {
+                let h = app.handle().clone();
+                std::thread::Builder::new()
+                    .name("audio-watchdog".into())
+                    .spawn(move || {
+                        use tauri::Manager;
+                        let mut last = 0u64;
+                        let mut stalled = 0u32;
+                        loop {
+                            std::thread::sleep(std::time::Duration::from_secs(1));
+                            let host = h.state::<AudioHost>();
+                            if !host.audio_alive() {
+                                // 引擎本来就没跑 —— 不算"卡死"，清掉报警
+                                stalled = 0;
+                                last = 0;
+                                if host.status().audio_stalled.is_some() {
+                                    host.set_audio_stalled(None);
+                                }
+                                continue;
+                            }
+                            let frames = host.rendered_frames();
+                            let panicked = backend_cpal::engine_panicked();
+                            if frames == last || panicked {
+                                stalled += 1;
+                                if stalled >= 3 {
+                                    let why = if panicked {
+                                        "音频回调里发生过 panic"
+                                    } else {
+                                        "音频回调已停止推进（流可能已经死了）"
+                                    };
+                                    println!("[看门狗] ⚠ {why} —— 自动重启音频");
+                                    host.set_audio_stalled(Some(format!("{why}，正在自动重启…")));
+                                    match host.restart_audio(Some(&h)) {
+                                        Ok(()) => {
+                                            println!("[看门狗] ✅ 音频已自动恢复");
+                                            host.set_audio_stalled(Some(format!(
+                                                "{why} —— 已自动恢复，如果队友那边断过，让他们重新连一下"
+                                            )));
+                                        }
+                                        Err(e) => {
+                                            println!("[看门狗] ❌ 自动恢复失败: {e:#}");
+                                            host.set_audio_stalled(Some(format!(
+                                                "{why}，且自动恢复失败：{e}。请手动点「启动」重试"
+                                            )));
+                                        }
+                                    }
+                                    stalled = 0;
+                                    last = host.rendered_frames();
+                                    continue;
+                                }
+                            } else {
+                                stalled = 0;
+                            }
+                            last = frames;
                         }
                     })
                     .ok();

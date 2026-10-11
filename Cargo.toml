@@ -54,7 +54,15 @@ redundant_clone = "warn"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+# 用 unwind 而不是 abort。
+#
+# 菜单栏常驻程序最怕的是"悄无声息地死掉" —— 用户正在游戏里，队友突然听不到他，
+# 而屏幕上什么提示都没有。abort 会让**任何一处 panic 都直接杀进程**。
+#
+# 但 unwind 有个前提：**音频回调里必须就地 catch_unwind**。
+# cpal 的回调是从 `extern "C" fn` 调过来的，panic 越过 FFI 边界是未定义行为。
+# 这一层在 crates/backend-cpal 里做了（见 guard_input / guard_output）。
+panic = "unwind"
 
 # 音频引擎必须快 —— 调试构建下也要能跑实时
 [profile.dev.package."*"]

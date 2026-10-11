@@ -453,6 +453,35 @@ impl CaptureProcessor {
 // ─────────────────────────────────────────── 渲染侧
 
 /// 渲染处理：取命令 → 读环形缓冲 → 混音 → 限幅 → 写输出。**实时线程。**
+/// 自测钩子：`MIXER_PANIC_AFTER=<秒>` 让渲染回调在指定秒数后**故意 panic 一次**。
+///
+/// 为什么要有它：panic 兜底 + 看门狗这套东西，不真的诱发一次就没法说它有效 ——
+/// 而"看起来做了"正是本项目反复踩的坑。正常运行时只是两次原子读，可忽略。
+/// 用一个哨兵值表示"没开"。
+static PANIC_AFTER_SECS: AtomicU64 = AtomicU64::new(u64::MAX);
+static PANIC_DONE: AtomicBool = AtomicBool::new(false);
+
+/// 按环境变量启用 panic 自测钩子（启动时调一次即可）。
+pub fn arm_panic_hook_from_env() {
+    if let Ok(v) = std::env::var("MIXER_PANIC_AFTER") {
+        if let Ok(secs) = v.parse::<u64>() {
+            PANIC_AFTER_SECS.store(secs, Ordering::Relaxed);
+            println!("[自测] 已武装 panic 钩子：渲染回调将在 {secs} 秒后故意 panic 一次");
+        }
+    }
+}
+
+/// 程序化武装自测钩子（供冒烟测试用，不依赖环境变量）。
+pub fn arm_panic_hook_for_test(after_secs: u64) {
+    PANIC_AFTER_SECS.store(after_secs, Ordering::Relaxed);
+    PANIC_DONE.store(false, Ordering::Relaxed);
+}
+
+/// 自测钩子是否已经触发过。
+pub fn panic_hook_fired() -> bool {
+    PANIC_DONE.load(Ordering::Relaxed)
+}
+
 pub struct RenderProcessor {
     ring: Consumer<f32>,
     cmd: Consumer<Command>,
@@ -482,6 +511,19 @@ impl RenderProcessor {
     /// 之前内部缓冲按设备声道切片、而音效播放器硬编码按 2 声道迭代，
     /// 两者一旦不一致就会出现"文件被以错误速率消费"这类隐蔽故障。
     pub fn process(&mut self, out: &mut [f32]) {
+        // ── 自测钩子（正常路径上只是两次原子读）──
+        if !PANIC_DONE.load(Ordering::Relaxed) {
+            let after = PANIC_AFTER_SECS.load(Ordering::Relaxed);
+            if after != u64::MAX {
+                let secs = self.stats.rendered_frames.load(Ordering::Relaxed) as f64
+                    / self.sample_rate.max(1) as f64;
+                if secs > after as f64 {
+                    PANIC_DONE.store(true, Ordering::Relaxed);
+                    panic!("自测：故意在音频渲染回调里 panic（MIXER_PANIC_AFTER={after}）");
+                }
+            }
+        }
+
         let dev_ch = self.out_channels.max(1);
         let frames = (out.len() / dev_ch).min(self.frames_cap);
         if frames == 0 {

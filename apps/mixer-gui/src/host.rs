@@ -104,6 +104,10 @@ pub struct StatusDto {
     pub skipped: Vec<String>,
     /// 设备掉线提示。有值 = 检测到设备不见了，界面要显著报警。
     pub device_lost: Option<String>,
+    /// 最近一次 panic 的摘要（界面据此弹提示；读一次就清）。
+    pub last_panic: Option<String>,
+    /// 音频卡死提示（回调不再被调用 / 回调 panic 过）。有值 = 界面要报警。
+    pub audio_stalled: Option<String>,
     /// 引擎是否还活着（麦克风是否正在被转发）。
     ///
     /// `running=false, passthrough=true` = **待机**：队友仍听得到你说话，但音效不响应。
@@ -134,6 +138,8 @@ impl StatusDto {
             skipped: Vec::new(),
             passthrough: false,
             device_lost: None,
+            last_panic: None,
+            audio_stalled: None,
         }
     }
 }
@@ -270,6 +276,83 @@ pub fn cfg_fingerprint(cfg: &StartConfig) -> String {
     )
 }
 
+/// 最近一次 panic 的摘要（供界面显示）。
+///
+/// 为什么要有它：**打包后的 App 没有控制台**，panic 默认写到 stderr 就没了 ——
+/// 用户只看到"程序有点怪"，或者更糟：程序还在但没声音，什么提示都没有。
+static LAST_PANIC: Mutex<Option<String>> = Mutex::new(None);
+
+/// 上次 panic 的摘要（消费式：读一次就清掉，避免界面反复弹同一条）。
+pub fn take_last_panic() -> Option<String> {
+    LAST_PANIC.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
+fn record_panic(msg: &str) {
+    *LAST_PANIC.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg.to_string());
+}
+
+/// panic 日志文件路径（macOS 惯例：`~/Library/Logs/<App>/`）。
+pub fn panic_log_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    Some(
+        std::path::PathBuf::from(home)
+            .join("Library/Logs/音效板")
+            .join("panic.log"),
+    )
+}
+
+/// 装上 panic hook：**落盘 + 上报界面**。
+///
+/// 为什么必须做：这个程序大部分时间在后台（菜单栏常驻），而打包后没有控制台。
+/// 一次 panic 如果只是写到 stderr，就等于什么都没发生 —— 用户不知道，
+/// 我们查不到。落盘 + 界面提示是唯一能让它可见的办法。
+pub fn install_panic_hook() {
+    use std::io::Write;
+
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "位置未知".into());
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "（无消息）".into());
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("未命名线程")
+            .to_string();
+
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let line = format!("[{secs}] panic @ {loc} | 线程 {thread} | {payload}");
+
+        // ① 落盘
+        if let Some(path) = panic_log_path() {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let _ = writeln!(f, "{line}");
+            }
+        }
+        // ② 上报界面（界面轮询 status 时取走）
+        record_panic(&format!("{payload}（{loc}）"));
+        // ③ 仍然打到 stderr —— 终端启动时能直接看到
+        eprintln!("[PANIC] {line}");
+        default(info);
+    }));
+}
+
 #[derive(Default)]
 pub struct AudioHost {
     running: Mutex<Option<Running>>,
@@ -282,6 +365,8 @@ pub struct AudioHost {
     remote_urls: Mutex<Vec<String>>,
     /// 设备掉线提示（热插拔检测到设备不见了时写这里，前端据此报警）
     device_lost: Mutex<Option<String>>,
+    /// 音频卡死提示（渲染回调不再被调用，或回调里 panic 过）
+    audio_stalled: Mutex<Option<String>>,
     /// 程序启动时的系统默认输入设备 —— 「切回真实麦克风」要还原成它。
     ///
     /// 只在**第一次启动音频之前**记录：之后我们再改默认设备也不会污染这个基准。
@@ -338,6 +423,14 @@ impl AudioHost {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
+            // ⚠️ 提前返回这条路径同样要带上 —— panic 之后引擎往往正好是停的，
+            //    而界面恰恰需要在这时告诉用户"出事了"。
+            s.last_panic = take_last_panic();
+            s.audio_stalled = self
+                .audio_stalled
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             return s;
         };
         let st = r.stats.snapshot();
@@ -375,6 +468,12 @@ impl AudioHost {
             passthrough: true, // 走到这里说明引擎还活着
             device_lost: self
                 .device_lost
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+            last_panic: take_last_panic(),
+            audio_stalled: self
+                .audio_stalled
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
@@ -940,6 +1039,46 @@ impl AudioHost {
         // 指纹会变（设备不同了）→ start 会走完整重启
         self.start(cfg, app)?;
         Ok(old)
+    }
+
+    /// 渲染回调累计处理了多少帧。**回调停了它就不涨** —— 看门狗靠这个判断死活。
+    pub fn rendered_frames(&self) -> u64 {
+        use std::sync::atomic::Ordering;
+        self.running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|r| r.stats.rendered_frames.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    /// 音频是否还活着（引擎在跑，且回调在推进）。false = 该重启了。
+    pub fn audio_alive(&self) -> bool {
+        self.running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    pub fn set_audio_stalled(&self, msg: Option<String>) {
+        *self.audio_stalled.lock().unwrap_or_else(|e| e.into_inner()) = msg;
+    }
+
+    /// 按**上次的配置**把音频重启一遍（看门狗自救用）。
+    ///
+    /// 注意要绕开 `start()` 的快路：设备没变时它会直接 activate，
+    /// 而我们现在要的恰恰是**重开流**。
+    pub fn restart_audio(&self, app: Option<&tauri::AppHandle>) -> Result<()> {
+        let cfg = {
+            let g = self.running.lock().unwrap_or_else(|e| e.into_inner());
+            g.as_ref().map(|r| r.cfg.clone())
+        };
+        let Some(cfg) = cfg else {
+            anyhow::bail!("没有可恢复的配置");
+        };
+        self.release();
+        backend_cpal::clear_engine_panic();
+        self.start(cfg, app)
     }
 
     /// 切回真实麦克风。

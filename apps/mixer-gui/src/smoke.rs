@@ -356,6 +356,44 @@ pub fn run(dir: PathBuf) -> Result<()> {
         }
     }
 
+    // ── 音频回调里的 panic 必须被就地兜住 ────────────────────────────
+    //
+    // 这条是**对抗性测试**：故意在渲染回调里 panic 一次，验证
+    //   ① 进程不会死（panic=abort 时会直接被杀）
+    //   ② panic 被 catch_unwind 兜住，没有 unwind 跨出 FFI 边界（那是 UB）
+    //   ③ 引擎会被标记为"不可信"，好让看门狗去重启它
+    //
+    // 不做这一步的话，这套兜底就只是"看起来做了" —— 而项目里反复踩过这个坑。
+    {
+        // 先正常起一次，让渲染回调跑起来
+        host.start(base.clone(), None).context("启动失败")?;
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        audio_core::engine::arm_panic_hook_for_test(1); // 1 秒后故意 panic
+                                                        // 等到它真的触发（渲染在推进，所以 1 秒多就够）
+        let mut fired = false;
+        for _ in 0..60 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if audio_core::engine::panic_hook_fired() {
+                fired = true;
+                break;
+            }
+        }
+        if !fired {
+            bail!("自测钩子没触发 —— 渲染回调可能压根没在跑");
+        }
+        // panic 之后回调还会被继续调用几轮，给它一点时间置位
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        if !backend_cpal::engine_panicked() {
+            bail!("回调 panic 没有被标记 —— 引擎状态会被当成可信的继续用");
+        }
+        println!("✅ 回调 panic 兜底      panic 被就地兜住、已标记引擎不可信（进程仍存活）");
+
+        // 恢复到干净状态，别影响后面的检查
+        backend_cpal::clear_engine_panic();
+        host.release();
+    }
+
     // 0. 坏文件不能拖垮整批（回归：早期版本遇到第一个坏文件就整个起不来）
     {
         let d = std::env::temp_dir().join(format!("mixer_bad_{}", std::process::id()));

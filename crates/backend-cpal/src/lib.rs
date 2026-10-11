@@ -11,6 +11,65 @@ use audio_core::device::{
     StreamFormat,
 };
 
+/// 音频回调里发生过 panic。
+///
+/// 一旦置位，说明**引擎内部状态已不可信** —— 光把它兜住还不够，
+/// 上层（看门狗）应当把音频重启一遍。
+static CALLBACK_PANICKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 音频回调里是否 panic 过。看门狗据此决定要不要重启音频。
+pub fn engine_panicked() -> bool {
+    CALLBACK_PANICKED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// 重启音频成功后清除标记。
+pub fn clear_engine_panic() {
+    CALLBACK_PANICKED.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 记一次回调 panic。**只报一次** —— 音频回调每秒被调上百次，
+/// 真出问题会连续 panic，不节流的话日志会被刷爆，反而看不到第一条。
+fn note_callback_panic() {
+    use std::sync::atomic::Ordering;
+    if !CALLBACK_PANICKED.swap(true, Ordering::SeqCst) {
+        log::error!(
+            "[audio] ⚠ 音频回调里发生了 panic —— 已就地兜住（不让它跨 FFI 边界，那是 UB）\
+             ，但引擎状态已不可信，应重启音频"
+        );
+    }
+}
+
+/// 给**输入**回调套一层 panic 兜底。
+///
+/// ⚠️ **这不是可选优化，是必须的。** cpal 的回调是从 `extern "C" fn` 里调过来的
+/// （coreaudio-rs 的 `input_proc` / render proc），panic 一旦 unwind 出去就是
+/// **跨 FFI 边界 = 未定义行为**，可能表现为莫名其妙的崩溃或死锁。
+/// 所以必须在**我们这一侧**就地兜住。
+fn guard_input(mut cb: CaptureCallback) -> CaptureCallback {
+    Box::new(move |data: &[f32]| {
+        // AssertUnwindSafe：回调持有 `&mut` 状态，编译器无法证明它 unwind-safe。
+        // 接受这个风险，但**不当作没事发生** —— 见 note_callback_panic。
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(data)));
+        if r.is_err() {
+            note_callback_panic();
+        }
+    })
+}
+
+/// 给**输出**回调套一层 panic 兜底。
+///
+/// 比输入侧多一件事：**必须把缓冲清零**。输出缓冲是复用的，
+/// panic 之后里面是上一次的残留 —— 不清零的话，游戏会收到一段垃圾音频。
+fn guard_output(mut cb: RenderCallback) -> RenderCallback {
+    Box::new(move |data: &mut [f32]| {
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cb(data)));
+        if r.is_err() {
+            data.fill(0.0); // 宁可静音，也不能把残留样本送出去
+            note_callback_panic();
+        }
+    })
+}
+
 pub struct CpalBackend;
 
 impl Default for CpalBackend {
@@ -229,7 +288,7 @@ impl AudioBackend for CpalBackend {
         &self,
         id: &DeviceId,
         prefer: Option<StreamFormat>,
-        mut cb: CaptureCallback,
+        cb: CaptureCallback,
     ) -> Result<Box<dyn AudioStream>> {
         let host = Self::host();
         let dev = Self::resolve(&host, id, Direction::Input)?;
@@ -242,6 +301,9 @@ impl AudioBackend for CpalBackend {
         let sc = stream_config(&cfg);
         let name = dev.name().unwrap_or_else(|_| id.to_string());
         let err_fn = |e| log::error!("[audio] 输入流错误: {e}");
+
+        // 在分派到各采样格式之前先包一层 —— 6 条分支就都受保护了
+        let mut cb = guard_input(cb);
 
         let stream = match cfg.sample_format() {
             cpal::SampleFormat::F32 => dev.build_input_stream(
@@ -290,7 +352,7 @@ impl AudioBackend for CpalBackend {
         &self,
         id: &DeviceId,
         prefer: Option<StreamFormat>,
-        mut cb: RenderCallback,
+        cb: RenderCallback,
     ) -> Result<Box<dyn AudioStream>> {
         let host = Self::host();
         let dev = Self::resolve(&host, id, Direction::Output)?;
@@ -303,6 +365,9 @@ impl AudioBackend for CpalBackend {
         let sc = stream_config(&cfg);
         let name = dev.name().unwrap_or_else(|_| id.to_string());
         let err_fn = |e| log::error!("[audio] 输出流错误: {e}");
+
+        // 同上：先包一层 panic 兜底
+        let mut cb = guard_output(cb);
 
         // 先建一个 f32 暂存区，再由回调填满（回调必须写满整个 buffer）
         let mut scratch: Vec<f32> = Vec::with_capacity(16384);
