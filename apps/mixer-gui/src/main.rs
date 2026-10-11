@@ -69,6 +69,17 @@ fn shellexpand_tilde(p: &str) -> String {
 
 #[tauri::command]
 fn start(app: tauri::AppHandle, host: State<'_, AudioHost>, cfg: StartConfig) -> Res<()> {
+    // 启动失败**一定要进日志**。打包后的 App 没有控制台，错误只回到前端的话，
+    // 用户看到的是一个弹一下就消失的 toast，我们事后什么都查不到。
+    // （排查"点了启动没反应"时正是卡在这里：错误只在前端，日志里一片正常。）
+    let r = start_inner(app, host, cfg);
+    if let Err(e) = &r {
+        println!("[启动] ❌ 失败: {e}");
+    }
+    r
+}
+
+fn start_inner(app: tauri::AppHandle, host: State<'_, AudioHost>, cfg: StartConfig) -> Res<()> {
     // 快路（设备没变就只重新激活）在 host.start 里面 —— 放那儿冒烟测试也能覆盖到。
     println!(
         "[启动] 前端送来的参数：monitor={} monitor_device={:?} output={:?} 文件 {} 个",
@@ -738,6 +749,19 @@ fn main() {
 
             // 一启动就问麦克风权限，别等到用户点「启动」时才弹窗
             host::request_mic_permission();
+
+            // 音效文件所在的目录也可能需要授权（macOS 对下载/桌面/文稿有保护）。
+            // 同样提前探测 —— 否则用户点「启动」时会**毫无反应**，
+            // 因为文件读取在授权确定之前是直接阻塞的。
+            {
+                let cfg = Config::load();
+                let files: Vec<PathBuf> = if cfg.sound_files.is_empty() {
+                    cfg.collect_sounds().unwrap_or_default()
+                } else {
+                    cfg.sound_files
+                };
+                host::probe_sound_file_access(&files);
+            }
 
             // 自检探针：程序自己关窗，验证"关窗不退"真的生效
             if std::env::args().any(|a| a == "--probe-close") {

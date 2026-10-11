@@ -32,7 +32,8 @@ fi
 command -v cargo >/dev/null 2>&1 || { echo "找不到 cargo，请先安装 Rust"; exit 1; }
 
 echo "── 1/4 打包 ──"
-../../node_modules/.bin/tauri build "$@"
+# 显式只要 .app —— DMG 由本脚本在**重新签名之后**自己打（见文件末尾）
+../../node_modules/.bin/tauri build --bundles app "$@"
 
 APP="../../target/release/bundle/macos/音效板.app"
 

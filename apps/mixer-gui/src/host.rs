@@ -295,6 +295,48 @@ fn record_panic(msg: &str) {
     *LAST_PANIC.lock().unwrap_or_else(|e| e.into_inner()) = Some(msg.to_string());
 }
 
+/// 启动时先把音效文件**读一下**，让系统尽早弹目录授权窗。
+///
+/// ## 为什么必须做
+///
+/// macOS 对 `~/Downloads`、桌面、文稿有独立的隐私保护。**在授权没确定之前，
+/// 对这些目录的文件读取会直接阻塞**（不报错、不超时）。
+///
+/// 表现极具迷惑性：用户点「启动」，界面毫无反应 —— 因为 `start()` 卡在解码那一步。
+/// 而错误只回到前端、不进日志，事后完全查不到。
+/// （这个坑实际踩到过：用户配置里的 mp3 在 `~/Downloads`，
+/// 授权窗挂着的时候「启动」就一直没反应；点了允许之后一切正常。）
+///
+/// 麦克风权限早就有类似的启动探测（`request_mic_permission`），
+/// 文件权限是同一个道理 —— **把弹窗挪到启动时，而不是用户点「启动」时**。
+pub fn probe_sound_file_access(paths: &[PathBuf]) {
+    let first = paths.iter().find(|p| p.is_file()).cloned();
+    let Some(p) = first else {
+        return;
+    };
+    std::thread::Builder::new()
+        .name("file-perm".into())
+        .spawn(move || {
+            use std::io::Read;
+            // 只读开头一小段就够触发授权判定，不用把整个文件读进来
+            match std::fs::File::open(&p) {
+                Ok(mut f) => {
+                    let mut buf = [0u8; 4096];
+                    match f.read(&mut buf) {
+                        Ok(n) => println!(
+                            "[文件权限] 已确认可读（{}，读到 {n} 字节）—— {}",
+                            p.file_name().unwrap_or_default().to_string_lossy(),
+                            p.parent().unwrap_or(&p).display()
+                        ),
+                        Err(e) => println!("[文件权限] ⚠ 读取失败: {e}（{}）", p.display()),
+                    }
+                }
+                Err(e) => println!("[文件权限] ⚠ 打不开: {e}（{}）", p.display()),
+            }
+        })
+        .ok();
+}
+
 /// panic 日志文件路径（macOS 惯例：`~/Library/Logs/<App>/`）。
 pub fn panic_log_path() -> Option<std::path::PathBuf> {
     let home = std::env::var("HOME").ok()?;
