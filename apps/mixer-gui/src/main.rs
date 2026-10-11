@@ -641,6 +641,13 @@ fn acquire_single_instance() -> Option<std::net::TcpListener> {
 }
 
 fn main() {
+    // ⚠️ 必须在**主线程**登记一次（也就是这里）。
+    //
+    // Windows 上热键的隐藏窗口必须建在跑消息循环的线程上 —— 拿不准的话
+    // `is_main_thread()` 返回 false，会把绑定调度到主线程；但要是
+    // 主线程压根没登记，那个调度判断就没有依据。
+    // 不登记的代价是热键**静默失效**（按了没反应，也不报错）。
+    hotkeys::note_main_thread();
     // 最先装 —— 越早装，越不会漏掉启动阶段的 panic
     host::install_panic_hook();
     // 自测钩子：只有设了 MIXER_PANIC_AFTER 才生效

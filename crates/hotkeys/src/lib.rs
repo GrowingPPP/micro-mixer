@@ -183,10 +183,61 @@ pub fn is_main_thread() -> bool {
     unsafe { pthread_main_np() == 1 }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// Windows：主线程必须**显式登记**，否则一律当成"不是主线程"。
+///
+/// ## 为什么不能像原来那样直接返回 `true`
+///
+/// 原来这里是 `true` —— 那不是检查，是个**桩**。后果是一条完整的静默失效链：
+///
+///   ① `bind_hotkeys_on_main_thread` 以为已经在主线程 → 不做调度
+///   ② `GlobalHotKeyManager` 在 **tokio 工作线程**上创建（隐藏窗口也建在那儿）
+///   ③ 那个线程**不泵消息** → `WM_HOTKEY` 永远不派发
+///   ④ **热键完全不响应**，而且不报任何错
+///
+/// Windows 上 `WM_HOTKEY` 是投递到**创建窗口那个线程**的消息队列的，
+/// 所以创建线程必须在跑消息循环 —— 这一点和 macOS 的 Carbon 要求**是同一类约束**。
+/// Tauri 的主线程在跑事件循环，tokio 工作线程不在。
+///
+/// 拿不准时返回 `false` 是**安全方向**：那会强制把绑定调度到主线程，
+/// 多一次往返而已；反过来的错误是热键彻底不工作。
+#[cfg(target_os = "windows")]
+pub fn is_main_thread() -> bool {
+    use std::sync::atomic::Ordering;
+    let noted = MAIN_THREAD_ID.load(Ordering::Acquire);
+    noted != 0 && noted == current_thread_id()
+}
+
+/// Windows 上记录"主线程是谁"。**必须从主线程调用一次**（启动时）。
+///
+/// 不做自动探测：靠"第一次调用发生在主线程"这种假设太脆，
+/// 而错了的代价是热键静默失效。显式登记，错了立刻看得出来。
+#[cfg(target_os = "windows")]
+pub fn note_main_thread() {
+    MAIN_THREAD_ID.store(current_thread_id(), std::sync::atomic::Ordering::Release);
+}
+
+#[cfg(target_os = "windows")]
+static MAIN_THREAD_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(target_os = "windows")]
+fn current_thread_id() -> u32 {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThreadId() -> u32;
+    }
+    // SAFETY: GetCurrentThreadId 无参数、无副作用失败，恒返回当前线程 ID
+    unsafe { GetCurrentThreadId() }
+}
+
+/// 其他平台（Linux 等）：没有"必须在主线程"的约束，永远返回 true 即可。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn is_main_thread() -> bool {
     true
 }
+
+/// 其他平台不需要登记，留一个空实现让调用方不用写 cfg。
+#[cfg(not(target_os = "windows"))]
+pub fn note_main_thread() {}
 
 /// 轮询句柄：**只读 global-hotkey 的全局事件通道 + 一张 id→槽位表**。
 ///
@@ -644,5 +695,42 @@ mod tests {
         for spec in ["", "   ", "Cmd+", "Cmd+Shift", "A+B", "NotAKey"] {
             assert!(parse_hotkey(spec).is_err(), "「{spec}」应报错");
         }
+    }
+}
+
+#[cfg(test)]
+mod main_thread_tests {
+    #![allow(non_snake_case)]
+    use super::*;
+
+    #[test]
+    fn 没登记时必须返回_false_而不是_true() {
+        // 这是安全方向：false → 强制调度到主线程（多一次往返）；
+        // true → 可能在 tokio 工作线程上建窗口，热键**静默失效**。
+        //
+        // 修之前这个函数在非 macOS 上恒返回 true —— 那不是检查，是桩。
+        #[cfg(target_os = "windows")]
+        {
+            // 先把登记清掉（模拟"忘了登记"）
+            MAIN_THREAD_ID.store(0, std::sync::atomic::Ordering::Release);
+            assert!(
+                !is_main_thread(),
+                "没登记就返回 true，会让热键建在错误的线程上"
+            );
+            // 登记之后，当前线程就是主线程
+            note_main_thread();
+            assert!(is_main_thread(), "登记之后当前线程应当被认作主线程");
+        }
+    }
+
+    #[test]
+    fn 登记函数在不支持的平台上也能编译通过() {
+        // 让调用方不必到处写 cfg
+        note_main_thread();
+    }
+
+    #[test]
+    fn 当前平台上_is_main_thread_能安全调用() {
+        let _ = is_main_thread();
     }
 }

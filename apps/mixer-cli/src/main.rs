@@ -135,6 +135,10 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    // ⚠️ 必须在**主线程**登记一次（也就是这里）。
+    // Windows 上热键的隐藏窗口必须建在跑消息循环的线程上。
+    // 不登记的代价是热键**静默失效**（按了没反应，也不报错）。
+    hotkeys::note_main_thread();
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("warn,symphonia=off"),
     )
