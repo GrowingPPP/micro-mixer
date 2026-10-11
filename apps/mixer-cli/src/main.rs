@@ -43,6 +43,13 @@ enum Cmd {
     /// 列出所有音频设备（含虚拟声卡）
     List,
 
+    /// 环境体检：设备、虚拟声卡、配置、文件、权限有没有问题
+    ///
+    /// 比 selftest 更靠前一步 —— selftest 验证"链路通不通"，
+    /// doctor 检查"该有的东西在不在"。用户遇到"没声音"时先跑这个，
+    /// 大多数情况不用进游戏就能看出问题。
+    Doctor,
+
     /// 端到端自检：送已知信号进虚拟设备，从环回录回来验证整条链路
     Selftest {
         /// 虚拟设备名，省略则自动探测
@@ -137,6 +144,7 @@ fn main() -> Result<()> {
 
     match cli.cmd {
         Cmd::List => list_devices(&backend),
+        Cmd::Doctor => cmd_doctor(&backend),
         Cmd::Selftest { device, freq, secs } => cmd_selftest(&backend, device, freq, secs),
         Cmd::Config { args } => cmd_config(&args),
         Cmd::HotkeyTest { keys } => hotkey_test(keys),
@@ -354,6 +362,138 @@ fn hotkey_test(keys: Option<String>) -> Result<()> {
 // ─────────────────────────────────────────── list
 
 /// 端到端自检：跑一遍链路，把结构化结果排版成表格。
+/// 环境体检。
+///
+/// 和 `selftest` 的分工：selftest 验证**链路通不通**（要开音频、要几秒），
+/// doctor 检查**该有的东西在不在**（秒出、不动音频设备）。
+/// 用户说"没声音"时先跑这个 —— 大多数问题（虚拟声卡没装、配置里的设备没了、
+/// 音效文件不存在）在这一步就能看出来，不用进游戏试。
+fn cmd_doctor(backend: &CpalBackend) -> Result<()> {
+    use audio_core::device::is_virtual_name;
+
+    let cfg = app_config::Config::load();
+    let mut problems: Vec<String> = Vec::new();
+
+    println!("\n  ═══ 环境体检 ═══\n");
+
+    // ── 平台 ──
+    let os = if cfg!(target_os = "windows") {
+        "Windows"
+    } else if cfg!(target_os = "macos") {
+        "macOS"
+    } else {
+        "其他"
+    };
+    println!("  平台      : {os}");
+    println!("  配置文件  : {}", app_config::Config::path().display());
+
+    // ── 设备 ──
+    let devs = backend.devices().unwrap_or_default();
+    let inputs: Vec<_> = devs
+        .iter()
+        .filter(|d| d.direction == Direction::Input)
+        .collect();
+    let outputs: Vec<_> = devs
+        .iter()
+        .filter(|d| d.direction == Direction::Output)
+        .collect();
+    println!("  输入设备  : {} 个", inputs.len());
+    println!("  输出设备  : {} 个", outputs.len());
+
+    // 虚拟声卡是整件事的前提 —— 没有它一切都免谈
+    let virt_out: Vec<_> = outputs
+        .iter()
+        .filter(|d| is_virtual_name(&d.name))
+        .collect();
+    let virt_in: Vec<_> = inputs.iter().filter(|d| is_virtual_name(&d.name)).collect();
+    if virt_out.is_empty() || virt_in.is_empty() {
+        println!("  ❌ 虚拟声卡: 没找到");
+        problems.push(format!(
+            "没装虚拟声卡。{}",
+            if cfg!(target_os = "windows") {
+                "去 vb-audio.com/Cable 下载 VB-CABLE，**以管理员身份**装完**重启**。\
+                 注意它的命名是反的：本程序输出到 CABLE Input，游戏选麦克风要选 CABLE Output。"
+            } else {
+                "推荐 BlackHole：brew install --cask blackhole-2ch，装完重启。"
+            }
+        ));
+    } else {
+        let names: Vec<&str> = virt_out.iter().map(|d| d.name.as_str()).collect();
+        println!("  ✅ 虚拟声卡: {}", names.join(" / "));
+    }
+
+    // ── 配置里的设备还在不在 ──
+    //
+    // 这是最常见的"上次还好好的、这次没声音"：耳机拔了、虚拟声卡重装后换了名字。
+    if let Some(want) = &cfg.output_device {
+        let ok = outputs.iter().any(|d| &d.name == want);
+        if ok {
+            println!("  ✅ 配置的输出设备「{want}」在线");
+        } else {
+            println!("  ❌ 配置的输出设备「{want}」**不在了**");
+            problems.push(format!(
+                "配置里写的输出设备「{want}」已经不存在（拔了？重装了？）。\
+                 打开界面重新选一个，或跑 `mixer config set output_device <名字>`。"
+            ));
+        }
+    }
+    if let Some(want) = &cfg.input_device {
+        if inputs.iter().any(|d| &d.name == want) {
+            println!("  ✅ 配置的麦克风「{want}」在线");
+        } else {
+            println!("  ⚠ 配置的麦克风「{want}」不在了 —— 会自动回退到系统默认");
+            problems.push(format!(
+                "配置里的麦克风「{want}」不在了。程序会自动回退到系统默认麦克风，\
+                 但建议重新选一次（`mixer config set input_device <名字>`）。"
+            ));
+        }
+    }
+
+    // ── 音效文件 ──
+    let files: Vec<_> = if cfg.sound_files.is_empty() {
+        cfg.collect_sounds().unwrap_or_default()
+    } else {
+        cfg.sound_files.clone()
+    };
+    let missing: Vec<_> = files.iter().filter(|p| !p.is_file()).collect();
+    println!(
+        "  音效文件  : {} 个（缺 {} 个）",
+        files.len(),
+        missing.len()
+    );
+    for m in missing.iter().take(5) {
+        println!("            ✗ {}", m.display());
+    }
+    if files.is_empty() {
+        problems.push("一个音效文件都没有。界面上点「添加音频」导入几个。".into());
+    } else if !missing.is_empty() {
+        problems.push(format!(
+            "有 {} 个音效文件找不到了（移动或删了？）。界面上对应的卡片会显示「打不开」。",
+            missing.len()
+        ));
+    }
+
+    // ── 热键 ──
+    if cfg.hotkeys.is_empty() {
+        problems.push("没配热键 —— 游戏里就没法触发了。界面上给槽位设一个（比如 F1）。".into());
+    } else {
+        println!("  ✅ 热键    : {}", cfg.hotkeys.join(", "));
+    }
+
+    // ── 结论 ──
+    println!();
+    if problems.is_empty() {
+        println!("  ✅ 没发现问题。下一步跑 `mixer selftest` 验证音频链路。\n");
+    } else {
+        println!("  发现 {} 个问题：", problems.len());
+        for (i, p) in problems.iter().enumerate() {
+            println!("\n   {}. {}", i + 1, p);
+        }
+        println!();
+    }
+    Ok(())
+}
+
 fn cmd_selftest(backend: &CpalBackend, device: Option<String>, freq: f32, secs: f32) -> Result<()> {
     // 自动重试：这块虚拟声卡偶发抽风，重开一次流通常就好
     let r = selftest::run_with_retry(backend, device, freq, secs, 3)?;
