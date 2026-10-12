@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "音效板",
+  "productName": "麦克风混音助手",
   "version": "0.1.0",
   "identifier": "dev.local.mixer",
   "build": {
@@ -10,7 +10,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "音效板 · 把音频播进麦克风",
+        "title": "麦克风混音助手 · 把音频和人声一起传给对方",
         "width": 920,
         "height": 660,
         "minWidth": 660,
@@ -37,8 +37,8 @@
     "macOS": {
       "minimumSystemVersion": "11.0"
     },
-    "shortDescription": "把音频播进麦克风，让队友听到",
-    "longDescription": "在游戏里按一个键，队友就听到你选的音频；同时你的真实说话声完全不受影响。",
+    "shortDescription": "将本地音频与麦克风人声混合，让对方听到",
+    "longDescription": "将本地音频与麦克风人声实时混合，通过虚拟音频设备传给语音、会议、直播或游戏中的对方。支持音效切换、单独调音量、循环播放、仅自己可听的试听和手机遥控。",
     "copyright": "Copyright (c) 2026 zhangguanghui <1003986591@qq.com>",
     "windows": {
       "nsis": {
@@ -49,7 +49,7 @@
         ],
         "displayLanguageSelector": false,
         "installerIcon": "icons/icon.ico",
-        "startMenuFolder": "音效板",
+        "startMenuFolder": "麦克风混音助手",
         "compression": "lzma"
       }
     }

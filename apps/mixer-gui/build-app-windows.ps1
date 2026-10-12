@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    在 Windows 上构建「音效板」并打出 NSIS 安装包。
+    在 Windows 上构建「麦克风混音助手」并打出 NSIS 安装包。
 
 .DESCRIPTION
     对应 macOS 那边的 apps/mixer-gui/build-app.sh。
@@ -30,6 +30,24 @@ function Step($n, $msg) { Write-Host "`n── $n $msg ──" }
 function Ok($msg)   { Write-Host "  [OK] $msg"   -ForegroundColor Green }
 function Bad($msg)  { Write-Host "  [!!] $msg"   -ForegroundColor Red }
 function Warn($msg) { Write-Host "  [??] $msg"   -ForegroundColor Yellow }
+
+function Get-TauriProductName($Config) {
+    $name = $Config.productName
+    if ($name -isnot [string] -or [string]::IsNullOrWhiteSpace($name) -or
+        $name -match '[<>:"/\\|?*\x00-\x1f]') {
+        throw 'tauri.conf.json 的 productName 必须是有效的跨平台文件名'
+    }
+    return $name
+}
+
+function Find-NsisInstaller([string]$Directory, [string]$ProductName, [string]$Version) {
+    # 精确匹配本次产品名及版本，避免改名后把旧安装包误判为本次产物。
+    return Get-ChildItem -LiteralPath $Directory -Filter "${ProductName}_${Version}_*-setup.exe" -File -ErrorAction SilentlyContinue |
+           Sort-Object LastWriteTime -Descending | Select-Object -First 1
+}
+
+$tauriConfig = Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot 'tauri.conf.json') | ConvertFrom-Json
+$AppName = Get-TauriProductName $tauriConfig
 
 function Get-TauriBuildArguments([bool]$WithoutInstaller) {
     if ($WithoutInstaller) { return @('build', '--no-bundle') }
@@ -72,7 +90,7 @@ function Test-SmokeResult([int]$ExitCode, [string]$Output) {
     $check = [regex]::Escape([string][char]0x2705)
     $cross = [string][char]0x274C
     $passed = ([regex]::Matches($Output, "(?m)^\s*$check")).Count
-    if ($ExitCode -ne 0) { throw "冒烟进程退出码 $ExitCode（通过 $passed 项）" }
+    if ($ExitCode -ne 0) { throw "冒烟进程退出码 ${ExitCode}（通过 $passed 项）" }
     if ($Output.Contains($cross)) { throw "冒烟输出包含失败标记（通过 $passed 项）" }
     # 空输出、程序提前退出和部分完成均不得通过发布门禁。
     if ($passed -lt 28) { throw "冒烟检查不完整：仅通过 $passed 项，要求至少 28 项" }
@@ -90,6 +108,28 @@ if ($TestSmokeHarness) {
     $testDir = Join-Path ([IO.Path]::GetTempPath()) ('mixer_smoke_gate_' + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $testDir | Out-Null
     try {
+        foreach ($name in @('麦克风混音助手', '测试 名称', 'Audio Mix')) {
+            if ((Get-TauriProductName ([pscustomobject]@{ productName = $name })) -cne $name) {
+                throw '中文或空格产品名不能被截断'
+            }
+        }
+        foreach ($name in @('', '   ', 'bad/name', 'bad\name', 'bad:name', 'bad*name')) {
+            $rejected = $false
+            try { Get-TauriProductName ([pscustomobject]@{ productName = $name }) | Out-Null } catch { $rejected = $true }
+            if (-not $rejected) { throw '无效产品名未被拒绝' }
+        }
+        $installerDir = Join-Path $testDir 'nsis'
+        New-Item -ItemType Directory -Path $installerDir | Out-Null
+        $expectedInstaller = Join-Path $installerDir '测试 名称_0.1.0_x64-setup.exe'
+        [IO.File]::WriteAllText($expectedInstaller, 'new package')
+        foreach ($stale in @('旧名称_0.1.0_x64-setup.exe', '测试 名称_0.0.9_x64-setup.exe')) {
+            $path = Join-Path $installerDir $stale
+            [IO.File]::WriteAllText($path, 'stale package')
+            (Get-Item -LiteralPath $path).LastWriteTime = [datetime]::Now.AddMinutes(1)
+        }
+        $found = Find-NsisInstaller $installerDir '测试 名称' '0.1.0'
+        if ($null -eq $found -or $found.FullName -cne $expectedInstaller) { throw '安装包选择误用了旧名或旧版本' }
+        if ($null -ne (Find-NsisInstaller $installerDir '不存在' '0.1.0')) { throw '缺少本次安装包时不得兜底选择旧产物' }
         $plainBuildArguments = @(Get-TauriBuildArguments $true)
         if (($plainBuildArguments -join ' ') -ne 'build --no-bundle' -or
             $plainBuildArguments -contains '--bundles') { throw 'NoInstaller 构建参数错误' }
@@ -124,7 +164,7 @@ if ($TestSmokeHarness) {
             try { Test-SmokeResult $case.Exit $case.Output | Out-Null } catch { $rejected = $true }
             if (-not $rejected) { throw '失败或不完整结果被误判为通过' }
         }
-        Ok '冒烟门禁回归通过：构建参数 + WAV + 正常完成 + 6 类失败/不完整结果'
+        Ok '冒烟门禁回归通过：产品名/安装包筛选 + 构建参数 + WAV + 正常完成 + 6 类失败/不完整结果'
     } finally {
         Remove-Item -Recurse -Force $testDir
     }
@@ -216,10 +256,9 @@ Step '3/4' '安装包'
 if ($NoInstaller) {
     Warn '按参数要求跳过了'
 } else {
-    $nsis = Get-ChildItem -Path (Join-Path $Root 'target\release\bundle\nsis') -Filter '*.exe' -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    $nsis = Find-NsisInstaller (Join-Path $Root 'target\release\bundle\nsis') $AppName $tauriConfig.version
     if ($null -eq $nsis) {
-        Bad '没找到 NSIS 安装包（target\release\bundle\nsis\*.exe）'
+        Bad "没找到本次 NSIS 安装包：${AppName}_$($tauriConfig.version)_*-setup.exe"
         exit 1
     }
     Ok "安装包：$($nsis.Name)（$([math]::Round($nsis.Length / 1MB, 1)) MB）"
@@ -229,24 +268,24 @@ if ($NoInstaller) {
 # ── 4. 下一步 ──────────────────────────────────────────────────
 Step '4/4' '下一步'
 
-Write-Host @'
+Write-Host @"
   装完之后还需要一件事：**虚拟声卡**。
 
-  游戏和语音软件只能从「麦克风」读声音，虚拟声卡扮演的就是那个麦克风。
+  语音、会议、直播或游戏应用从「麦克风」读声音，虚拟声卡扮演的就是那个麦克风。
 
     1. 去 https://vb-audio.com/Cable/ 下载 VB-CABLE（个人使用免费）
     2. 解压后**右键 → 以管理员身份运行** VBCABLE_Setup_x64.exe，点 Install Driver
     3. **重启电脑**（驱动要重启才生效）
 
-  然后打开音效板：
+  然后打开 ${AppName}：
     · 「输出到（虚拟声卡）」选 **CABLE Input**
-    · 游戏里的麦克风选 **CABLE Output**
+    · 目标应用里的麦克风选 **CABLE Output**
 
   ⚠️ VB-CABLE 的命名是**反的**：本程序输出到 CABLE Input，
-     而游戏选麦克风要选 CABLE Output。名字看着别扭，但就是这样。
+     而目标应用选麦克风要选 CABLE Output。名字看着别扭，但就是这样。
      程序里如果没检测到虚拟声卡，会直接把这段引导显示出来。
 
   想先确认整条链路通不通：界面上点「自检」。
-'@
+"@
 
 Write-Host "`n完成。`n"

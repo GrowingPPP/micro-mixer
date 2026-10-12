@@ -89,7 +89,7 @@ impl Default for Config {
             sound_names: Vec::new(),
             sound_tags: Vec::new(),
             // 默认**开启**监听：没有它，用户在游戏里按键后自己听不到任何声音，
-            // 只能盲猜队友有没有收到 —— 这是实打实的可用性问题。
+            // 只能盲猜对方有没有收到 —— 这是实打实的可用性问题。
             monitor: true,
             looping: false,
             monitor_device: None,
@@ -789,11 +789,15 @@ fn legacy_list(value: &str) -> Vec<String> {
     parts
 }
 
-/// 展开开头的 `~`
+/// 展开 `~/`，与 GUI 目录输入共用平台的主目录规则。
 fn expand(p: String) -> PathBuf {
+    expand_on(&p, Platform::current(), &|key| std::env::var_os(key))
+}
+
+fn expand_on(p: &str, platform: Platform, env: EnvFn) -> PathBuf {
     if let Some(rest) = p.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
+        if let Some(home) = home_dir_on(platform, env) {
+            return home.join(rest);
         }
     }
     PathBuf::from(p)
@@ -890,6 +894,72 @@ mod path_tests {
         // 反过来：Windows 上**没有** USERPROFILE 就是 None，不能去读 HOME
         let env2 = env_of(&[("HOME", "/HOME")]);
         assert_eq!(home_dir_on(Platform::Windows, &env2), None);
+    }
+
+    #[test]
+    fn macos_目录别名使用_HOME_并保留中文空格和逗号() {
+        let env = env_of(&[
+            ("HOME", "/Users/测试 用户"),
+            ("USERPROFILE", "/wrong-profile"),
+        ]);
+        assert_eq!(
+            expand_on("~/音频 素材,一", Platform::Unix, &env),
+            PathBuf::from("/Users/测试 用户").join("音频 素材,一")
+        );
+    }
+
+    #[test]
+    fn windows_目录别名使用_USERPROFILE_不依赖_HOME() {
+        let env = env_of(&[("USERPROFILE", r"C:\Users\测试 用户")]);
+        let expected = PathBuf::from(r"C:\Users\测试 用户").join("音频 素材,一");
+        assert_eq!(
+            expand_on("~/音频 素材,一", Platform::Windows, &env),
+            expected
+        );
+
+        // Git Bash 等环境可能也设置 HOME，仍与 GUI 一致使用 USERPROFILE。
+        let env = env_of(&[
+            ("USERPROFILE", r"D:\Users\测试 用户"),
+            ("HOME", "/wrong-home"),
+        ]);
+        assert_eq!(
+            expand_on("~/Sounds", Platform::Windows, &env),
+            PathBuf::from(r"D:\Users\测试 用户").join("Sounds")
+        );
+    }
+
+    #[test]
+    fn 没有平台主目录时保留目录别名() {
+        for (platform, pairs) in [
+            (Platform::Windows, vec![]),
+            (Platform::Windows, vec![("USERPROFILE", "")]),
+            (Platform::Windows, vec![("HOME", "/wrong-home")]),
+            (Platform::Unix, vec![]),
+            (Platform::Unix, vec![("HOME", "")]),
+            (Platform::Unix, vec![("USERPROFILE", "/wrong-profile")]),
+        ] {
+            assert_eq!(
+                expand_on("~/Sounds", platform, &env_of(&pairs)),
+                PathBuf::from("~/Sounds"),
+                "不能改成依赖当前工作目录的 Sounds：{platform:?} {pairs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn 主目录展开不改写绝对路径或普通相对路径() {
+        let env = env_of(&[("HOME", "/home"), ("USERPROFILE", r"C:\Users\测试")]);
+        for platform in [Platform::Unix, Platform::Windows] {
+            for path in [
+                "/Volumes/音频 素材/声音,一.wav",
+                r"D:\音频 素材\声音,一.wav",
+                r"\\server\share\音频 素材\声音.wav",
+                "relative/sound.wav",
+                "~other/Sounds",
+            ] {
+                assert_eq!(expand_on(path, platform, &env), PathBuf::from(path));
+            }
+        }
     }
 
     #[test]
@@ -1321,10 +1391,15 @@ value = "second"
     }
 
     #[test]
-    fn 波浪号应展开为家目录() {
-        std::env::set_var("HOME", "/tmp/fakehome");
+    fn 配置目录别名应使用当前平台主目录() {
+        // 只读真实环境，避免改 HOME 干扰同时运行的路径或配置测试。
+        let expected = home_dir()
+            .map(|home| home.join("Sounds"))
+            .unwrap_or_else(|| PathBuf::from("~/Sounds"));
         let c = Config::parse(r#"sound_dirs = ["~/Sounds"]"#);
-        assert_eq!(c.sound_dirs[0], PathBuf::from("/tmp/fakehome/Sounds"));
+        assert_eq!(c.sound_dirs[0], expected);
+        let c = Config::parse(r#"sound_files = ["~/Sounds"]"#);
+        assert_eq!(c.sound_files[0], expected);
     }
 }
 
@@ -1372,6 +1447,38 @@ pub fn scan_dirs(dirs: &[PathBuf]) -> Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod scan_tests {
     use super::*;
+
+    #[test]
+    fn 非下载目录的中文空格逗号路径可保存恢复后扫描() {
+        struct TemporaryDirectory(PathBuf);
+        impl Drop for TemporaryDirectory {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let directory = TemporaryDirectory(std::env::temp_dir().join(format!(
+            "mixer-custom-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        )));
+        let source = directory.0.join("音频 目录,素材");
+        std::fs::create_dir_all(source.join("子文件夹")).unwrap();
+        let sound = source.join("声音, 一.WAV");
+        std::fs::write(&sound, b"scan fixture").unwrap();
+        std::fs::write(source.join("ignored.txt"), b"not audio").unwrap();
+        std::fs::write(source.join("子文件夹/nested.wav"), b"nested").unwrap();
+
+        let config = Config {
+            sound_dirs: vec![source.clone()],
+            ..Default::default()
+        };
+        let restored = Config::parse(&config.to_text());
+        assert_eq!(restored.sound_dirs, vec![source]);
+        assert_eq!(restored.collect_sounds().unwrap(), vec![sound]);
+    }
 
     #[test]
     fn 只挑出音频文件并按名排序() {

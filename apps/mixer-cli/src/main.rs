@@ -5,7 +5,7 @@
 //! ```text
 //! mixer list                                                 # 列出设备
 //! mixer passthrough                                          # 麦克风透传（验证链路）
-//! mixer play --file 笑.mp3 --file 警报.mp3 --hotkeys F1,F2     # 全局热键触发的音效板
+//! mixer play --file 笑.mp3 --file 警报.mp3 --hotkeys F1,F2     # 全局热键触发的麦克风混音助手
 //! ```
 
 use std::path::PathBuf;
@@ -44,8 +44,8 @@ fn take_monitor_warning(health: &StreamHealth, warned: &mut bool) -> Option<Stri
 #[command(
     name = "mixer",
     version,
-    about = "把本地音频播进麦克风，让队友听到",
-    long_about = "把本地音频播进麦克风，让队友听到。\n\n日常使用只需要：mixer play（读 ~/.config/mixer/config.toml）"
+    about = "将本地音频与麦克风人声混合，让对方听到",
+    long_about = "将本地音频与麦克风人声混合，通过虚拟音频设备传给语音、会议、直播或游戏中的对方。\n\n日常使用只需要：mixer play（读 ~/.config/mixer/config.toml）"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -94,7 +94,7 @@ enum Cmd {
         duration: Option<u64>,
     },
 
-    /// 音效板：麦克风 + 多路音效实时混音，全局热键触发（**不传参数就读配置**）
+    /// 麦克风混音助手：麦克风与当前音效实时混音，全局热键触发（**不传参数就读配置**）
     Play {
         /// 音频文件，可重复。第 i 个文件对应第 i 个热键
         #[arg(short, long)]
@@ -877,7 +877,7 @@ fn run(b: &CpalBackend, options: RunOptions) -> Result<()> {
 
     println!("\n✅ 音频链路已启动");
     if slot_names.is_empty() {
-        println!("   对着麦克风说话，队友应该能听到。q = 退出\n");
+        println!("   对着麦克风说话，对方应该能听到。q = 退出\n");
     } else {
         println!(
             "   终端也能触发：数字键 1-{} = 播放   s = 全部停止   q = 退出\n",

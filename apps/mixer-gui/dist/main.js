@@ -1,4 +1,4 @@
-// 音效板前端。纯静态、无打包器 —— 通过 withGlobalTauri 暴露的 __TAURI__ 调用 Rust。
+// 麦克风混音助手前端。纯静态、无打包器 —— 通过 withGlobalTauri 暴露的 __TAURI__ 调用 Rust。
 
 const invoke = (cmd, args) => window.__TAURI__.core.invoke(cmd, args);
 
@@ -42,7 +42,42 @@ const el = {
   vdevHelp: $('vdevHelp'), micHelp: $('micHelp'), btnMicHelp: $('btnMicHelp'),
   grid: $('grid'), metrics: $('metrics'), toast: $('toast'),
   btnStopAll: $('btnStopAll'), setup: $('setup'), btnSetup: $('btnSetup'),
+  btnAbout: $('btnAbout'), btnAboutClose: $('btnAboutClose'),
+  aboutOverlay: $('aboutOverlay'), aboutTitle: $('aboutTitle'), aboutVersion: $('aboutVersion'),
 };
+
+// 关于窗口只展示功能和版本；打开、关闭均不改变音频会话。
+let aboutOpen = false;
+let aboutReturnFocus = null;
+async function openAbout() {
+  if (aboutOpen) return;
+  aboutReturnFocus = document.activeElement || el.btnAbout;
+  aboutOpen = true;
+  el.aboutOverlay.classList.remove('hidden');
+  el.btnAboutClose.focus();
+  try {
+    const info = await invoke('app_info');
+    if (typeof info?.name === 'string' && info.name) el.aboutTitle.textContent = info.name;
+    if (typeof info?.version === 'string' && info.version) {
+      el.aboutVersion.textContent = `版本 ${info.version} · 支持 macOS 和 Windows`;
+      el.aboutVersion.classList.remove('hidden');
+    }
+  } catch (_) { /* 简介与关闭功能不依赖版本信息。 */ }
+}
+function closeAbout() {
+  if (!aboutOpen) return;
+  aboutOpen = false;
+  el.aboutOverlay.classList.add('hidden');
+  aboutReturnFocus?.focus();
+}
+el.btnAbout.addEventListener('click', openAbout);
+el.btnAboutClose.addEventListener('click', closeAbout);
+el.aboutOverlay.addEventListener('click', e => {
+  if (e.target === el.aboutOverlay) closeAbout();
+});
+document.addEventListener('focusin', e => {
+  if (aboutOpen && e.target !== el.btnAboutClose) el.btnAboutClose.focus();
+});
 
 let state = { running: false, slots: [], items: [], lastStatus: null,
                monitorDevice: null, remoteUrl: null, activeTag: null, devices: [],
@@ -285,7 +320,7 @@ async function start() {
     closeTestPanel();   // 自检是"启动前"的检查，开起来之后留着只占地方
     toast('已启动 · 关闭窗口不会退出');
   hint(`正在把「${el.selIn.selectedOptions[0]?.textContent || '系统默认麦克风'}」的声音和音效一起送进 ` +
-       `「${el.selOut.selectedOptions[0]?.textContent || '虚拟声卡'}」。游戏麦克风选它就能同时听到你说话和音效。`, 'ok');
+       `「${el.selOut.selectedOptions[0]?.textContent || '虚拟声卡'}」。在目标应用中选择对应的虚拟麦克风，对方就能同时听到你说话和音效。`, 'ok');
   } catch (e) {
     if (choice !== audioChoice) return;
     if (!opened) state.running = false;
@@ -328,8 +363,8 @@ async function stop() {
     return;
   }
   toast('音效已关闭');
-  hint('已停止音效。麦克风仍在转发 —— 队友照常听得到你说话，' +
-       '想放音效时点「开启音效」即可，游戏里的麦克风不用动。', 'ok');
+  hint('已停止音效。麦克风仍在转发 —— 对方照常听得到你说话，' +
+       '想放音效时点「开启音效」即可，目标应用的麦克风设置不用动。', 'ok');
 }
 
 let setupOpen = true;
@@ -360,7 +395,7 @@ function syncToggle() {
   el.btnToggle.textContent = state.running ? '关闭音效'
     : state.standby ? '开启音效' : '启动';
   el.btnToggle.title = state.running
-    ? '关掉音效播放。麦克风会继续转发，队友照样听得到你说话'
+    ? '关掉音效播放。麦克风会继续转发，对方照样听得到你说话'
     : state.standby
       ? '重新打开音效（设备不重开，瞬间生效）'
       : '启动音频引擎（麦克风开始转发，热键生效）';
@@ -435,7 +470,7 @@ async function play(slot) {
     await poll(choice);
     if (choice !== audioChoice) return;
     // 和「试听」形成明确对照：这条是真的送进麦克风了
-    toast(replacing ? '已切换播放 —— 队友听得到' : '已送进麦克风 —— 队友听得到');
+    toast(replacing ? '已切换播放 —— 对方听得到' : '已送进麦克风 —— 对方听得到');
   } catch (e) {
     if (choice === audioChoice) toast(e, true);
   }
@@ -504,7 +539,7 @@ function render() {
     d.className = 'empty';
     d.innerHTML = state.running
       ? '没有音效'
-      : '选一个音效文件夹，点「载入」<br><b>然后把游戏/语音软件的麦克风选成同一个虚拟声卡</b>';
+      : '选一个音效文件夹，点「载入」<br><b>然后把目标应用的麦克风选为对应的虚拟麦克风</b>';
     el.grid.appendChild(d);
     updateCount();
     return;
@@ -539,7 +574,7 @@ function render() {
       <span class="idx">${s.index + 1}</span>
       <div class="name" title="双击可改名">${esc(s.name)}</div>
       <div class="meta">
-        <span class="prev" title="试听：只放给你自己听，队友听不到。想让队友听到请点卡片空白处，或按热键">试听</span>
+        <span class="prev" title="试听：只放给你自己听，对方听不到。想让对方听到请点卡片空白处，或按热键">试听</span>
         <span class="dur">${s.duration ? s.duration.toFixed(1) + 's' : ''}</span>
         ${s.hotkey ? `<span class="key">${esc(s.hotkey)}</span>` : ''}
       </div>
@@ -604,7 +639,7 @@ function render() {
         }, choice), choice)) return;
         await poll(choice);
         if (choice !== audioChoice) return;
-        toast(replacing ? '已切换试听（仅自己听，队友听不到）' : '试听中（队友听不到）');
+        toast(replacing ? '已切换试听（仅自己听，对方听不到）' : '试听中（对方听不到）');
       } catch (err) { if (choice === audioChoice) toast('试听失败：' + err, true); }
     });
     pv.addEventListener('pointerdown', e => e.stopPropagation());
@@ -757,7 +792,7 @@ function updateCardPlayback(card, slot) {
   }
   const label = card.querySelector('.playback-state');
   if (label) label.textContent = playback.active
-    ? preview ? '试听中 · 仅自己听' : '播放中 · 队友听得到' : '';
+    ? preview ? '试听中 · 仅自己听' : '播放中 · 对方听得到' : '';
   const bar = card.querySelector('.bar');
   if (bar) {
     bar.style.width = playback.progress + '%';
@@ -789,7 +824,7 @@ async function poll(choice = audioChoice) {
     state.slots = st.slots || [];
 
     // 顶栏：三种状态必须一眼分得清 ——
-    //   待机时**麦克风仍在转发**，这点写出来，否则用户会以为"停了队友就听不到我"
+    //   待机时**麦克风仍在转发**，这点写出来，否则用户会以为"停了对方就听不到我"
     const wasStandby = state.standby;
     state.standby = !st.running && !!st.passthrough;
     // 待机状态变了要刷新按钮文案（轮询是唯一能发现"从别处停了"的途径）
@@ -798,14 +833,14 @@ async function poll(choice = audioChoice) {
       : st.overruns > 0 || st.underruns > 0 ? 'warn' : 'ok');
     el.headline.textContent = !st.running
       ? (state.standby
-          ? '待机 · 麦克风仍在转发（队友听得到你，音效已关）'
+          ? '待机 · 麦克风仍在转发（对方听得到你，音效已关）'
           : '未启动')
       : `${st.device} · 已运行 ${fmtTime(st.uptime_secs)}` +
         (st.hotkeys_active ? ' · 热键已绑定' : ' · 热键未绑定');
 
     // ── 麦克风一直没声音？ ──
     //
-    // 这是最典型的"无声失败"：引擎在跑、界面一切正常，但队友就是听不到。
+    // 这是最典型的"无声失败"：引擎在跑、界面一切正常，但对方就是听不到。
     // 原因通常是权限或"默认通信设备"选错了 —— 用户自己很难想到。
     //
     // 判定条件保守一点，避免误报：
@@ -827,7 +862,7 @@ async function poll(choice = audioChoice) {
     if (st.last_panic && st.last_panic !== state.lastPanicSeen) {
       state.lastPanicSeen = st.last_panic;
       hint('💥 程序内部出错了：' + st.last_panic +
-           ' —— 已记录到 ~/Library/Logs/音效板/panic.log，音频会在几秒内自动恢复。', 'error');
+           ' —— 请查看诊断日志；音频正在尝试自动恢复。', 'error');
       toast('程序内部出错（已兜住，正在自动恢复）', true);
     }
 
@@ -887,7 +922,7 @@ async function poll(choice = audioChoice) {
       if (st.last_error) hint('启动失败：' + st.last_error, 'error');
     }
 
-    // 电平表 —— 直接回答"队友能不能听到我"
+    // 电平表 —— 直接回答"对方能不能听到我"
     updateMeter(st);
 
     // 手机遥控地址：优先显示局域网地址（手机要用的就是它）
@@ -1124,8 +1159,8 @@ el.btnRelease.addEventListener('click', async () => {
     return;
   }
   toast('已彻底释放音频设备');
-  hint('设备已释放。⚠️ 如果游戏的麦克风还指着虚拟声卡，队友现在听不到你 —— 要么重新「启动」，' +
-       '要么把游戏里的麦克风改回真实麦克风。', 'error');
+  hint('设备已释放。⚠️ 如果目标应用的麦克风仍选着虚拟声卡，对方现在听不到你 —— 要么重新「启动」，' +
+       '要么把目标应用的麦克风改回真实麦克风。', 'error');
 });
 
 /// 这台机器上有没有虚拟声卡？
@@ -1155,8 +1190,8 @@ async function renderVdevHelp() {
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
   let html = `<div class="vdh-title">⚠️ ${esc2(info.title)}</div>` +
-    `<p>游戏和语音软件只能从「麦克风」读声音。虚拟声卡的作用就是：` +
-    `<b>我们把音效写进去，游戏从它读出来</b> —— 声音于是进了你的麦克风。</p>` +
+    `<p>语音、会议、直播和游戏应用通过「麦克风」读取声音。虚拟声卡的作用就是：` +
+    `<b>我们把人声和音频写进去，目标应用从它读出来</b> —— 声音于是进了你的麦克风。</p>` +
     `<p class="vdh-pick">推荐装 <b>${esc2(info.driver)}</b>：</p>` +
     `<ol class="vdh-steps">` +
     info.steps.map(t => `<li>${mdBold(t)}</li>`).join('') +
@@ -1212,7 +1247,7 @@ async function showMicHelp() {
     el.micHelp.innerHTML =
       `<div class="vdh-title">🔇 ${esc2(mp.title)}</div>` +
       `<p>${mdBold('引擎在跑，但送进麦克风的信号一直是**完全没有声音**（真实麦克风总有一点底噪）。' +
-                    '队友现在听不到你。按下面几步查一下：')}</p>` +
+                    '对方现在听不到你。按下面几步查一下：')}</p>` +
       `<ol class="vdh-steps">` +
       mp.steps.map(t => `<li>${mdBold(t)}</li>`).join('') +
       `</ol>` +
@@ -1252,6 +1287,7 @@ async function copyDriverCmd() {
 }
 el.inSearch.addEventListener('input', render);
 document.addEventListener('keydown', e => {
+  if (aboutOpen) return;
   if (e.key !== 'Escape') return;
   // 正在改名字/标签时 Esc 是"取消编辑"，别抢
   if (document.activeElement && document.activeElement.classList.contains('taginput')) return;
@@ -1312,7 +1348,7 @@ async function toggleQr() {
     tip.className = 'qrhint';
     tip.innerHTML = '<b>遥控还没启动</b><br>' +
       '点右上角「启动」之后，这里会出现二维码 ——<br>' +
-      '手机扫一下就能在游戏里点音效。';
+      '手机扫一下就能遥控播放音频。';
     el.qrPanel.appendChild(tip);
     addPanelClose(el.qrPanel, closeQr);
     el.qrPanel.classList.remove('hidden');
@@ -1375,7 +1411,7 @@ async function runSelfTest() {
     }
     if (r.passed) {
       html += '<div class="advice" style="color:var(--accent2)">' +
-              '整条链路正常，可以点「启动」进游戏了。</div>';
+              '整条链路正常，可以点「启动」，在目标应用中选择对应虚拟麦克风了。</div>';
     }
     el.testPanel.innerHTML = html;
     addPanelClose(el.testPanel, closeTestPanel);
@@ -1396,6 +1432,11 @@ el.inSfxGain.addEventListener('input', pushGains);
 
 // 快捷键：数字播放，空格停止（窗口内有效；游戏内靠全局热键）
 document.addEventListener('keydown', e => {
+  if (aboutOpen) {
+    if (e.key === 'Escape') { closeAbout(); e.preventDefault(); }
+    if (e.key === 'Tab') { el.btnAboutClose.focus(); e.preventDefault(); }
+    return;
+  }
   if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
   if (e.key >= '1' && e.key <= '9') {
     const i = +e.key - 1;

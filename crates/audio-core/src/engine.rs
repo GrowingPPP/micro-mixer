@@ -141,7 +141,7 @@ pub struct EngineStats {
     pub limiter_gain_db100: AtomicU32,
     /// **送往虚拟麦克风的最终电平**（峰值 / RMS，dB×100 + 偏移）
     ///
-    /// 这是产品里最重要的一个指标：它直接回答"队友能不能听到我"。
+    /// 这是产品里最重要的一个指标：它直接回答"对方能不能听到我"。
     /// 语音软件的降噪会吃掉太弱的信号，所以必须让用户看得见。
     pub out_peak_db100: AtomicU32,
     pub out_rms_db100: AtomicU32,

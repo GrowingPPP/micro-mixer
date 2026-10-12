@@ -24,6 +24,58 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+REPO_ROOT="$(cd ../.. && pwd)"
+# shellcheck source=../../tools/app-product-name.sh
+. "$REPO_ROOT/tools/app-product-name.sh"
+APP_NAME=$(app_product_name "$REPO_ROOT/apps/mixer-gui/tauri.conf.json")
+APP="$REPO_ROOT/target/release/bundle/macos/${APP_NAME}.app"
+VERSION=$(node -p 'require("./tauri.conf.json").version')
+DMG_DIR="$REPO_ROOT/target/release/bundle/dmg"
+DMG="$DMG_DIR/${APP_NAME}_${VERSION}.dmg"
+
+print_first_open_note() {
+cat <<NOTE
+首次打开请这样做
+=================
+
+这个 App 没有经过 Apple 公证（公证需要付费的开发者账号），
+所以**直接双击会被系统拦住**，提示"无法验证开发者"。
+
+正确做法：
+  1. 把「${APP_NAME}」拖进旁边的 Applications 文件夹
+  2. 打开「应用程序」，**按住 Control 键点它 → 选「打开」**
+  3. 弹窗里再点一次「打开」
+做完这一次，以后就能正常双击启动了（系统会记住）。
+
+
+还有一件事：这个 App 需要系统里有一个「虚拟声卡」
+================================================
+
+语音、会议、直播或游戏应用从「麦克风」读声音。虚拟声卡扮演的就是那个麦克风 ——
+本程序把人声与音频混合后写进去，对方应用从它读出来。
+
+macOS 系统自带的没有，所以要装一个。**推荐 BlackHole（免费、开源）**：
+
+    brew install --cask blackhole-2ch
+
+没装 Homebrew 的话，去 https://existential.audio/blackhole/ 下载安装包。
+装完**重启一次**。
+
+App 启动后会自己检测：没装的话界面上会直接给出安装命令，点一下就能复制。
+NOTE
+}
+
+# 用于脚本回归及查看产物位置，不构建、不签名、不触碰音频设备。
+if [ "${1:-}" = "--print-artifact-paths" ]; then
+  printf '%s\n' "$APP" "$DMG"
+  exit 0
+fi
+
+if [ "${1:-}" = "--print-first-open-note" ]; then
+  print_first_open_note
+  exit 0
+fi
+
 # 脚本环境里可能没有 cargo（终端才会 source ~/.cargo/env）
 if ! command -v cargo >/dev/null 2>&1; then
   # shellcheck disable=SC1091
@@ -35,7 +87,7 @@ echo "── 1/4 打包 ──"
 # 显式只要 .app —— DMG 由本脚本在**重新签名之后**自己打（见文件末尾）
 ../../node_modules/.bin/tauri build --bundles app "$@"
 
-APP="../../target/release/bundle/macos/音效板.app"
+[ -d "$APP" ] || { echo "没找到 App 产物：$APP"; exit 1; }
 
 # ── 把许可证放进 .app ──
 #
@@ -43,7 +95,6 @@ APP="../../target/release/bundle/macos/音效板.app"
 #    而 TCC 权限绑定签名 —— 结果是装上去麦克风录到全零，且不报错。
 #
 # 放 Contents/Resources/ 是 macOS 的惯例（许可证要随二进制一起分发）。
-REPO_ROOT="$(cd ../.. && pwd)"
 mkdir -p "$APP/Contents/Resources"
 cp "$REPO_ROOT/LICENSE" "$APP/Contents/Resources/LICENSE"
 cp "$REPO_ROOT/THIRD-PARTY-NOTICES.md" "$APP/Contents/Resources/THIRD-PARTY-NOTICES.md"
@@ -118,8 +169,7 @@ echo
 echo "── 4/4 打 DMG ──"
 
 VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Contents/Info.plist" 2>/dev/null || echo "0.0.0")
-DMG_DIR="$(cd ../.. && pwd)/target/release/bundle/dmg"
-DMG="$DMG_DIR/音效板_${VERSION}.dmg"
+DMG="$DMG_DIR/${APP_NAME}_${VERSION}.dmg"
 mkdir -p "$DMG_DIR"
 
 STAGE=$(mktemp -d)
@@ -131,38 +181,10 @@ cp "$REPO_ROOT/LICENSE" "$STAGE/LICENSE"
 cp "$REPO_ROOT/THIRD-PARTY-NOTICES.md" "$STAGE/第三方依赖声明.md"
 
 # 没公证的 App 直接双击会被 Gatekeeper 拦，用户不知道怎么办 —— 写在盘里
-cat > "$STAGE/首次打开请看这里.txt" <<'NOTE'
-首次打开请这样做
-=================
-
-这个 App 没有经过 Apple 公证（公证需要付费的开发者账号），
-所以**直接双击会被系统拦住**，提示"无法验证开发者"。
-
-正确做法：
-  1. 把「音效板」拖进旁边的 Applications 文件夹
-  2. 打开「应用程序」，**按住 Control 键点它 → 选「打开」**
-  3. 弹窗里再点一次「打开」
-做完这一次，以后就能正常双击启动了（系统会记住）。
-
-
-还有一件事：这个 App 需要系统里有一个「虚拟声卡」
-================================================
-
-游戏和语音软件只能从「麦克风」读声音。虚拟声卡扮演的就是那个麦克风 ——
-我们把音效写进去，游戏从它读出来。
-
-macOS 系统自带的没有，所以要装一个。**推荐 BlackHole（免费、开源）**：
-
-    brew install --cask blackhole-2ch
-
-没装 Homebrew 的话，去 https://existential.audio/blackhole/ 下载安装包。
-装完**重启一次**。
-
-App 启动后会自己检测：没装的话界面上会直接给出安装命令，点一下就能复制。
-NOTE
+print_first_open_note > "$STAGE/首次打开请看这里.txt"
 
 rm -f "$DMG"
-hdiutil create -quiet -volname "音效板 $VERSION" \
+hdiutil create -quiet -volname "${APP_NAME} $VERSION" \
   -srcfolder "$STAGE" -ov -format UDZO "$DMG" \
   || { echo "  ❌ 生成 DMG 失败"; rm -rf "$STAGE"; exit 1; }
 echo "  已生成: $(basename "$DMG")（$(du -h "$DMG" | cut -f1)）"
@@ -173,7 +195,7 @@ echo "  已生成: $(basename "$DMG")（$(du -h "$DMG" | cut -f1)）"
 echo
 echo "── 验证 DMG ──"
 # ⚠️ 别去解析 `hdiutil attach` 的输出 —— 加了 -quiet 它**什么都不打印**，
-#    而卷名里带空格（"音效板 0.1.0"）又会让按字段切分变得很脆。
+#    而卷名里带空格（产品名称 + 版本）又会让按字段切分变得很脆。
 #    直接指定挂载点，稳。
 MP=$(mktemp -d)
 if ! hdiutil attach -quiet -nobrowse -readonly -mountpoint "$MP" "$DMG"; then
@@ -181,8 +203,9 @@ if ! hdiutil attach -quiet -nobrowse -readonly -mountpoint "$MP" "$DMG"; then
 fi
 
 DMG_OK=1
-[ -d "$MP/音效板.app" ] && echo "  ✅ 里面有 App" || { echo "  ❌ 没有 App"; DMG_OK=0; }
-[ -f "$MP/音效板.app/Contents/Resources/LICENSE" ] \
+DMG_APP="$MP/${APP_NAME}.app"
+[ -d "$DMG_APP" ] && echo "  ✅ 里面有 App" || { echo "  ❌ 没有 App"; DMG_OK=0; }
+[ -f "$DMG_APP/Contents/Resources/LICENSE" ] \
   && echo "  ✅ App 包内含 LICENSE" \
   || { echo "  ❌ App 包里没有 LICENSE"; DMG_OK=0; }
 [ -L "$MP/Applications" ] && echo "  ✅ 有 Applications 快捷方式（可拖拽安装）" || { echo "  ⚠ 缺 Applications 快捷方式"; DMG_OK=0; }
@@ -191,18 +214,18 @@ DMG_OK=1
 [ -f "$MP/第三方依赖声明.md" ] && echo "  ✅ 有第三方依赖声明" || { echo "  ❌ 缺第三方依赖声明"; DMG_OK=0; }
 
 # **最关键的一条**：dmg 里的 App 签名必须仍然有效（TCC 权限绑定签名）
-if codesign -v "$MP/音效板.app" 2>/dev/null; then
+if codesign -v "$DMG_APP" 2>/dev/null; then
   echo "  ✅ DMG 里的 App 签名有效"
 else
   echo "  ❌ DMG 里的 App 签名无效 —— 装上去拿不到麦克风权限"; DMG_OK=0
 fi
-if codesign -d --entitlements - "$MP/音效板.app" 2>/dev/null | grep -q "audio-input"; then
+if codesign -d --entitlements - "$DMG_APP" 2>/dev/null | grep -q "audio-input"; then
   echo "  ✅ DMG 里的 App 带 audio-input entitlement"
 else
   echo "  ❌ DMG 里的 App 缺 audio-input entitlement"; DMG_OK=0
 fi
 if /usr/libexec/PlistBuddy -c "Print :NSMicrophoneUsageDescription" \
-     "$MP/音效板.app/Contents/Info.plist" >/dev/null 2>&1; then
+     "$DMG_APP/Contents/Info.plist" >/dev/null 2>&1; then
   echo "  ✅ DMG 里的 Info.plist 用途说明齐全"
 else
   echo "  ❌ DMG 里的 Info.plist 缺用途说明"; DMG_OK=0
@@ -221,5 +244,5 @@ else
 fi
 echo
 echo "产物:"
-echo "  App: $(cd ../.. && pwd)/target/release/bundle/macos/音效板.app"
+echo "  App: $APP"
 echo "  DMG: $DMG   ← 把这个发给别人"

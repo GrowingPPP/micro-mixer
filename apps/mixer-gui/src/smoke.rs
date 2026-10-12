@@ -229,7 +229,7 @@ pub fn run(dir: PathBuf) -> Result<()> {
     //
     // 这是用户实打实会踩的坑：他大多数时候不用音效，而游戏的麦克风一直指着虚拟声卡。
     // 如果「停止」把转发也断了，虚拟声卡里就是一片死寂（实测精确为 0），
-    // **队友会突然听不到他说话**。
+    // **对方会突然听不到他说话**。
     {
         let before = host.status();
         if !before.running || !before.passthrough {
@@ -245,7 +245,7 @@ pub fn run(dir: PathBuf) -> Result<()> {
             bail!("停止后 running 应为 false");
         }
         if !mid.passthrough {
-            bail!("❌ 停止把麦克风转发也断了 —— 队友会突然听不到用户说话");
+            bail!("❌ 停止把麦克风转发也断了 —— 对方会突然听不到用户说话");
         }
         println!("✅ 待机              停止后 running=false 但 passthrough=true（麦克风仍在转发）");
 
@@ -263,7 +263,7 @@ pub fn run(dir: PathBuf) -> Result<()> {
         if rel.passthrough {
             bail!("release 之后不应再转发");
         }
-        println!("✅ 彻底释放          passthrough=false（此后再停就必须把游戏麦克风改回去）");
+        println!("✅ 彻底释放          passthrough=false（此后必须把目标应用的麦克风改回去）");
 
         // 收尾：重新启动，好让后面的检查（stop_all / 遥控 / 试听）有引擎可用
         host.start(cfg, None).context("重新启动失败")?;
@@ -317,7 +317,7 @@ pub fn run(dir: PathBuf) -> Result<()> {
     // 10. 试听（走系统默认输出，**不经过虚拟麦克风** —— 这就是它存在的意义）
     host.preview(files[0].clone(), -20.0)
         .context("preview 失败")?;
-    println!("✅ preview          试听已启动（走默认输出，队友听不到）");
+    println!("✅ preview          试听已启动（走默认输出，对方听不到）");
     std::thread::sleep(Duration::from_millis(700));
     host.stop_preview();
     std::thread::sleep(Duration::from_millis(150));

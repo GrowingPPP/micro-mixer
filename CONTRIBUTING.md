@@ -132,7 +132,7 @@ Windows 交叉类型检查通过应记录为编译验证；Windows 的设备、W
 ### panic 策略（改之前先读完这段）
 
 release 用的是 `panic = "unwind"` 而**不是** `abort` —— 因为菜单栏常驻程序
-最怕"悄无声息地死掉"：用户正在游戏里，队友突然听不到他，屏幕上却毫无提示。
+最怕"悄无声息地死掉"：用户正在游戏里，对方突然听不到他，屏幕上却毫无提示。
 
 但 unwind 有个**硬前提**：
 
@@ -146,7 +146,7 @@ release 用的是 `panic = "unwind"` 而**不是** `abort` —— 因为菜单�
 
 | 层 | 在哪 | 作用 |
 |---|---|---|
-| panic hook | `apps/mixer-gui/src/host.rs` | 落盘 `~/Library/Logs/音效板/panic.log` + 上报界面（打包后没有控制台） |
+| panic hook | `apps/mixer-gui/src/host.rs` | 落盘 `~/Library/Logs/麦克风混音助手/panic.log` + 上报界面（打包后没有控制台） |
 | 音频看门狗 | `apps/mixer-gui/src/main.rs` | `rendered_frames` 3 秒不涨，或回调 panic 过 → 自动重启音频 |
 | 自测钩子 | `MIXER_PANIC_AFTER=<秒>` | **真的诱发一次 panic** 来验证上面这套还有效 |
 
@@ -195,7 +195,7 @@ Windows 另执行 `build-app-windows.ps1 -TestSmokeHarness`，验证受控 WAV�
 
 ```bash
 # 无窗口冒烟：跑通界面调用的全部命令 + 异常路径（33 项）
-target/release/bundle/macos/音效板.app/Contents/MacOS/mixer-gui --smoke --dir ~/Sounds
+target/release/bundle/macos/麦克风混音助手.app/Contents/MacOS/mixer-gui --smoke --dir ~/Sounds
 
 # 端到端自检：真的送测试音进虚拟声卡、再从环回录回来核对
 ./target/release/mixer selftest

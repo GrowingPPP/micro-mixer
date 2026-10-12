@@ -1,4 +1,4 @@
-//! 音效板 GUI —— Tauri 外壳。
+//! 麦克风混音助手 GUI —— Tauri 外壳。
 //!
 //! 前端是**纯静态 HTML/JS**（不引入打包器），通过 `withGlobalTauri` 暴露的
 //! `window.__TAURI__.core.invoke` 调用下面的命令。
@@ -138,10 +138,10 @@ async fn start(app: tauri::AppHandle, cfg: StartConfig, operation: Option<u64>) 
     .map_err(err)?
 }
 
-/// 停止音效 —— **但继续转发麦克风**（队友照常听得到你说话）。
+/// 停止音效 —— **但继续转发麦克风**（对方照常听得到你说话）。
 ///
 /// 语义是「关掉音效」而不是「把我变成哑巴」：游戏的麦克风一直指着虚拟声卡，
-/// 一旦连转发也断了，虚拟声卡里就是一片死寂，队友会突然听不到你。
+/// 一旦连转发也断了，虚拟声卡里就是一片死寂，对方会突然听不到你。
 #[tauri::command]
 async fn stop(app: tauri::AppHandle, operation: Option<u64>) -> Res<bool> {
     let ticket = operation.unwrap_or_else(|| app.state::<AudioHost>().reserve_audio_request());
@@ -156,7 +156,7 @@ async fn stop(app: tauri::AppHandle, operation: Option<u64>) -> Res<bool> {
 
 /// 彻底释放音频设备（换设备、退出时用）。
 ///
-/// ⚠️ 释放后虚拟声卡里就没人写了 —— 游戏的麦克风如果还指着它，队友会听不到你。
+/// ⚠️ 释放后虚拟声卡里就没人写了 —— 游戏的麦克风如果还指着它，对方会听不到你。
 #[tauri::command]
 async fn release(app: tauri::AppHandle, operation: Option<u64>) -> Res<bool> {
     let ticket = operation.unwrap_or_else(|| app.state::<AudioHost>().reserve_audio_request());
@@ -171,7 +171,7 @@ async fn release(app: tauri::AppHandle, operation: Option<u64>) -> Res<bool> {
 
 /// 一键切回真实麦克风。
 ///
-/// **为什么需要**：游戏的麦克风一旦指向虚拟声卡，"队友能不能听到你"就完全由本程序决定了。
+/// **为什么需要**：游戏的麦克风一旦指向虚拟声卡，"对方能不能听到你"就完全由本程序决定了。
 /// 用户不想用了（或要退出）时，如果只关掉本程序，游戏那边读到的是**一片死寂** ——
 /// 而这个设置藏在游戏里，很多人根本不知道要去改。
 ///
@@ -195,8 +195,8 @@ fn revert_mic_inner(app: &tauri::AppHandle) -> Res<serde_json::Value> {
             "device": device,
             "current": current,
             // 系统默认改了还不够 —— 显式指定了麦克风的游戏要用户自己改
-            "note": "系统默认麦克风已切回。如果游戏/语音软件里是手动指定的麦克风，\
-                     还需要进去把它也改回真实麦克风，否则队友仍然听不到你。",
+            "note": "系统默认麦克风已切回。如果语音、会议、直播或游戏应用里是手动指定的麦克风，\
+                     还需要进去把它也改回真实麦克风，否则对方仍然听不到你。",
         }))
     }
     // Windows 上没有这个功能，**不是遗漏，是设计如此**：
@@ -212,7 +212,7 @@ fn revert_mic_inner(app: &tauri::AppHandle) -> Res<serde_json::Value> {
     {
         let _ = host;
         Err("Windows 上不需要这个：本程序不会改动系统默认设备，\
-             游戏里的麦克风是你自己选的。想让游戏自动用它，\
+             目标应用里的麦克风是你自己选的。想让应用自动用它，\
              去 设置 → 系统 → 声音 → 更多声音设置 → 录制，把你的设备设为默认通信设备。"
             .into())
     }
@@ -288,6 +288,15 @@ fn js_error(msg: String, stack: String) {
     }
 }
 
+/// 产品名称与版本来自打包配置，供两端共用的关于窗口展示。
+#[tauri::command]
+fn app_info(app: tauri::AppHandle) -> serde_json::Value {
+    serde_json::json!({
+        "name": app.config().product_name.as_deref().unwrap_or("麦克风混音助手"),
+        "version": app.package_info().version.to_string(),
+    })
+}
+
 /// 当前平台，以及推荐的虚拟声卡方案。
 ///
 /// 前端是**两端共用**的，但"怎么装虚拟声卡"这件事在两个平台完全不一样 ——
@@ -316,14 +325,14 @@ fn platform_info_for(p: app_config::Platform) -> serde_json::Value {
             "cmd": null,
             // Windows 上 VB-CABLE 的命名是**反的**，这是最容易卡住人的地方
             "naming": "⚠️ 注意 VB-CABLE 的命名是反的：本程序要输出到 **CABLE Input**，\
-                       而游戏里选麦克风要选 **CABLE Output**。名字看着别扭，但就是这样。",
+                       而目标应用里选麦克风要选 **CABLE Output**。名字看着别扭，但就是这样。",
             "alts": "其他选择：VoiceMeeter（免费，功能更多但更复杂）、Virtual Audio Cable（付费）。",
             "mic_privacy": {
                 "title": "麦克风收不到声音？",
                 "steps": [
                     "打开 设置 → 隐私和安全性 → 麦克风，确认「麦克风访问」是**开**的",
                     "往下拉到「允许桌面应用访问你的麦克风」—— **这一条最容易漏**。\
-                     音效板属于桌面应用，这个开关和上面那个是分开的，上面开了下面没开照样没声音。",
+                     麦克风混音助手属于桌面应用，这个开关和上面那个是分开的，上面开了下面没开照样没声音。",
                     "如果游戏或语音软件里听不到：Windows 有**两套**默认设备 —— \
                      「默认设备」和「默认通信设备」。很多游戏读的是后者。\
                      去 设置 → 系统 → 声音 → 更多声音设置 → 录制，\
@@ -351,7 +360,7 @@ fn platform_info_for(p: app_config::Platform) -> serde_json::Value {
                 "title": "麦克风收不到声音？",
                 "steps": [
                     "打开 系统设置 → 隐私与安全性 → 麦克风",
-                    "确认「音效板」在列表里并且是**勾上**的",
+                    "确认「麦克风混音助手」在列表里并且是**勾上**的",
                     "如果列表里没有它：把 App 删掉重新拖进去一次（签名变了系统会当成新 App）",
                 ],
                 "settings_page": "microphone",
@@ -735,7 +744,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let revert = MenuItem::with_id(
         app,
         "revert",
-        "切回真实麦克风（用完不用进游戏改设置）",
+        "切回真实麦克风（系统默认输入）",
         true,
         None::<&str>,
     )?;
@@ -750,7 +759,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     TrayIconBuilder::with_id("main-tray")
         .icon(icon)
         .icon_as_template(true) // macOS：按菜单栏明暗自动着色
-        .tooltip("音效板")
+        .tooltip("麦克风混音助手")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, ev| match ev.id.as_ref() {
@@ -853,7 +862,7 @@ fn main() {
             Some(l) => Some(l),
             None => {
                 eprintln!(
-                    "音效板已经在运行了。\n\
+                    "麦克风混音助手已经在运行了。\n\
                      如果找不到窗口，点菜单栏那个均衡器图标把它调出来。\n\
                      （同时开两个实例会导致声音叠加、热键失效）"
                 );
@@ -897,7 +906,7 @@ fn main() {
             // ── 热插拔看门狗 ──────────────────────────────────────────
             //
             // 耳机拔了、虚拟声卡驱动被卸载/重启 —— 这些都会让音频链路**悄悄断掉**，
-            // 而用户正在游戏里，根本发现不了（他只会觉得"队友怎么不理我"）。
+            // 而用户正在游戏里，根本发现不了（他只会觉得"对方怎么不理我"）。
             // 每 2 秒检查一次，出事立刻报警。
             {
                 let h = app.handle().clone();
@@ -924,7 +933,7 @@ fn main() {
 
                             if out_lost {
                                 let msg = format!(
-                                    "虚拟声卡「{name}」不见了 —— 队友现在听不到你。\
+                                    "虚拟声卡「{name}」不见了 —— 对方现在听不到你。\
                                      请重新选一个输出设备，再点「启动」。"
                                 );
                                 if host.set_device_lost_for(generation, Some(msg.clone())) {
@@ -964,7 +973,7 @@ fn main() {
             // ── 音频看门狗 ──────────────────────────────────────────
             //
             // 为什么需要：这个程序大部分时间在后台跑，而**"没声音"是它最糟的失败模式** ——
-            // 用户正在游戏里，队友突然听不到他，屏幕上却什么提示都没有。
+            // 用户正在游戏里，对方突然听不到他，屏幕上却什么提示都没有。
             //
             // 检测两件事：
             //   ① 渲染回调不再被推进（流死了）—— 用 rendered_frames 是否还在涨判断
@@ -993,7 +1002,7 @@ fn main() {
                                 match host.restart_audio(generation, Some(&h)) {
                                     Ok(Some(new_generation)) => {
                                         if host.set_audio_stalled_for(new_generation, Some(format!(
-                                            "{why} —— 已自动恢复，如果队友那边断过，让他们重新连一下"
+                                            "{why} —— 已自动恢复；若通话曾中断，请重新连接"
                                         ))) {
                                             println!("[看门狗] ✅ 音频已自动恢复");
                                         }
@@ -1074,7 +1083,7 @@ fn main() {
             Ok(())
         })
         // 关闭窗口**不退出**：隐藏即可。
-        // 游戏时窗口会挡视线，但引擎必须继续跑 —— 一旦退出，队友就听不到你了。
+        // 游戏时窗口会挡视线，但引擎必须继续跑 —— 一旦退出，对方就听不到你了。
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
@@ -1105,6 +1114,7 @@ fn main() {
             autostart,
             self_test,
             remote_qr,
+            app_info,
             platform_info,
             open_system_settings,
             js_error,

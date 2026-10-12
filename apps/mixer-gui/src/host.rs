@@ -74,7 +74,7 @@ pub struct StartConfig {
     pub sfx_gain_db: f32,
     pub looping: bool,
     /// 监听：触发的音效**同时放给自己听**（走系统默认输出）。
-    /// 没有它，用户在游戏里按键后什么都听不到，只能盲猜队友有没有听到。
+    /// 没有它，用户在游戏里按键后什么都听不到，只能盲猜对方有没有听到。
     #[serde(default)]
     pub monitor: bool,
     /// 监听输出设备；None = 系统默认输出
@@ -125,7 +125,7 @@ pub struct StatusDto {
     pub audio_stalled: Option<String>,
     /// 引擎是否还活着（麦克风是否正在被转发）。
     ///
-    /// `running=false, passthrough=true` = **待机**：队友仍听得到你说话，但音效不响应。
+    /// `running=false, passthrough=true` = **待机**：对方仍听得到你说话，但音效不响应。
     pub passthrough: bool,
 }
 
@@ -280,8 +280,8 @@ pub fn probe_sound_file_access(paths: &[PathBuf]) {
 
 /// panic 日志文件路径。
 ///
-/// - **Windows**：`%LOCALAPPDATA%\音效板\logs\panic.log`（Windows 惯例）
-/// - **macOS / Linux**：`~/Library/Logs/音效板/panic.log`（macOS 惯例）
+/// - **Windows**：`%LOCALAPPDATA%\麦克风混音助手\logs\panic.log`（Windows 惯例）
+/// - **macOS / Linux**：`~/Library/Logs/麦克风混音助手/panic.log`（macOS 惯例）
 ///
 /// 拆成"平台 + 环境变量注入"的纯函数，是为了**让 Windows 分支能在 macOS 上被测到** ——
 /// 交叉编译只证明能编译，证不了算得对。
@@ -300,13 +300,15 @@ fn panic_log_path_on(
     match p {
         app_config::Platform::Windows => Some(
             get("LOCALAPPDATA")?
-                .join("音效板")
+                .join("麦克风混音助手")
                 .join("logs")
                 .join("panic.log"),
         ),
-        app_config::Platform::Unix => {
-            Some(get("HOME")?.join("Library/Logs/音效板").join("panic.log"))
-        }
+        app_config::Platform::Unix => Some(
+            get("HOME")?
+                .join("Library/Logs/麦克风混音助手")
+                .join("panic.log"),
+        ),
     }
 }
 
@@ -1014,7 +1016,7 @@ impl AudioHost {
     /// 停止音效 —— **但继续转发麦克风**。
     ///
     /// 为什么不整个停掉：用户大多数时候不用音效，而游戏的麦克风**一直**指着虚拟声卡。
-    /// 一旦连转发也断了，虚拟声卡里就是一片死寂（实测精确为 0），**队友会突然听不到他说话**。
+    /// 一旦连转发也断了，虚拟声卡里就是一片死寂（实测精确为 0），**对方会突然听不到他说话**。
     /// 所以「停止」的语义是「关掉音效」，不是「把我变成哑巴」。
     ///
     /// 进入待机时会**注销热键** —— 否则 F1/F2 仍被我们截走，游戏里按这两个键毫无反应。
@@ -2182,7 +2184,7 @@ mod panic_path_tests {
         let p = panic_log_path_on(app_config::Platform::Windows, &env).unwrap();
         assert_eq!(
             p,
-            std::path::PathBuf::from("/LOCALAPPDATA/音效板/logs/panic.log")
+            std::path::PathBuf::from("/LOCALAPPDATA/麦克风混音助手/logs/panic.log")
         );
     }
 
@@ -2201,7 +2203,7 @@ mod panic_path_tests {
         let p = panic_log_path_on(app_config::Platform::Unix, &env).unwrap();
         assert_eq!(
             p,
-            std::path::PathBuf::from("/HOME/Library/Logs/音效板/panic.log")
+            std::path::PathBuf::from("/HOME/Library/Logs/麦克风混音助手/panic.log")
         );
     }
 

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>音效板</title>
+<title>麦克风混音助手</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -12,13 +12,14 @@
   <div class="brand">
     <span id="dot" class="dot off"></span>
     <div>
-      <h1>音效板</h1>
+      <h1>麦克风混音助手</h1>
       <p id="headline">未启动</p>
     </div>
   </div>
   <div class="actions">
+    <button id="btnAbout" class="ghost" aria-haspopup="dialog">关于</button>
     <button id="btnSelfTest" class="ghost" title="把测试音送进虚拟设备再从环回录回来，验证整条链路">自检</button>
-    <button id="btnMicHelp" class="ghost" title="队友听不到你？按平台给出排查步骤（权限、默认通信设备等）">麦克风没声音？</button>
+    <button id="btnMicHelp" class="ghost" title="对方听不到你？按平台给出排查步骤（权限、默认通信设备等）">麦克风没声音？</button>
     <button id="btnSetup" class="ghost" title="展开/收起设置">设置</button>
     <button id="btnToggle" class="primary">启动</button>
   </div>
@@ -36,7 +37,6 @@
       <span class="withunit"><input id="inBuf" type="number" value="20" min="5" max="200"><i>ms</i></span>
     </label>
   </div>
-
   <div class="row">
     <label class="grow">音效<span id="count" class="count"></span>
       <span class="withbtn">
@@ -48,6 +48,7 @@
       </span>
     </label>
   </div>
+  <p id="folderHelp" class="hint">支持任意有读取权限的文件夹（只扫描当前层）。载入文件夹会替换列表；“添加文件…”可从不同目录追加音频。</p>
 
   <div class="row">
     <label class="grow">热键（逗号分隔，与音效顺序对应）
@@ -62,10 +63,10 @@
     <label class="check" title="循环播放正式音效与监听；取消后当前一遍结束即停止。试听始终只播放一次。">
       <input id="inLoop" type="checkbox" aria-label="循环播放" aria-describedby="loopHelp"> 循环播放
     </label>
-    <label class="check" title="触发的音效同时放给你自己听 —— 游戏里唯一能确认「按下去了」的反馈">
+    <label class="check" title="触发的音效同时放给你自己听 —— 用于确认音效已触发">
       <input id="inMonitor" type="checkbox" checked> 监听
     </label>
-    <label class="check" title="热键被全屏游戏吞掉时的兜底：手机浏览器打开这个地址就能触发音效">
+    <label class="check" title="手机浏览器打开遥控地址即可触发音效，也适合全屏操作时使用">
       <input id="inRemote" type="checkbox" checked> 手机遥控
     </label>
   </div>
@@ -83,7 +84,7 @@
     <span id="btnRevertMic" class="linky">切回真实麦克风</span>
     ·
     <span id="btnRelease" class="linky">彻底释放音频设备</span>
-    —— 只有你要退出、或把游戏麦克风改回真实麦克风时才需要。
+    —— 只有你要退出、或把目标应用的麦克风改回真实麦克风时才需要。
     平常「停止」不会断掉麦克风转发。
   </p>
   <p id="setupHint" class="hint">选好设备与音效文件夹，然后点右上角「启动」。运行中调整增益会立即生效。</p>
@@ -113,6 +114,26 @@
   <span id="toast" class="toast"></span>
   <button id="btnStopAll" class="ghost" title="立即停止音效播放和本机试听（长音效不用等它放完）。不影响麦克风转发，也不影响热键。">停止播放 / 试听 <kbd>空格</kbd></button>
 </footer>
+
+<div id="aboutOverlay" class="about-overlay hidden">
+  <section class="about-dialog" role="dialog" aria-modal="true" aria-labelledby="aboutTitle" aria-describedby="aboutSummary">
+    <div class="about-heading">
+      <div>
+        <p class="about-eyebrow">关于软件</p>
+        <h2 id="aboutTitle">麦克风混音助手</h2>
+      </div>
+      <button id="btnAboutClose" class="ghost" aria-label="关闭关于窗口">关闭</button>
+    </div>
+    <p id="aboutSummary" class="about-summary">将本地音频与麦克风人声混合，通过虚拟音频设备传给语音、会议、直播或游戏中的对方。</p>
+    <dl class="about-usage">
+      <div><dt>播放</dt><dd>点击音频卡片或按热键，向对方播放音频。每次只播放一个音频。</dd></div>
+      <div><dt>试听</dt><dd>仅自己可听，用于确认内容和音量。</dd></div>
+      <div><dt>连接</dt><dd>在目标应用中选择对应的虚拟麦克风。VB-CABLE：本软件输出选 CABLE Input，目标应用麦克风选 CABLE Output；macOS 两边选择同一虚拟设备。</dd></div>
+      <div><dt>音频来源</dt><dd>支持任意有读取权限的文件夹，也可从不同目录添加文件。macOS 首次访问下载、桌面或文稿时，请允许读取。</dd></div>
+    </dl>
+    <p id="aboutVersion" class="about-version hidden"></p>
+  </section>
+</div>
 
 <script src="library-model.js"></script>
 <script src="main.js"></script>

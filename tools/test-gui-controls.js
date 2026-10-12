@@ -193,6 +193,91 @@ async function boot({ running = false, initialLoop, onInvoke } = {}) {
   };
 }
 
+test('About explains playback, preview and arbitrary audio folders with the packaged name and version', async () => {
+  const app = await boot({ onInvoke(command) {
+    if (command === 'app_info') return { name: '麦克风混音助手', version: '0.1.0' };
+  } });
+  const button = app.document.getElementById('btnAbout');
+  const overlay = app.document.getElementById('aboutOverlay');
+  button.focus();
+  await button.emit('click');
+  assert.equal(overlay.classList.contains('hidden'), false);
+  assert.equal(app.document.activeElement, app.document.getElementById('btnAboutClose'));
+  assert.equal(app.document.getElementById('aboutTitle').textContent, '麦克风混音助手');
+  assert.equal(app.document.getElementById('aboutVersion').textContent, '版本 0.1.0 · 支持 macOS 和 Windows');
+  assert.match(overlay.textContent, /将本地音频与麦克风人声混合/);
+  assert.match(overlay.textContent, /试听.*仅自己可听/s);
+  assert.match(overlay.textContent, /任意有读取权限的文件夹/);
+  assert.match(overlay.textContent, /本软件输出选 CABLE Input，目标应用麦克风选 CABLE Output/,
+    'Windows must choose the capture endpoint, whose name differs from the output endpoint');
+  assert.doesNotMatch(overlay.textContent, /队友/);
+  await overlay.emit('click', { target: app.document.getElementById('aboutSummary') });
+  assert.equal(overlay.classList.contains('hidden'), false, 'selecting the description must not dismiss About');
+  await app.document.getElementById('btnAboutClose').emit('click');
+  assert.equal(overlay.classList.contains('hidden'), true);
+  assert.equal(app.document.activeElement, button, 'closing must restore the keyboard focus');
+});
+
+for (const running of [false, true]) {
+  test(`About keyboard navigation cannot play or stop audio with running=${running}`, async () => {
+    const app = await boot({ running });
+    const button = app.document.getElementById('btnAbout');
+    const close = app.document.getElementById('btnAboutClose');
+    const overlay = app.document.getElementById('aboutOverlay');
+    const controls = () => app.calls.filter(call =>
+      ['begin_playback_operation', 'activate', 'play', 'preview', 'stop_all', 'stop_preview', 'stop'].includes(call.command));
+    button.focus();
+    await button.emit('click');
+    for (const key of ['1', '2', ' ', 'Tab']) await app.document.emit('keydown', { key, target: close });
+    await app.document.emit('keydown', { key: 'Tab', shiftKey: true, target: close });
+    assert.equal(app.document.activeElement, close, 'Tab and Shift+Tab remain in the modal');
+    assert.deepEqual(controls(), [], 'reading About must preserve the playing or idle session');
+    const qrPanel = app.document.getElementById('qrPanel');
+    qrPanel.classList.remove('hidden');
+    await app.document.emit('keydown', { key: 'Escape', target: close });
+    assert.equal(overlay.classList.contains('hidden'), true);
+    assert.equal(qrPanel.classList.contains('hidden'), false, 'Escape closes only the active modal');
+    assert.equal(app.document.activeElement, button);
+    assert.deepEqual(controls(), []);
+    await app.document.emit('keydown', { key: ' ', target: app.document });
+    await flush();
+    assert.equal(controls().some(call => call.command === 'stop_all'), true, 'normal shortcuts resume after closing About');
+  });
+}
+
+test('panic diagnostics do not direct Windows users to a macOS-only log path', async () => {
+  const app = await boot({ onInvoke(command) {
+    if (command === 'status') return playbackStatus({ last_panic: 'fixture panic' });
+  } });
+  const message = app.document.getElementById('setupHint').textContent;
+  assert.match(message, /fixture panic.*诊断日志/);
+  assert.doesNotMatch(message, /Library\/Logs|~\//);
+});
+
+test('About remains readable and can close when version lookup fails or completes after dismissal', async () => {
+  let resolveInfo;
+  const app = await boot({ onInvoke(command) {
+    if (command === 'app_info') return new Promise(resolve => { resolveInfo = resolve; });
+  } });
+  const opening = app.document.getElementById('btnAbout').emit('click');
+  await flush();
+  const overlay = app.document.getElementById('aboutOverlay');
+  assert.equal(overlay.classList.contains('hidden'), false);
+  await overlay.emit('click');
+  resolveInfo({ name: '麦克风混音助手', version: '0.1.0' });
+  await opening;
+  assert.equal(overlay.classList.contains('hidden'), true, 'late metadata must not reopen the dialog');
+  const failed = await boot({ onInvoke(command) {
+    if (command === 'app_info') return Promise.reject(new Error('unavailable'));
+  } });
+  await failed.document.getElementById('btnAbout').emit('click');
+  assert.match(failed.document.getElementById('aboutSummary').textContent, /虚拟音频设备/);
+  assert.equal(failed.document.getElementById('aboutVersion').classList.contains('hidden'), true);
+  await failed.document.getElementById('btnAboutClose').emit('click');
+  assert.equal(failed.document.getElementById('aboutOverlay').classList.contains('hidden'), true);
+  assert.deepEqual(failed.calls.filter(call => call.command === 'js_error'), []);
+});
+
 test('looping changes while a sound is playing update native audio immediately and save both values', async () => {
   const app = await boot({ onInvoke(command) {
     if (command === 'load_config') return { items, dir: '', hotkeys: ',F2', looping: true };
@@ -944,7 +1029,7 @@ test('main and preview transitions use one highlighted card and preview completi
   assert.equal(app.card(1).classList.contains('playing'), false);
   assert.equal(app.card(1).querySelector('.prev').classList.contains('playing'), false);
   assert.equal(app.card(0).classList.contains('previewing'), false);
-  assert.match(app.card(0).querySelector('.playback-state').textContent, /播放中.*队友/);
+  assert.match(app.card(0).querySelector('.playback-state').textContent, /播放中.*对方/);
   assert.match(app.document.getElementById('toast').textContent, /已切换播放/);
   await app.card(1).querySelector('.prev').emit('click');
   status = playbackStatus();

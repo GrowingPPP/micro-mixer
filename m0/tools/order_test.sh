@@ -112,7 +112,7 @@ run_case () {   # $1=名称  $2=yes/no(录音方是否先启动)
   if [ "$rec_first" != "yes" ]; then
     ffmpeg -hide_banner -loglevel error -f avfoundation -i ":$IN_IDX" \
       -t 13 -ac 2 -ar 48000 -y "$wav" & rec=$!
-    echo "  [0s] 音效板先启动"
+    echo "  [0s] 麦克风混音助手先启动"
   fi
   sleep 3
 

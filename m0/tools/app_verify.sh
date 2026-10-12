@@ -31,7 +31,14 @@ avf_index() {
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 
-APP="$ROOT/target/release/bundle/macos/音效板.app"
+# shellcheck source=../../tools/app-product-name.sh
+. "$ROOT/tools/app-product-name.sh"
+APP_NAME=$(app_product_name "$ROOT/apps/mixer-gui/tauri.conf.json") || exit 1
+APP="$ROOT/target/release/bundle/macos/${APP_NAME}.app"
+if [ "${1:-}" = "--print-app-path" ]; then
+  printf '%s\n' "$APP"
+  exit 0
+fi
 LOG=/tmp/app_verify.log
 READY=/tmp/app_verify_ready.txt
 LANIP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo "")

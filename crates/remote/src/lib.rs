@@ -14,7 +14,7 @@
 //!
 //! ⚠️ **安全提示**：默认监听 `0.0.0.0`（否则手机连不上），
 //! 因此**同一局域网内的任何人都能触发音效**。这是刻意的取舍 ——
-//! 它只在本地网络可达，且最坏后果是"队友听到一声笑声"。
+//! 它只在本地网络可达，且最坏后果是"对方听到一声笑声"。
 //! 需要更严的隔离时用 `--remote-bind 127.0.0.1`。
 
 use std::io::{BufRead, BufReader, Write};
@@ -292,7 +292,7 @@ function pct(db){{return Math.max(0,Math.min(100,(db+60)/60*100));}}setTimeout((
         }
         "/status" => {
             let st = ctl.stats();
-            // 带上电平：手机上也能看到"队友听到的声音有多大"
+            // 带上电平：手机上也能看到"对方听到的声音有多大"
             let body = format!(
                 r#"{{"playing":{},"slot":{},"playhead":{},"underruns":{},"overruns":{},"peak_db":{:.1},"rms_db":{:.1}}}"#,
                 st.playing,
@@ -383,7 +383,7 @@ h1{{font-size:17px;font-weight:600;margin:0 0 4px}}
   </div>
 </div>
 <h1>音效遥控</h1>
-<div id="s">点一下就播给队友听 · 当前 {}/{}</div>
+<div id="s">点一下就播给对方听 · 当前 {}/{}</div>
 <div class="grid">{buttons}</div>
 <button class="stop" onclick="hit('/stop',this)">全部停止</button>
 <div id="m"></div>
