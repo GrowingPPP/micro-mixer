@@ -5,6 +5,9 @@
 
 > 只想用这个软件？看 [README.md](README.md) 就够了。
 
+自动化开发助手先读 [AGENTS.md](AGENTS.md)，当前实现地图与验证流程见 [AI 开发文档索引](docs/ai/README.md)。
+目录级约定只补充所属模块规则，共用规则不在多个工具入口重复维护。
+
 ---
 
 ## 1. 环境
@@ -146,7 +149,7 @@ release 用的是 `panic = "unwind"` 而**不是** `abort` —— 因为菜单�
 
 | 层 | 在哪 | 作用 |
 |---|---|---|
-| panic hook | `apps/mixer-gui/src/host.rs` | 落盘 `~/Library/Logs/麦克风混音助手/panic.log` + 上报界面（打包后没有控制台） |
+| panic hook | `apps/mixer-gui/src/host.rs` | 落盘 + 上报界面：macOS `~/Library/Logs/麦克风混音助手/panic.log`；Windows `%LOCALAPPDATA%\麦克风混音助手\logs\panic.log` |
 | 音频看门狗 | `apps/mixer-gui/src/main.rs` | `rendered_frames` 3 秒不涨，或回调 panic 过 → 自动重启音频 |
 | 自测钩子 | `MIXER_PANIC_AFTER=<秒>` | **真的诱发一次 panic** 来验证上面这套还有效 |
 
@@ -157,24 +160,25 @@ release 用的是 `panic = "unwind"` 而**不是** `abort` —— 因为菜单�
 
 ## 4. 测试
 
-**提交前跑这一条就够了：**
+常规快速巡检不使用真实音频设备：
 
 ```bash
-tools/check-all.sh          # 全部检查
-tools/check-all.sh --fast   # 只跑静态 + 单元测试（约 8 秒，不碰音频设备）
+tools/check-all.sh --fast   # 静态、Rust/JS 回归；HTTP 测试需要 localhost 监听能力
 ```
 
-它会依次跑：格式 → clippy → **打包配置 schema 校验** → 单元测试 →
-打包（签名 + DMG） → 冒烟 → 音频链路自检 → 环境体检 → 双击路径 → Windows 交叉编译。
+此快捷脚本不能代替下面锁定依赖、覆盖全部目标的提交门禁。
+无参数的 `tools/check-all.sh` 还会打包、运行真实音频与双击验证；历史双击工具会关闭正在运行的 App。
+完整模式只用于已准备好设备、独立配置和授权的受控验收环境，具体副作用见 [验证工作流](docs/ai/WORKFLOW.md)。
 
 其中「打包配置 schema 校验」(`tools/check-tauri-config.sh`) 值得单独说：
 Tauri 配置里的错误（键名拼错、枚举值写错）**在 macOS 上完全不会报错** ——
 那些字段只在真正构建对应平台时才被用到。实测踩过一次：往配置里加了个注释字段，
 因为 schema 不允许未知字段，整个配置直接失效。
 
+schema 脚本有跳过和结构自检的降级分支；只有看到「完全符合 Tauri 官方 schema」才记录完整校验通过。
 下面是各层的细节。
 
-### 提交前必须跑
+### 代码提交前必须跑
 
 ```bash
 cargo fmt --all --check
@@ -182,11 +186,13 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
 node --check apps/mixer-gui/dist/main.js
 node --check crates/remote/src/control-page.js
-node --test tools/test-gui-model.js tools/test-gui-controls.js tools/test-remote-controls.js
+node --test tools/test-gui-model.js tools/test-gui-controls.js tools/test-remote-controls.js tools/test-app-packaging.js
 cargo build --locked --release --workspace
 ```
 
-`.github/workflows/quality.yml` 在 macOS / Windows 宿主运行上述回归。
+纯文档变更核对实际实现、相对链接和命令，并执行 `git diff --check`，无需为文档启动音频设备或重新打包。
+
+`.github/workflows/quality.yml` 在 macOS / Windows 宿主运行 Rust/JS 回归及对应平台检查。release 构建和完整 Tauri schema 校验属于本地补充门禁，当前不在该 CI 工作流中执行。
 Windows 另执行 `build-app-windows.ps1 -TestSmokeHarness`，验证受控 WAV、构建参数与失败退出码门禁；
 该检查无需虚拟声卡。`tools/win-cross-check.sh` 在 macOS 检查 Windows 所有目标（包含测试），
 但不链接安装包，不能替代 Windows 上的真实 WASAPI、热键、WebView 与 NSIS 验收。
@@ -194,16 +200,16 @@ Windows 另执行 `build-app-windows.ps1 -TestSmokeHarness`，验证受控 WAV�
 ### 改到音频链路时，还要跑
 
 ```bash
-# 无窗口冒烟：跑通界面调用的全部命令 + 异常路径（33 项）
+# 无窗口冒烟：真实设备及受控素材，检查命令和异常路径
 target/release/bundle/macos/麦克风混音助手.app/Contents/MacOS/mixer-gui --smoke --dir ~/Sounds
 
 # 端到端自检：真的送测试音进虚拟声卡、再从环回录回来核对
 ./target/release/mixer selftest
 
-# 双击启动路径（11 项）—— 见下，这条**不能省**
+# 历史双击启动工具：先核查配置、设备和关闭现有 App 的影响
 ./m0/tools/app_verify.sh
 
-# 设备占用顺序矩阵
+# 历史设备顺序工具：先核查录音索引、素材及设备
 ./m0/tools/order_test.sh
 ```
 
@@ -214,7 +220,9 @@ target/release/bundle/macos/麦克风混音助手.app/Contents/MacOS/mixer-gui -
 而**从终端启动时 TCC 会把权限归因给终端**（终端本来就有权限），
 所以**所有命令行测试都会正常通过，完全掩盖这个 bug**。
 
-> **改打包配置（Info.plist / 签名 / entitlements）之后，必须跑 `app_verify.sh`。**
+> **改权限或打包配置之后，必须安排双击启动路径验收。**
+> `app_verify.sh` 属于依赖特定配置和设备的历史工具，会强制关闭现有 App；
+> 只有前置条件和授权匹配时才直接运行，否则按当前设备准备受控双击验收方案。
 
 ### 两个容易踩的工具链陷阱
 
@@ -314,6 +322,8 @@ MIT / Apache-2.0 / BSD 这类许可证都要求**保留版权声明**，所以�
 README.md          给使用者：怎么用、怎么装、遇到问题怎么办
 CHANGELOG.md       给使用者 + 维护者：改了什么、踩过什么坑
 CONTRIBUTING.md    给开发者：就是这份
+AGENTS.md          给自动化开发助手：仓库规则与模块约定入口
+docs/ai/           当前项目上下文与验证工作流
 docs/              设计与计划，见 docs/README.md
 ```
 

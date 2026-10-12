@@ -2,6 +2,7 @@
 
 **这个目录放「设计、决策、计划」，不放「怎么用」。**
 使用说明看 [README.md](../README.md)，开发约定看 [CONTRIBUTING.md](../CONTRIBUTING.md)。
+自动化开发助手先看 [AGENTS.md](../AGENTS.md) 与 [AI 开发文档索引](ai/README.md)。
 
 ---
 
@@ -23,6 +24,16 @@
 ---
 
 ## 目录结构
+
+### `ai/` — 当前开发上下文
+
+| 文档 | 内容 |
+|---|---|
+| [README.md](ai/README.md) | AI 开发文档与模块约定的阅读入口 |
+| [PROJECT_CONTEXT.md](ai/PROJECT_CONTEXT.md) | 当前实现的模块边界、行为和双端差异 |
+| [WORKFLOW.md](ai/WORKFLOW.md) | 验证选择、实际脚本副作用、提交与报告 |
+
+这些文档描述当前代码。下面的早期规划与阶段状态保留历史语境，不作为当前功能清单或自动任务指令。
 
 ### `engineering/` — 技术
 
@@ -62,6 +73,8 @@
 ---
 
 ## 阶段划分
+
+以下为早期规划快照，当前模块和实现状态请结合代码及 [项目上下文](ai/PROJECT_CONTEXT.md) 核对。
 
 ```
 M0  可行性验证        ✅ 已结项（H1 成立 → GO）
