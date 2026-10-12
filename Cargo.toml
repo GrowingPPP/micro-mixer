@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/audio-core",
+    "crates/audio-session",
     "crates/backend-cpal",
     "crates/hotkeys",
     "crates/app-config",
@@ -14,7 +15,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.88"
 license = "MIT"
 authors = ["zhangguanghui <1003986591@qq.com>"]
 

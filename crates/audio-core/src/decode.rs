@@ -49,6 +49,9 @@ impl DecodedAudio {
 ///
 /// 支持 mp3 / aac(m4a) / flac / ogg-vorbis / wav / alac。
 pub fn decode_file(path: &Path, target_rate: u32) -> Result<DecodedAudio> {
+    if target_rate == 0 {
+        return Err(anyhow!("目标采样率必须大于零"));
+    }
     let file =
         std::fs::File::open(path).with_context(|| format!("打不开文件: {}", path.display()))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -79,6 +82,9 @@ pub fn decode_file(path: &Path, target_rate: u32) -> Result<DecodedAudio> {
         .codec_params
         .sample_rate
         .ok_or_else(|| anyhow!("音轨缺少采样率信息"))?;
+    if src_rate == 0 {
+        return Err(anyhow!("音轨采样率必须大于零"));
+    }
 
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
@@ -125,9 +131,13 @@ pub fn decode_file(path: &Path, target_rate: u32) -> Result<DecodedAudio> {
     let mono = if src_rate != target_rate {
         let ratio = target_rate as f64 / src_rate as f64;
         let mut rs = LinearResampler::new(ratio);
-        let mut out = vec![0f32; (mono.len() as f64 * ratio).ceil() as usize + 16];
-        let n = rs.process(&mono, &mut out);
-        out.truncate(n);
+        let frames = (mono.len() as f64 * ratio).ceil() as usize;
+        // 实时重采样需要等待下一块完成末样本插值；文件已结束，复制末样本补齐时长。
+        let mut padded = mono;
+        padded.push(*padded.last().expect("已检查非空"));
+        let mut out = vec![0f32; frames + ratio.ceil() as usize + 8];
+        let n = rs.process(&padded, &mut out);
+        out.truncate(n.min(frames));
         out
     } else {
         mono
@@ -151,6 +161,57 @@ pub fn decode_file(path: &Path, target_rate: u32) -> Result<DecodedAudio> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 低采样率文件解码应保持一秒时长和音高() {
+        // 独立生成标准 PCM WAV，覆盖文件解码 → 重采样整个实际路径。
+        let mut bytes = Vec::new();
+        let frames = 8000u32;
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + frames * 2).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&8000u32.to_le_bytes());
+        bytes.extend_from_slice(&16000u32.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(frames * 2).to_le_bytes());
+        for i in 0..frames {
+            let s = (std::f32::consts::TAU * 440.0 * i as f32 / 8000.0).sin();
+            bytes.extend_from_slice(&((s * 16000.0) as i16).to_le_bytes());
+        }
+        let path =
+            std::env::temp_dir().join(format!("mixer-decode-low-rate-{}.wav", std::process::id()));
+        std::fs::write(&path, bytes).unwrap();
+        let decoded = decode_file(&path, 48_000);
+        let _ = std::fs::remove_file(path);
+        let audio = decoded.unwrap();
+        assert_eq!(audio.frames(), 48_000, "一秒文件不得缩短");
+        let mono: Vec<f32> = audio
+            .samples
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|f| f[0])
+            .collect();
+        let crossings = mono
+            .windows(2)
+            .filter(|w| w[0] <= 0.0 && w[1] > 0.0)
+            .count();
+        assert!(
+            crossings.abs_diff(440) <= 1,
+            "一秒内应约 440 个周期，实际 {crossings}"
+        );
+    }
+
+    #[test]
+    fn 零目标采样率应返回错误() {
+        let error = decode_file(Path::new("unused.wav"), 0).unwrap_err();
+        assert!(error.to_string().contains("采样率"));
+    }
 
     #[test]
     fn 峰值归一化正确() {

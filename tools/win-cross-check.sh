@@ -62,7 +62,7 @@ else
 fi
 
 export PATH="$STUB_DIR:$PATH"
-out=$(cargo check --target "$TARGET" "${ARGS[@]}" 2>&1)
+out=$(cargo check --locked --all-targets --target "$TARGET" "${ARGS[@]}" 2>&1)
 rc=$?
 
 if [ $rc -eq 0 ]; then

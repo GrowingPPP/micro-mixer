@@ -1,0 +1,16 @@
+[package]
+name = "audio-session"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+audio-core = { path = "../audio-core" }
+backend-cpal = { path = "../backend-cpal" }
+anyhow.workspace = true
+log.workspace = true
+rtrb.workspace = true
+
+[lints]
+workspace = true

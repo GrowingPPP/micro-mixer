@@ -19,6 +19,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -37,6 +38,8 @@ use audio_core::engine::PlaybackControl;
 /// 而"监听"必须对三条都生效 —— 尤其热键，那才是游戏内的主要方式。
 /// 早期监听只挂在界面点击那条路上，导致热键触发时**自己听不到任何声音**。
 pub type PlayHook = Arc<dyn Fn(usize) + Send + Sync>;
+pub type PlayHandler = Arc<dyn Fn(usize) -> bool + Send + Sync>;
+pub type StopHandler = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Default)]
 pub struct Shared {
@@ -44,27 +47,107 @@ pub struct Shared {
     pub slots: Mutex<Vec<String>>,
     /// 每次成功触发播放后调用（参数是 0 基槽位号）
     pub on_play: Mutex<Option<PlayHook>>,
+    play_handler: Mutex<Option<PlayHandler>>,
+    stop_handler: Mutex<Option<StopHandler>>,
 }
 
 impl Shared {
     pub fn set(&self, ctl: Arc<PlaybackControl>, slots: Vec<String>) {
-        *self.control.lock().unwrap_or_else(|e| e.into_inner()) = Some(ctl);
-        *self.slots.lock().unwrap_or_else(|e| e.into_inner()) = slots;
+        let mut control = self.control.lock().unwrap_or_else(|e| e.into_inner());
+        let mut names = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        *control = Some(ctl);
+        *names = slots;
+    }
+    /// Publish a complete host route before either playback operation can observe it.
+    /// Legacy callers can still use `set` plus the optional hook/handler setters.
+    pub fn set_routed(
+        &self,
+        ctl: Arc<PlaybackControl>,
+        slots: Vec<String>,
+        play_handler: PlayHandler,
+        stop_handler: StopHandler,
+    ) {
+        // Every operation taking several state locks follows this order. Readers
+        // retain their handler lock until the fallback snapshot is complete, so
+        // they cannot combine a missing old handler with a newly published control.
+        let mut play = self.play_handler.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stop = self.stop_handler.lock().unwrap_or_else(|e| e.into_inner());
+        let mut control = self.control.lock().unwrap_or_else(|e| e.into_inner());
+        let mut names = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        *play = Some(play_handler);
+        *stop = Some(stop_handler);
+        *control = Some(ctl);
+        *names = slots;
     }
     pub fn clear(&self) {
-        *self.control.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let mut play = self.play_handler.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stop = self.stop_handler.lock().unwrap_or_else(|e| e.into_inner());
+        let mut control = self.control.lock().unwrap_or_else(|e| e.into_inner());
+        let mut names = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hook = self.on_play.lock().unwrap_or_else(|e| e.into_inner());
+        *play = None;
+        *stop = None;
+        *control = None;
+        names.clear();
+        *hook = None;
     }
     pub fn set_hook(&self, hook: PlayHook) {
         *self.on_play.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
     }
-    fn fire_hook(&self, slot: usize) {
-        let h = self
-            .on_play
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        if let Some(h) = h {
-            h(slot);
+    pub fn set_play_handler(&self, handler: PlayHandler) {
+        *self.play_handler.lock().unwrap_or_else(|e| e.into_inner()) = Some(handler);
+    }
+    pub fn set_stop_handler(&self, handler: StopHandler) {
+        *self.stop_handler.lock().unwrap_or_else(|e| e.into_inner()) = Some(handler);
+    }
+    pub fn play(&self, slot: usize) -> bool {
+        let (handler, control, hook) = {
+            let handler = self.play_handler.lock().unwrap_or_else(|e| e.into_inner());
+            if handler.is_some() {
+                (handler.clone(), None, None)
+            } else {
+                let control = self
+                    .control
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let hook = self
+                    .on_play
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                (None, control, hook)
+            }
+        };
+        // Host callbacks may clear or replace this Shared. Invoke after all state
+        // locks are released; an already cloned handler owns its lifecycle gate.
+        if let Some(handler) = handler {
+            return handler(slot);
+        }
+        let ok = control.as_ref().is_some_and(|c| c.play(slot));
+        if let Some(hook) = hook.filter(|_| ok) {
+            hook(slot);
+        }
+        ok
+    }
+    pub fn stop_all(&self) {
+        let (handler, control) = {
+            let handler = self.stop_handler.lock().unwrap_or_else(|e| e.into_inner());
+            if handler.is_some() {
+                (handler.clone(), None)
+            } else {
+                let control = self
+                    .control
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                (None, control)
+            }
+        };
+        if let Some(handler) = handler {
+            handler();
+        } else if let Some(control) = control {
+            control.stop_all();
         }
     }
 }
@@ -76,62 +159,81 @@ pub struct RemoteConfig {
 
 /// 启动遥控服务。返回本机可用的访问地址列表，供打印。
 pub fn serve(shared: Arc<Shared>, cfg: RemoteConfig) -> Result<Vec<String>> {
-    let addr = format!("{}:{}", cfg.bind, cfg.port);
-    let listener = TcpListener::bind(&addr)
-        .with_context(|| format!("监听 {addr} 失败（端口被占用？换 --remote <端口>）"))?;
-    listener.set_nonblocking(false).ok();
+    let mut server = Server::start(shared, cfg)?;
+    // Legacy CLI API: the process lifetime owns this listener.
+    server.shutdown_on_drop = false;
+    Ok(server.urls.clone())
+}
 
-    let port = cfg.port;
+/// A cancellable listener: changing ports and dropping a host release the socket.
+pub struct Server {
+    pub urls: Vec<String>,
+    pub port: u16,
+    shutdown: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    shutdown_on_drop: bool,
+}
+impl Server {
+    pub fn start(shared: Arc<Shared>, cfg: RemoteConfig) -> Result<Self> {
+        let addr = format!("{}:{}", cfg.bind, cfg.port);
+        let listener = TcpListener::bind(&addr)
+            .with_context(|| format!("监听 {addr} 失败（端口被占用？换 --remote <端口>）"))?;
+        listener.set_nonblocking(true)?;
 
-    std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            match stream {
-                Ok(s) => {
-                    let shared = shared.clone();
-                    // 每个连接一个线程：请求量极小，够用且简单
-                    std::thread::spawn(move || {
-                        let _ = handle(s, &shared);
-                    });
+        let port = listener.local_addr()?.port();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = shutdown.clone();
+
+        let thread = std::thread::spawn(move || {
+            while !worker_shutdown.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((s, _)) => {
+                        let shared = shared.clone();
+                        // 每个连接一个线程：请求量极小，够用且简单
+                        std::thread::spawn(move || {
+                            let _ = handle(s, &shared);
+                        });
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20))
+                    }
+                    Err(e) => {
+                        log::warn!("遥控连接失败: {e}");
+                        break;
+                    }
                 }
-                Err(e) => log::warn!("遥控连接失败: {e}"),
+            }
+        });
+
+        // 收集本机 IPv4 地址，方便用户直接在手机上敲
+        let bind_all = cfg.bind == "0.0.0.0";
+        let mut urls = vec![format!("http://127.0.0.1:{port}")];
+        if bind_all {
+            for ip in local_ipv4_addrs() {
+                urls.push(format!("http://{ip}:{port}"));
             }
         }
-    });
-
-    // 收集本机 IPv4 地址，方便用户直接在手机上敲
-    let bind_all = cfg.bind == "0.0.0.0";
-    let mut urls = vec![format!("http://127.0.0.1:{port}")];
-    if bind_all {
-        for ip in local_ipv4_addrs() {
-            urls.push(format!("http://{ip}:{port}"));
+        Ok(Self {
+            urls,
+            port,
+            shutdown,
+            thread: Some(thread),
+            shutdown_on_drop: true,
+        })
+    }
+}
+impl Drop for Server {
+    fn drop(&mut self) {
+        if self.shutdown_on_drop {
+            self.shutdown.store(true, Ordering::Release);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
         }
     }
-    Ok(urls)
 }
 
 fn handle(mut s: TcpStream, shared: &Shared) -> Result<()> {
-    let ctl = shared
-        .control
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    let slots: Vec<String> = shared
-        .slots
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    let ctl = match ctl {
-        Some(c) => c,
-        None => {
-            return respond(
-                &mut s,
-                200,
-                "text/html; charset=utf-8",
-                "<meta charset=utf-8><body style='background:#111;color:#eee;font:16px -apple-system;padding:32px'>                 <h2>音频未启动</h2><p style='color:#888'>请在电脑上点「启动」。</p>                 <script>
-function pct(db){{return Math.max(0,Math.min(100,(db+60)/60*100));}}setTimeout(()=>location.reload(),2000)</script>",
-            )
-        }
-    };
     s.set_read_timeout(Some(Duration::from_secs(2)))?;
     s.set_write_timeout(Some(Duration::from_secs(2)))?;
 
@@ -156,13 +258,31 @@ function pct(db){{return Math.max(0,Math.min(100,(db+60)/60*100));}}setTimeout((
 
     let path = path.split('?').next().unwrap_or("/");
 
+    let (ctl, slots) = {
+        let control = shared.control.lock().unwrap_or_else(|e| e.into_inner());
+        let slots = shared.slots.lock().unwrap_or_else(|e| e.into_inner());
+        (control.clone(), slots.clone())
+    };
+    let ctl = match ctl {
+        Some(c) => c,
+        None => {
+            return respond(
+                &mut s,
+                200,
+                "text/html; charset=utf-8",
+                "<meta charset=utf-8><body style='background:#111;color:#eee;font:16px -apple-system;padding:32px'>                 <h2>音频未启动</h2><p style='color:#888'>请在电脑上点「启动」。</p>                 <script>
+function pct(db){{return Math.max(0,Math.min(100,(db+60)/60*100));}}setTimeout(()=>location.reload(),2000)</script>",
+            )
+        }
+    };
+
     match path {
         "/" | "/index.html" => {
             let html = control_page(&slots, &ctl);
             respond(&mut s, 200, "text/html; charset=utf-8", &html)
         }
         "/stop" => {
-            ctl.stop_all();
+            shared.stop_all();
             respond(
                 &mut s,
                 200,
@@ -195,10 +315,7 @@ function pct(db){{return Math.max(0,Math.min(100,(db+60)/60*100));}}setTimeout((
                     r#"{"ok":false,"error":"没有这个槽位"}"#,
                 );
             }
-            let ok = ctl.play(n - 1);
-            if ok {
-                shared.fire_hook(n - 1); // 监听等副作用由宿主决定
-            }
+            let ok = shared.play(n - 1);
             let body = format!(r#"{{"ok":{},"slot":{}}}"#, ok, n);
             respond(&mut s, 200, "application/json", &body)
         }
@@ -271,21 +388,12 @@ h1{{font-size:17px;font-weight:600;margin:0 0 4px}}
 <button class="stop" onclick="hit('/stop',this)">全部停止</button>
 <div id="m"></div>
 <script>
-function pct(db){{return Math.max(0,Math.min(100,(db+60)/60*100));}}
-async function hit(p,el){{
-  el.classList.add('on');setTimeout(()=>el.classList.remove('on'),260);
-  try{{const r=await fetch(p);const j=await r.json();
-    document.getElementById('m').textContent=j.ok?'已触发':'失败：'+(j.error||'');}}
-  catch(e){{document.getElementById('m').textContent='连不上电脑';}}
-}}
-document.addEventListener('keydown',e=>{{
-  if(e.key>='1'&&e.key<='9'){{const b=document.querySelectorAll('.b')[+e.key-1];if(b)b.click();}}
-  if(e.key===' '){{hit('/stop',document.body);e.preventDefault();}}
-}});
+{script}
 </script></body></html>"#,
         if st.playing { "播放中" } else { "待机" },
         slots.len(),
-        buttons = buttons
+        buttons = buttons,
+        script = include_str!("control-page.js")
     )
 }
 
@@ -428,3 +536,6 @@ fn local_ipv4_addrs() -> Vec<String> {
     }
     out
 }
+
+#[cfg(test)]
+mod tests;

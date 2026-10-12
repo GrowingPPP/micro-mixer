@@ -17,8 +17,9 @@ pub struct LinearResampler {
 
 impl LinearResampler {
     pub fn new(ratio: f64) -> Self {
+        assert!(ratio.is_finite() && ratio > 0.0, "重采样比率必须是正有限数");
         Self {
-            ratio: ratio.clamp(0.25, 4.0),
+            ratio,
             pos: 0.0,
             prev: 0.0,
             primed: false,
@@ -29,9 +30,12 @@ impl LinearResampler {
         self.ratio
     }
 
-    /// 设置重采样比率。内部做范围钳制，防止漂移控制器发散。
+    /// 设置正有限重采样比率。无效更新会被忽略，保持实时线程安全。
+    /// 漂移范围由 [`DriftController`] 围绕设备基础比率限制，不能截断合法采样率。
     pub fn set_ratio(&mut self, ratio: f64) {
-        self.ratio = ratio.clamp(0.25, 4.0);
+        if ratio.is_finite() && ratio > 0.0 {
+            self.ratio = ratio;
+        }
     }
 
     pub fn reset(&mut self) {
@@ -43,7 +47,8 @@ impl LinearResampler {
     /// 把 `input` 重采样写入 `out`，返回实际写入的样本数。
     ///
     /// 要求 `out` 足够大（建议 `ceil(input.len() * ratio) + 8`）。
-    /// 未写满的尾部不会丢失 —— 位置状态会带到下一次调用。
+    /// 此函数消耗整块输入；输出缓冲不足会丢失尚未输出的部分。
+    /// 调用方必须按当前比率准备缓冲，或先将输入切成能容纳的块。
     pub fn process(&mut self, input: &[f32], out: &mut [f32]) -> usize {
         let n = input.len();
         if n == 0 || out.is_empty() {
@@ -76,11 +81,8 @@ impl LinearResampler {
 
         // 位置平移到下一块的坐标系：下一块的第 0 个样本 = 本块的第 n 个
         self.prev = input[n - 1];
-        self.pos -= n as f64;
-        // 防止长期累积误差把位置推到不可用的范围
-        if self.pos < -4.0 {
-            self.pos = -1.0;
-        }
+        self.pos = (self.pos - n as f64).max(-1.0);
+        // 足量输出缓冲下，pos >= -1。保留较大的正位置：低比率可能跨过多块输入。
         written
     }
 }
@@ -156,6 +158,54 @@ mod tests {
         let mut out = vec![0f32; 256];
         let n = r.process(&input, &mut out);
         assert!((190..=210).contains(&n), "2x 上采样应输出约 200，实际 {n}");
+    }
+
+    #[test]
+    fn 八千赫兹到四万八千赫兹应保持时长和音高() {
+        let input: Vec<f32> = (0..8000)
+            .map(|i| (std::f32::consts::TAU * 440.0 * i as f32 / 8000.0).sin())
+            .collect();
+        let mut rs = LinearResampler::new(6.0);
+        let mut out = vec![0.0; 48_016];
+        let n = rs.process(&input, &mut out);
+        assert!(
+            (47_990..=48_000).contains(&n),
+            "一秒输入应约一秒输出，实际 {n} 帧"
+        );
+        let crossings = out[..n]
+            .windows(2)
+            .filter(|w| w[0] <= 0.0 && w[1] > 0.0)
+            .count();
+        let hz = crossings as f64 * 48_000.0 / n as f64;
+        assert!((hz - 440.0).abs() < 2.0, "应保持 440 Hz，实际 {hz}");
+    }
+
+    #[test]
+    fn 高比率和低比率的分块波形应与整块一致() {
+        let input: Vec<f32> = (0..8000).map(|i| (i as f32 * 0.02).sin()).collect();
+        for ratio in [6.0, 24.0, 1.0 / 6.0, 1.0 / 24.0] {
+            let mut whole = LinearResampler::new(ratio);
+            let mut expected = vec![0.0; (input.len() as f64 * ratio).ceil() as usize + 32];
+            let n = whole.process(&input, &mut expected);
+            expected.truncate(n);
+            let mut chunked = LinearResampler::new(ratio);
+            let mut actual = Vec::new();
+            for chunk in input.chunks(37) {
+                let mut out = vec![0.0; (chunk.len() as f64 * ratio).ceil() as usize + 32];
+                let n = chunked.process(chunk, &mut out);
+                actual.extend_from_slice(&out[..n]);
+            }
+            assert!(
+                expected.len().abs_diff(actual.len()) <= 1,
+                "比率 {ratio} 输出帧数不一致"
+            );
+            for (a, b) in expected.iter().zip(&actual) {
+                assert!(
+                    (a - b).abs() < 1e-4,
+                    "比率 {ratio} 分块波形不一致：{a} / {b}"
+                );
+            }
+        }
     }
 
     #[test]

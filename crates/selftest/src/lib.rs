@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use audio_core::device::{AudioBackend, DeviceId, StreamFormat};
+use audio_core::device::{AudioBackend, DeviceId, DeviceInfo, Direction, StreamFormat};
 use backend_cpal::CpalBackend;
 
 /// 送入信号的前导 / 尾部静音，让录音能完整框住信号
@@ -39,6 +39,7 @@ pub struct Report {
     pub freq_sent: f32,
     pub secs_sent: f32,
     pub sample_rate: u32,
+    pub capture_format: StreamFormat,
     pub checks: Vec<Check>,
     /// 输出侧实际送出的帧数（用于诊断"根本没播"）
     pub played_frames: usize,
@@ -83,28 +84,113 @@ impl Report {
     }
 }
 
+/// 虚拟驱动的播放端和录音端，不要求二者拥有相同名字或标识。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointPair {
+    pub output: DeviceId,
+    pub capture: DeviceId,
+}
+
+/// 从设备清单中确定环回端点；同名候选不唯一时要求显式选择。
+pub fn resolve_endpoints(
+    devices: &[DeviceInfo],
+    output: &DeviceId,
+    capture: Option<&DeviceId>,
+) -> Result<EndpointPair> {
+    let select = |id: &DeviceId, direction: Direction| -> Result<&DeviceInfo> {
+        if let Some(device) = devices
+            .iter()
+            .find(|d| d.direction == direction && d.id == *id)
+        {
+            return Ok(device);
+        }
+        let candidates: Vec<_> = devices
+            .iter()
+            .filter(|d| d.direction == direction && d.name.eq_ignore_ascii_case(id.as_str()))
+            .collect();
+        match candidates.as_slice() {
+            [device] => Ok(device),
+            [] => anyhow::bail!("找不到{}端点「{id}」", direction.label()),
+            _ => anyhow::bail!("{}端点「{id}」同名，请指定稳定设备标识", direction.label()),
+        }
+    };
+    let output = select(output, Direction::Output)?;
+    let capture = if let Some(id) = capture {
+        select(id, Direction::Input)?
+    } else {
+        let lower = output.name.to_lowercase();
+        // VB-CABLE: playback CABLE Input -> recording CABLE Output. Keep the
+        // driver suffix (including A/B variants) so separate cables cannot cross-pair.
+        let expected = if lower.contains("cable") && lower.contains("input") {
+            lower.replacen("input", "output", 1)
+        } else {
+            lower
+        };
+        let matches: Vec<_> = devices
+            .iter()
+            .filter(|d| d.direction == Direction::Input && d.name.to_lowercase() == expected)
+            .collect();
+        match matches.as_slice() {
+            [device] => *device,
+            [] => anyhow::bail!(
+                "无法为「{}」确定环回录音端点，请手动选择 capture 设备",
+                output.name
+            ),
+            _ => anyhow::bail!(
+                "「{}」有多个同名录音端点，请手动选择 capture 设备标识",
+                output.name
+            ),
+        }
+    };
+    Ok(EndpointPair {
+        output: output.id.clone(),
+        capture: capture.id.clone(),
+    })
+}
+
 /// 跑一次自检。`device` 为 None 时自动探测虚拟声卡。
 pub fn run(backend: &CpalBackend, device: Option<String>, freq: f32, secs: f32) -> Result<Report> {
+    run_with_capture(backend, device, None, freq, secs)
+}
+
+/// 显式 capture 可用于未识别的虚拟驱动或多个同名端点。
+pub fn run_with_capture(
+    backend: &dyn AudioBackend,
+    device: Option<String>,
+    capture: Option<String>,
+    freq: f32,
+    secs: f32,
+) -> Result<Report> {
+    anyhow::ensure!(
+        freq.is_finite() && freq > 0.0 && secs.is_finite() && secs > 0.0 && secs <= 60.0,
+        "测试频率和时长无效"
+    );
     let id = match device {
         Some(n) => DeviceId::new(n),
         None => backend
             .guess_virtual_output()
             .context("没探测到虚拟声卡，请手动指定设备")?,
     };
-
-    let in_fmt = backend.input_format(&id, Some(StreamFormat::new(48_000, 2)))?;
-    let out_fmt = backend.output_format(&id, Some(StreamFormat::new(48_000, 2)))?;
-
+    let pair = resolve_endpoints(
+        &backend.devices()?,
+        &id,
+        capture.as_deref().map(DeviceId::new).as_ref(),
+    )?;
+    let in_fmt = backend.input_format(&pair.capture, None)?;
+    let out_fmt = backend.output_format(&pair.output, None)?;
     let sr = out_fmt.sample_rate;
+    let capture_sr = in_fmt.sample_rate;
+    let capture_ch = in_fmt.ch();
+    anyhow::ensure!(
+        sr > 0 && capture_sr > 0 && freq < (sr.min(capture_sr) as f32 / 2.0),
+        "测试频率超过端点的 Nyquist 频率"
+    );
     let total_secs = LEAD_SECS + secs + TAIL_SECS;
     let mut advice: Vec<String> = Vec::new();
-    if in_fmt.sample_rate != out_fmt.sample_rate {
-        advice.push("输入输出采样率不同，会引入重采样，结论需谨慎".into());
-    }
 
     // ── 采集缓冲：预分配 + 原子写指针，回调里不做分配
     //    注意 ×2：缓冲存的是**交错样本**（L/R），不是帧。少算一半会导致写满回绕、冲掉开头。
-    let cap_len = (((total_secs + 1.0) * sr as f32) as usize) * 2;
+    let cap_len = (((total_secs + 1.0) * capture_sr as f32) as usize) * capture_ch;
     let buf = Arc::new(Mutex::new(vec![0f32; cap_len]));
     let write_idx = Arc::new(AtomicUsize::new(0));
     let capturing = Arc::new(AtomicBool::new(true));
@@ -114,10 +200,14 @@ pub fn run(backend: &CpalBackend, device: Option<String>, freq: f32, secs: f32) 
     let in_drops = Arc::new(AtomicUsize::new(0));
     let drops_c = in_drops.clone();
 
+    let capturing_c = capturing.clone();
     let in_stream = backend.open_input(
-        &id,
+        &pair.capture,
         Some(in_fmt),
         Box::new(move |data: &[f32]| {
+            if !capturing_c.load(Ordering::Relaxed) {
+                return;
+            }
             // 用 try_lock：绝不在实时线程上阻塞
             match buf_c.try_lock() {
                 Ok(mut b) => {
@@ -142,7 +232,7 @@ pub fn run(backend: &CpalBackend, device: Option<String>, freq: f32, secs: f32) 
     //    CoreAudio 打开输入设备有约 1 秒的启动延迟；不等它就开始放，
     //    录音会把音调开头截掉，导致"时长不足"的假失败。
     let wait_t0 = Instant::now();
-    while write_idx.load(Ordering::Relaxed) <= 4800 {
+    while write_idx.load(Ordering::Relaxed) <= capture_sr as usize / 10 * capture_ch {
         if wait_t0.elapsed() > Duration::from_secs(5) {
             advice.push("等待采集流启动超时（5 秒），时长结论可能不准".into());
             break;
@@ -164,7 +254,7 @@ pub fn run(backend: &CpalBackend, device: Option<String>, freq: f32, secs: f32) 
     let played_c = played.clone();
 
     let out_stream = backend.open_output(
-        &id,
+        &pair.output,
         Some(out_fmt),
         Box::new(move |out: &mut [f32]| {
             let frames = out.len() / out_ch;
@@ -213,7 +303,7 @@ pub fn run(backend: &CpalBackend, device: Option<String>, freq: f32, secs: f32) 
             f32::NEG_INFINITY
         };
 
-        if n < sr as usize / 2 {
+        if n < capture_sr as usize / 2 * capture_ch {
             advice.push(RETRY_HINT.into());
             advice.push(format!(
                 "只录到 {n} 个样本 —— 环回输入侧几乎没有数据。\
@@ -258,14 +348,9 @@ pub fn run(backend: &CpalBackend, device: Option<String>, freq: f32, secs: f32) 
                 ok: false,
             });
         } else {
-            let mono: Vec<f32> = data[..n]
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|f| (f[0] + f[1]) * 0.5)
-                .collect();
+            let mono = downmix_capture(&data[..n], capture_ch);
 
-            match find_tone(&mono, sr) {
+            match find_tone(&mono, capture_sr) {
                 None => {
                     advice.push(RETRY_HINT.into());
                     advice.push(format!(
@@ -282,10 +367,10 @@ pub fn run(backend: &CpalBackend, device: Option<String>, freq: f32, secs: f32) 
                 }
                 Some((a, b)) => {
                     let tone = &mono[a..b];
-                    let dur = tone.len() as f32 / sr as f32;
+                    let dur = tone.len() as f32 / capture_sr as f32;
                     let rms = (tone.iter().map(|s| s * s).sum::<f32>() / tone.len() as f32).sqrt();
                     let rms_db = 20.0 * (rms.max(1e-9)).log10();
-                    let measured = zerocross(tone, sr);
+                    let measured = zerocross(tone, capture_sr);
 
                     let freq_ok = (measured - freq).abs() <= freq * 0.03;
                     let dur_ok = (dur - secs).abs() <= secs * 0.15;
@@ -339,10 +424,11 @@ pub fn run(backend: &CpalBackend, device: Option<String>, freq: f32, secs: f32) 
     }
 
     Ok(Report {
-        device: id.to_string(),
+        device: format!("{} → {}", pair.output, pair.capture),
         freq_sent: freq,
         secs_sent: secs,
         sample_rate: sr,
+        capture_format: in_fmt,
         checks,
         played_frames,
         captured_samples,
@@ -367,10 +453,21 @@ pub fn run_with_retry(
     secs: f32,
     attempts: u32,
 ) -> Result<Report> {
+    run_with_capture_retry(backend, device, None, freq, secs, attempts)
+}
+
+pub fn run_with_capture_retry(
+    backend: &dyn AudioBackend,
+    device: Option<String>,
+    capture: Option<String>,
+    freq: f32,
+    secs: f32,
+    attempts: u32,
+) -> Result<Report> {
     let attempts = attempts.max(1);
     let mut last: Option<Report> = None;
     for i in 1..=attempts {
-        let mut r = run(backend, device.clone(), freq, secs)?;
+        let mut r = run_with_capture(backend, device.clone(), capture.clone(), freq, secs)?;
         r.attempts = i;
         if r.passed() {
             if i > 1 {
@@ -385,6 +482,12 @@ pub fn run_with_retry(
         last = Some(r);
     }
     Ok(last.expect("至少尝试过一次"))
+}
+
+fn downmix_capture(data: &[f32], channels: usize) -> Vec<f32> {
+    data.chunks_exact(channels.max(1))
+        .map(|f| f.iter().sum::<f32>() / channels.max(1) as f32)
+        .collect()
 }
 
 /// 找出连续有信号的段（阈值取峰值以下 20 dB）
@@ -426,12 +529,170 @@ fn zerocross(sig: &[f32], sr: u32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use audio_core::device::{AudioStream, CaptureCallback, RenderCallback};
+
+    #[derive(Default)]
+    struct EmptyBackend {
+        enumerations: AtomicUsize,
+    }
+    impl AudioBackend for EmptyBackend {
+        fn backend_name(&self) -> &'static str {
+            "empty-test-backend"
+        }
+        fn devices(&self) -> Result<Vec<DeviceInfo>> {
+            self.enumerations.fetch_add(1, Ordering::Relaxed);
+            Ok(Vec::new())
+        }
+        fn default_input(&self) -> Option<DeviceId> {
+            None
+        }
+        fn default_output(&self) -> Option<DeviceId> {
+            None
+        }
+        fn input_format(&self, _: &DeviceId, _: Option<StreamFormat>) -> Result<StreamFormat> {
+            panic!("missing endpoints must fail before format negotiation")
+        }
+        fn output_format(&self, _: &DeviceId, _: Option<StreamFormat>) -> Result<StreamFormat> {
+            panic!("missing endpoints must fail before format negotiation")
+        }
+        fn open_input(
+            &self,
+            _: &DeviceId,
+            _: Option<StreamFormat>,
+            _: CaptureCallback,
+        ) -> Result<Box<dyn AudioStream>> {
+            panic!("missing endpoints must fail before opening streams")
+        }
+        fn open_output(
+            &self,
+            _: &DeviceId,
+            _: Option<StreamFormat>,
+            _: RenderCallback,
+        ) -> Result<Box<dyn AudioStream>> {
+            panic!("missing endpoints must fail before opening streams")
+        }
+    }
 
     fn sine(freq: f32, sr: u32, secs: f32, amp: f32) -> Vec<f32> {
         let n = (sr as f32 * secs) as usize;
         (0..n)
             .map(|i| amp * (2.0 * std::f32::consts::PI * freq * i as f32 / sr as f32).sin())
             .collect()
+    }
+
+    fn endpoint(id: &str, name: &str, direction: Direction) -> DeviceInfo {
+        DeviceInfo {
+            id: DeviceId::new(id),
+            name: name.into(),
+            direction,
+            is_default: false,
+            max_channels: 2,
+            default_sample_rate: 48_000,
+        }
+    }
+
+    #[test]
+    fn vb_cable_pairs_render_input_with_recording_output() {
+        let devices = [
+            endpoint(
+                "render",
+                "CABLE Input (VB-Audio Virtual Cable)",
+                Direction::Output,
+            ),
+            endpoint(
+                "capture",
+                "CABLE Output (VB-Audio Virtual Cable)",
+                Direction::Input,
+            ),
+            endpoint(
+                "other",
+                "CABLE-A Output (VB-Audio Cable A)",
+                Direction::Input,
+            ),
+        ];
+        let pair = resolve_endpoints(&devices, &DeviceId::new("render"), None).unwrap();
+        assert_eq!(pair.capture, DeviceId::new("capture"));
+        assert_eq!(pair.output, DeviceId::new("render"));
+    }
+
+    #[test]
+    fn stable_endpoint_identity_precedes_a_matching_display_name_and_checks_direction() {
+        let devices = [
+            endpoint("wasapi:output", "CABLE Input", Direction::Output),
+            endpoint("wasapi:other", "wasapi:output", Direction::Output),
+            endpoint("wasapi:capture", "CABLE Output", Direction::Input),
+        ];
+        let pair = resolve_endpoints(
+            &devices,
+            &DeviceId::new("wasapi:output"),
+            Some(&DeviceId::new("wasapi:capture")),
+        )
+        .unwrap();
+        assert_eq!(pair.output, DeviceId::new("wasapi:output"));
+        assert!(resolve_endpoints(&devices, &DeviceId::new("wasapi:capture"), None).is_err());
+        assert!(resolve_endpoints(
+            &devices,
+            &DeviceId::new("wasapi:output"),
+            Some(&DeviceId::new("wasapi:output"))
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn macos_same_name_endpoints_and_explicit_capture_are_supported() {
+        let devices = [
+            endpoint("out", "BlackHole 2ch", Direction::Output),
+            endpoint("in", "BlackHole 2ch", Direction::Input),
+            endpoint("custom", "Custom loopback", Direction::Input),
+        ];
+        assert_eq!(
+            resolve_endpoints(&devices, &DeviceId::new("out"), None)
+                .unwrap()
+                .capture,
+            DeviceId::new("in")
+        );
+        assert_eq!(
+            resolve_endpoints(
+                &devices,
+                &DeviceId::new("out"),
+                Some(&DeviceId::new("custom"))
+            )
+            .unwrap()
+            .capture,
+            DeviceId::new("custom")
+        );
+    }
+
+    #[test]
+    fn ambiguous_pair_requires_explicit_capture() {
+        let devices = [
+            endpoint("out", "BlackHole 2ch", Direction::Output),
+            endpoint("one", "BlackHole 2ch", Direction::Input),
+            endpoint("two", "BlackHole 2ch", Direction::Input),
+        ];
+        assert!(resolve_endpoints(&devices, &DeviceId::new("out"), None).is_err());
+        assert_eq!(
+            resolve_endpoints(&devices, &DeviceId::new("out"), Some(&DeviceId::new("two")))
+                .unwrap()
+                .capture,
+            DeviceId::new("two")
+        );
+    }
+
+    #[test]
+    fn capture_analysis_uses_capture_rate_and_channel_count() {
+        for (sr, channels) in [(44_100, 1), (48_000, 2), (32_000, 6)] {
+            let mono = sine(440.0, sr, 0.5, 0.5);
+            let interleaved: Vec<_> = mono
+                .iter()
+                .flat_map(|s| std::iter::repeat_n(*s, channels))
+                .collect();
+            let downmixed = downmix_capture(&interleaved, channels);
+            assert_eq!(downmixed.len(), mono.len());
+            assert!((zerocross(&downmixed, sr) - 440.0).abs() < 3.0);
+            let (a, b) = find_tone(&downmixed, sr).unwrap();
+            assert!(((b - a) as f32 / sr as f32 - 0.5).abs() < 0.03);
+        }
     }
 
     #[test]
@@ -475,12 +736,17 @@ mod tests {
     }
 
     #[test]
-    fn 带重试的自检应返回最后一次结果并记录尝试次数() {
-        // 用一个不存在的设备，保证每次都失败；验证重试次数被如实记录。
-        // （真实重试路径依赖硬件，无法在单测里跑；这里锁住接口语义。）
-        let b = CpalBackend::new();
-        let r = run_with_retry(&b, Some("绝对不存在的设备xyz".into()), 440.0, 0.2, 3);
+    fn 不存在设备的自检应在协商或开流前返回错误() {
+        // A missing-device regression must be deterministic and must never enumerate
+        // the developer's real hardware (which can block in third-party drivers).
+        let b = EmptyBackend::default();
+        let r = run_with_capture_retry(&b, Some("绝对不存在的设备xyz".into()), None, 440.0, 0.2, 3);
         assert!(r.is_err(), "设备不存在时应返回错误而不是 panic");
+        assert_eq!(
+            b.enumerations.load(Ordering::Relaxed),
+            1,
+            "配置错误应立即返回，不重开设备"
+        );
     }
 
     #[test]
@@ -490,6 +756,7 @@ mod tests {
             freq_sent: 440.0,
             secs_sent: 1.0,
             sample_rate: 48_000,
+            capture_format: StreamFormat::new(48_000, 2),
             checks: vec![Check {
                 name: "频率".into(),
                 got: "440.0 Hz".into(),

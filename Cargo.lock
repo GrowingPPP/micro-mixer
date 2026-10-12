@@ -124,6 +124,7 @@ name = "app-config"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "toml 0.8.2",
 ]
 
 [[package]]
@@ -348,6 +349,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio-session"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "audio-core",
+ "backend-cpal",
+ "log",
+ "rtrb",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -361,6 +373,7 @@ dependencies = [
  "audio-core",
  "cpal",
  "log",
+ "windows 0.54.0",
 ]
 
 [[package]]
@@ -1826,6 +1839,7 @@ dependencies = [
  "anyhow",
  "global-hotkey",
  "log",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2507,6 +2521,7 @@ dependencies = [
  "anyhow",
  "app-config",
  "audio-core",
+ "audio-session",
  "backend-cpal",
  "clap",
  "env_logger",
@@ -2523,6 +2538,7 @@ dependencies = [
  "anyhow",
  "app-config",
  "audio-core",
+ "audio-session",
  "backend-cpal",
  "env_logger",
  "hotkeys",

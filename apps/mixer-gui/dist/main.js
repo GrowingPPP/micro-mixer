@@ -30,7 +30,7 @@ const el = {
   selIn: $('selIn'), selOut: $('selOut'), inBuf: $('inBuf'),
   inDir: $('inDir'), btnBrowse: $('btnBrowse'), btnScan: $('btnScan'),
   inKeys: $('inKeys'), inMicGain: $('inMicGain'), inSfxGain: $('inSfxGain'),
-  inLoop: $('inLoop'), hint: $('setupHint'),
+  inLoop: $('inLoop'), loopHelp: $('loopHelp'), hint: $('setupHint'),
   btnAdd: $('btnAdd'), btnClear: $('btnClear'), count: $('count'),
   inRemote: $('inRemote'), remote: $('remote'), meter: $('meter'),
   inMonitor: $('inMonitor'),
@@ -47,19 +47,20 @@ const el = {
 let state = { running: false, slots: [], items: [], lastStatus: null,
                monitorDevice: null, remoteUrl: null, activeTag: null, devices: [],
                lastDeviceLost: null, lastPanicSeen: null, lastStalled: null,
+               lastMonitorError: null,
                silentSecs: 0, micHelpShown: false, micHelpDismissed: false };
 
-// ── 音效库条目：{ file, name, gain, tags }
-//    标签用逗号分隔的字符串存（与配置一致），用时再拆成数组。
-const basename = (p) => String(p).split('/').pop().replace(/\.[^.]+$/, '');
-const makeItem = (file, name, gain, tags) => ({
+// ── 音效库条目：{ id, file, name, gain, tags: string[] }
+//    标签始终保存为数组，单个标签中的标点不作为分隔符。
+const basename = MixerLibrary.basename;
+const makeItem = (file, name, gain, tags, id) => ({
+  id: id || (globalThis.crypto?.randomUUID?.() ?? `sound-${Date.now()}-${Math.random().toString(16).slice(2)}`),
   file,
   name: (name || '').trim() || basename(file),
   gain: Number.isFinite(+gain) ? +gain : 0,
-  tags: tags || '',
+  tags: MixerLibrary.tags(tags),
 });
-const itemTags = (it) => String(it?.tags || '')
-  .split(/[,|;]/).map(t => t.trim()).filter(Boolean);
+const itemTags = (it) => MixerLibrary.tags(it?.tags);
 const allTags = () => {
   const set = new Set();
   for (const it of state.items) for (const t of itemTags(it)) set.add(t);
@@ -92,18 +93,21 @@ async function loadSavedConfig() {
     if (Array.isArray(c.items) && c.items.length) {
       // ⚠️ 不能写成 .map(makeItem) —— map 会传 (元素, 索引, 数组)，
       //    而 makeItem 的签名是 (file, name, gain, tags)，整个对象会被当成路径。
-      state.items = c.items.map(o => makeItem(o.file, o.name, o.gain, o.tags));
+      state.items = c.items.map(o => makeItem(o.file, o.name, o.gain, o.tags, o.id));
     }
     if (c.buffer_ms) el.inBuf.value = c.buffer_ms;
     if (c.mic_gain_db !== null) el.inMicGain.value = c.mic_gain_db;
     if (c.sfx_gain_db !== null) el.inSfxGain.value = c.sfx_gain_db;
-    if (c.hotkeys) el.inKeys.value = c.hotkeys;
+    if (typeof c.hotkeys === 'string') el.inKeys.value = c.hotkeys;
     if (typeof c.monitor === 'boolean') el.inMonitor.checked = c.monitor;
+    if (typeof c.looping === 'boolean') el.inLoop.checked = c.looping;
+    syncLoopHelp();
     state.monitorDevice = c.monitor_device || null;
 
     // 设备下拉里没有这一项时，临时插进去，避免设置丢失
-    const pick = (sel, name) => {
+    const pick = (sel, name, direction) => {
       if (!name) return;
+      name = MixerLibrary.resolveSelector(state.devices, name, direction);
       if (![...sel.options].some(o => o.value === name)) {
         const o = document.createElement('option');
         o.value = name; o.textContent = name + '（上次使用）';
@@ -111,21 +115,23 @@ async function loadSavedConfig() {
       }
       sel.value = name;
     };
-    pick(el.selIn, c.input_device);
-    pick(el.selOut, c.output_device);
+    pick(el.selIn, c.input_device, '输入');
+    pick(el.selOut, c.output_device, '输出');
 
     if (c.dir) hint('已载入上次的设置', 'ok');
     return c;
   } catch (e) { return null; }
 }
 
-async function saveCurrentConfig() {
+let configSaveTail = Promise.resolve();
+async function saveCurrentConfig(before) {
   try {
-    await invoke('save_config', {
+    const snapshot = {
       items: state.items.map(it => ({
-        file: it.file, name: it.name, gain: it.gain, tags: it.tags,
+        id: it.id, file: it.file, name: it.name, gain: it.gain, tags: it.tags,
       })),
       monitor: el.inMonitor.checked,
+      looping: !!el.inLoop.checked,
       monitorDevice: state.monitorDevice || null,
       dir: el.inDir.value.trim(),
       inputDevice: el.selIn.value || null,
@@ -134,12 +140,20 @@ async function saveCurrentConfig() {
       micGainDb: parseFloat(el.inMicGain.value || '0'),
       sfxGainDb: parseFloat(el.inSfxGain.value || '-6'),
       hotkeys: el.inKeys.value.trim(),
+    };
+    // Preserve completion order when consecutive slider gestures save snapshots.
+    configSaveTail = configSaveTail.catch(() => {}).then(async () => {
+      if (before) await before.catch(() => {});
+      return invoke('save_config', snapshot);
     });
+    await configSaveTail;
   } catch (e) { /* 保存失败不影响使用 */ }
 }
 
 async function loadDevices() {
   try {
+    const previousInput = el.selIn.value;
+    const previousOutput = el.selOut.value;
     const devs = (await invoke('list_devices')) || [];
     state.devices = devs;
     const inputs = devs.filter(d => d.direction === '输入');
@@ -148,7 +162,10 @@ async function loadDevices() {
     fill(el.selIn, inputs, '（系统默认麦克风）');
     fill(el.selOut, outputs, '（自动探测虚拟声卡）');
 
-    const guess = await invoke('guess_output');
+    if (previousInput) el.selIn.value = MixerLibrary.resolveSelector(devs, previousInput, '输入');
+    if (previousOutput) el.selOut.value = MixerLibrary.resolveSelector(devs, previousOutput, '输出');
+    if (state.monitorDevice) state.monitorDevice = MixerLibrary.resolveSelector(devs, state.monitorDevice, '输出');
+    const guess = previousOutput ? null : await invoke('guess_output');
     if (guess) {
       for (const o of el.selOut.options) {
         if (o.value === guess) { el.selOut.value = guess; break; }
@@ -168,7 +185,7 @@ function fill(sel, list, placeholder) {
   sel.appendChild(opt0);
   for (const d of list) {
     const o = document.createElement('option');
-    o.value = d.name;
+    o.value = d.id || d.name;
     o.textContent = d.name +
       (d.is_default ? ' · 默认' : '') +
       `  ${d.sample_rate / 1000}kHz/${d.channels}ch`;
@@ -179,36 +196,36 @@ function fill(sel, list, placeholder) {
 // ─────────────────────────────── 音效
 
 async function scanDir(silent = false) {
+  if (state.running) { if (!silent) toast('先点「停止」再改音效库', true); return; }
   const dir = el.inDir.value.trim();
   if (!dir) { if (!silent) hint('先填一个音效文件夹', 'error'); return; }
   try {
     const files = (await invoke('scan_dir', { path: dir })) || [];
-    // 已有的条目按路径复用（保住用户改过的名字、标签、音量）
-    const known = new Map(state.items.map(it => [it.file, it]));
-    state.items = files.map(f => known.get(f) || makeItem(f));
+    if (state.running) { if (!silent) toast('先点「停止」再改音效库', true); return; }
+    // 路径相同的条目复用身份、名字、标签、音量和热键，包括未绑定的空热键。
+    applyLibraryEdit(MixerLibrary.scanFiles(state.items, hotkeyList(), files, makeItem));
     if (!files.length) {
       hint('这个文件夹里没有音频文件（支持 mp3 / wav / ogg / m4a / flac 等）', 'error');
     } else {
       hint(`找到 ${files.length} 个音效`, 'ok');
-      if (!el.inKeys.value.trim()) {
-        el.inKeys.value = files.map((_, i) => 'F' + (i + 1)).join(',');
-      }
     }
     render();
   } catch (e) {
     hint('读取文件夹失败：' + (e && e.message ? e.message : e) +
          ' —— 检查路径是否存在、是否有权限', 'error');
-    state.items = []; render();
+    render();
   }
 }
 
 function hotkeyList() {
-  return el.inKeys.value.split(',').map(s => s.trim()).filter(Boolean);
+  return MixerLibrary.hotkeys(el.inKeys.value);
 }
 
 // ─────────────────────────────── 启停
 
 async function start() {
+  const choice = newAudioChoice();
+  let opened = false;
   if (!state.items.length) {
     await scanDir(true);
     if (!state.items.length) {
@@ -219,12 +236,17 @@ async function start() {
   el.btnToggle.disabled = true;
   hint('正在启动音频…');
   await saveCurrentConfig();   // 记住这次的选择
+  if (choice !== audioChoice) return;
   try {
-    await invoke('start', {
-      cfg: {
+    // Finish changes sent to the previous session before opening a new one.
+    await loopUpdateTail.catch(() => {});
+    if (choice !== audioChoice) return;
+    const cfg = {
         input_device: el.selIn.value || null,
         output_device: el.selOut.value || null,
         files: state.items.map(it => it.file),
+        ids: state.items.map(it => it.id),
+        tags: state.items.map(itemTags),
         gains: state.items.map(it => it.gain),
         names: state.items.map(it => it.name),
         hotkeys: hotkeyList(),
@@ -238,32 +260,73 @@ async function start() {
         //    「用 config set 指定了监听设备，一点启动就被抹掉」。
         monitor_device: state.monitorDevice || null,
         remote_port: el.inRemote.checked ? 8765 : null,
-      },
-    });
+      };
+    if (!await confirmedAudio(await invokeAudio('start', { cfg }, choice), choice)) return;
+    opened = true;
     state.running = true;
+    clearPlaybackFeedback();
+    // Decode/open can take time. A loop edit made during startup was saved as
+    // an idle preference; reconcile it with the newly opened session now.
+    if (cfg.looping !== !!el.inLoop.checked) {
+      await queueLoopUpdate(!!el.inLoop.checked);
+      if (choice !== audioChoice) return;
+    }
+    await poll(choice);
+    if (choice !== audioChoice) return;
+    // The idle grid uses source positions. The opened session may skip bad
+    // files and assign different loaded slots, so rebuild names and bindings.
+    render();
+    if (!state.running) {
+      setSetupOpen(true);
+      toast('音频状态已被其他操作更新');
+      return;
+    }
     setSetupOpen(false);   // 启动后收起设置，把空间让给音效网格
     closeTestPanel();   // 自检是"启动前"的检查，开起来之后留着只占地方
     toast('已启动 · 关闭窗口不会退出');
-  hint(`正在把「${el.selIn.value || '系统默认麦克风'}」的声音和音效一起送进 ` +
-       `「${el.selOut.value || '虚拟声卡'}」。游戏麦克风选它就能同时听到你说话和音效。`, 'ok');
+  hint(`正在把「${el.selIn.selectedOptions[0]?.textContent || '系统默认麦克风'}」的声音和音效一起送进 ` +
+       `「${el.selOut.selectedOptions[0]?.textContent || '虚拟声卡'}」。游戏麦克风选它就能同时听到你说话和音效。`, 'ok');
   } catch (e) {
-    hint('启动失败：' + e, 'error');
-    state.running = false;
+    if (choice !== audioChoice) return;
+    if (!opened) state.running = false;
+    await poll(choice);
+    if (choice !== audioChoice) return;
+    render();
+    hint((opened ? '循环设置更新失败，请重新切换循环开关：' : '启动失败：') + e, 'error');
   } finally {
-    el.btnToggle.disabled = false;
-    syncToggle();
+    if (choice === audioChoice) {
+      el.btnToggle.disabled = false;
+      syncToggle();
+    }
   }
 }
 
 async function stop() {
+  const choice = newAudioChoice();
   el.btnToggle.disabled = true;
-  try { await invoke('stop'); } catch (e) { /* 忽略 */ }
+  try {
+    if (!await confirmedAudio(await invokeAudio('stop', {}, choice), choice)) return;
+  } catch (e) {
+    if (choice === audioChoice) toast('关闭音效失败：' + e, true);
+    return;
+  } finally {
+    if (choice === audioChoice) el.btnToggle.disabled = false;
+  }
+  if (choice !== audioChoice) return;
   state.running = false;
+  state.standby = true;
   state.slots = [];
+  clearPlaybackFeedback();
   setSetupOpen(true);
   el.btnToggle.disabled = false;
   syncToggle();
   render();
+  await poll(choice);
+  if (choice !== audioChoice) return;
+  if (state.running || !state.standby) {
+    toast('音频状态已被其他操作更新');
+    return;
+  }
   toast('音效已关闭');
   hint('已停止音效。麦克风仍在转发 —— 队友照常听得到你说话，' +
        '想放音效时点「开启音效」即可，游戏里的麦克风不用动。', 'ok');
@@ -306,34 +369,93 @@ function syncToggle() {
 
 // ─────────────────────────────── 播放
 
+// Commands can finish out of order (especially preview decode). Completion
+// feedback and refreshes belong only to the most recent audio operation.
+let audioChoice = 0;
+let operationReservationTail = Promise.resolve();
+function newAudioChoice() {
+  // A newer operation owns the busy UI too; an abandoned startup may still be
+  // waiting for a disk save or decode and must not leave the toggle locked.
+  el.btnToggle.disabled = false;
+  return ++audioChoice;
+}
+
+async function invokeAudio(command, args, choice) {
+  // Reserve in user order, but do not put decoding/opening or their responses
+  // in this queue. Stop must be able to cancel a slow preview immediately.
+  const reserved = operationReservationTail.catch(() => {}).then(async () => {
+    if (choice !== audioChoice) return null;
+    return invoke('begin_playback_operation');
+  });
+  operationReservationTail = reserved;
+  const operation = await reserved;
+  if (operation == null || choice !== audioChoice) return;
+  return invoke(command, { ...args, operation });
+}
+
+async function confirmedAudio(result, choice) {
+  if (choice !== audioChoice) return false;
+  if (result !== false) return true;
+  // A newer hotkey/phone/menu action can cancel the host ticket without
+  // changing this WebView's local choice. Follow native state in that case.
+  await poll(choice);
+  if (choice === audioChoice) {
+    render();
+    toast('播放状态已被其他操作更新');
+  }
+  return false;
+}
+
+function clearPlaybackFeedback() {
+  if (state.lastStatus) state.lastStatus = {
+    ...state.lastStatus, playing: false, active_slot: -1, playhead_secs: 0,
+    preview_playing: false, preview_sound_id: null, preview_playhead_secs: 0,
+  };
+  // A confirmed stop also clears feedback when the following status request
+  // fails. Later successful status always takes priority over this snapshot.
+  const slots = new Map(baseSlots().map(slot => [slot.index, slot]));
+  for (const card of el.grid.children) {
+    const slot = slots.get(+card.dataset.slot);
+    if (slot) updateCardPlayback(card, slot);
+  }
+}
+
 async function play(slot) {
+  if (!MixerLibrary.canPlay(state)) { toast("先开启音效再播放", true); return; }
+  const choice = newAudioChoice();
   try {
-    const ok = await invoke('play', { slot });
-    if (!ok) { toast('没有这个音效', true); return; }
+    const replacing = !!MixerLibrary.currentPlayback(state);
+    const ok = await invokeAudio('play', { slot }, choice);
+    if (choice !== audioChoice) return;
+    if (ok === false) {
+      await confirmedAudio(false, choice);
+      if (choice === audioChoice) toast('未接纳这次播放，播放状态已刷新', true);
+      return;
+    }
+    await poll(choice);
+    if (choice !== audioChoice) return;
     // 和「试听」形成明确对照：这条是真的送进麦克风了
-    toast('已送进麦克风 —— 队友听得到');
+    toast(replacing ? '已切换播放 —— 队友听得到' : '已送进麦克风 —— 队友听得到');
   } catch (e) {
-    toast(e, true);
+    if (choice === audioChoice) toast(e, true);
   }
 }
 
 async function stopAll() {
-  try { await invoke('stop_all'); toast('已掐掉正在播放的音效（麦克风转发不受影响）'); }
-  catch (e) { toast(e, true); }
+  const choice = newAudioChoice();
+  try {
+    if (!await confirmedAudio(await invokeAudio('stop_all', {}, choice), choice)) return;
+    await poll(choice);
+    if (choice !== audioChoice) return;
+    toast('已停止音效播放和试听（麦克风转发不受影响）');
+  }
+  catch (e) { if (choice === audioChoice) toast(e, true); }
 }
 
 // ─────────────────────────────── 渲染
 
 function baseSlots() {
-  return state.slots.length ? state.slots
-    : state.items.map((it, i) => ({
-        index: i,
-        name: it.name,
-        file: it.file,
-        duration: 0,
-        hotkey: hotkeyList()[i] || '',
-        gain_db: it.gain,
-      }));
+  return MixerLibrary.baseSlots(state, hotkeyList());
 }
 
 /// 按搜索词与标签过滤。**保留原始 index**（data-slot），
@@ -342,10 +464,10 @@ function visibleSlots() {
   const q = el.inSearch.value.trim().toLowerCase();
   const tag = state.activeTag;
   return baseSlots().filter(s => {
-    const it = state.items[s.index];
+    const it = MixerLibrary.itemForSlot(state, s);
     if (tag && !itemTags(it).includes(tag)) return false;
     if (q) {
-      const hay = (s.name + ' ' + (it?.tags || '') + ' ' + (s.hotkey || '')).toLowerCase();
+      const hay = (s.name + ' ' + itemTags(it).join(' ') + ' ' + (s.hotkey || '')).toLowerCase();
       if (!hay.includes(q)) return false;
     }
     return true;
@@ -403,9 +525,9 @@ function render() {
 
   for (const s of slots) {
     const card = document.createElement('div');
-    card.className = 'card' + (isActive(s.index) ? ' playing' : '');
+    card.className = 'card';
     card.dataset.slot = s.index;   // ⚠️ 始终是**原始**槽位号
-    const it = state.items[s.index];
+    const it = MixerLibrary.itemForSlot(state, s);
     const g = it?.gain ?? s.gain_db ?? 0;
     const tags = itemTags(it);
     card.innerHTML = `
@@ -421,14 +543,23 @@ function render() {
         <span class="dur">${s.duration ? s.duration.toFixed(1) + 's' : ''}</span>
         ${s.hotkey ? `<span class="key">${esc(s.hotkey)}</span>` : ''}
       </div>
+      <div class="playback-state" aria-live="polite"></div>
       <div class="tags" title="双击可编辑标签">${
         tags.length ? tags.map(t => `<i>${esc(t)}</i>`).join('')
                     : '<i class="addtag">＋ 标签</i>'
       }</div>
-      <input class="vol ${volClass(g)}" type="range"
-             min="${VOL_MIN}" max="${VOL_MAX}" step="1" value="${g}"
-             title="音量 ${g} dB">
-      <div class="bar"></div>`;
+      <div class="volume-control">
+        <div class="volume-heading">
+          <label class="volume-label" for="sound-volume-${s.index}">音效音量</label>
+          <output class="volume-value" for="sound-volume-${s.index}">${formatGain(g)}</output>
+        </div>
+        <input id="sound-volume-${s.index}" class="vol ${volClass(g)}" type="range"
+               min="${VOL_MIN}" max="${VOL_MAX}" step="1" value="${g}"
+               aria-label="${esc(s.name)} 音效音量" aria-valuetext="${formatGain(g)}"
+               title="音效音量 ${formatGain(g)} · 试听与播放均实时生效">
+        <div class="volume-help">试听、播放均实时生效</div>
+      </div>
+      <div class="bar" title="播放进度" aria-hidden="true"></div>`;
 
     card.addEventListener('click', () => play(s.index));
 
@@ -437,8 +568,8 @@ function render() {
       btn.addEventListener('click', e => {
         e.stopPropagation();
         const act = btn.dataset.act;
-        if (act === 'del') removeItem(s.index);
-        else moveItem(s.index, act === 'left' ? -1 : 1);
+        if (act === 'del') removeItem(MixerLibrary.sourceIndex(s));
+        else moveItem(MixerLibrary.sourceIndex(s), act === 'left' ? -1 : 1);
       });
       btn.addEventListener('pointerdown', e => e.stopPropagation());
     }
@@ -447,14 +578,14 @@ function render() {
     const nameEl = card.querySelector('.name');
     nameEl.addEventListener('dblclick', e => {
       e.stopPropagation();
-      startRename(nameEl, s.index);
+      startRename(nameEl, MixerLibrary.sourceIndex(s));
     });
 
     // 双击标签区改标签
     const tagsEl = card.querySelector('.tags');
     tagsEl.addEventListener('dblclick', e => {
       e.stopPropagation();
-      startTagEdit(tagsEl, s.index);
+      startTagEdit(tagsEl, MixerLibrary.sourceIndex(s));
     });
     tagsEl.addEventListener('click', e => e.stopPropagation());
 
@@ -462,27 +593,39 @@ function render() {
     const pv = card.querySelector('.prev');
     pv.addEventListener('click', async e => {
       e.stopPropagation();
-      const file = (state.slots[s.index] || {}).file || it?.file;
+      const file = s.file || it?.file;
       if (!file) { toast('找不到这个音效的文件路径', true); return; }
-      pv.classList.add('playing');
-      setTimeout(() => pv.classList.remove('playing'), 400);
+      const choice = newAudioChoice();
       try {
-        await invoke('preview', { file, gainDb: it?.gain ?? 0 });
-        toast('试听中（队友听不到）');
-      } catch (err) { toast('试听失败：' + err, true); }
+        const replacing = !!MixerLibrary.currentPlayback(state);
+        toast('加载试听…');
+        if (!await confirmedAudio(await invokeAudio('preview', {
+          file, gainDb: it?.gain ?? 0, soundId: it?.id ?? s.id,
+        }, choice), choice)) return;
+        await poll(choice);
+        if (choice !== audioChoice) return;
+        toast(replacing ? '已切换试听（仅自己听，队友听不到）' : '试听中（队友听不到）');
+      } catch (err) { if (choice === audioChoice) toast('试听失败：' + err, true); }
     });
     pv.addEventListener('pointerdown', e => e.stopPropagation());
 
     const vol = card.querySelector('.vol');
+    const volume = card.querySelector('.volume-control');
+    volume.addEventListener('click', e => e.stopPropagation());
+    volume.addEventListener('pointerdown', e => e.stopPropagation());
     vol.addEventListener('click', e => e.stopPropagation());
     vol.addEventListener('pointerdown', e => e.stopPropagation());
     vol.addEventListener('input', e => {
       e.stopPropagation();
       const db = +e.target.value;
-      setSlotGain(s.index, db);
+      setSoundGain(it?.id ?? s.id, db);
       vol.className = 'vol ' + volClass(db);
-      vol.title = `音量 ${db} dB`;
+      vol.title = `音效音量 ${formatGain(db)} · 试听与播放均实时生效`;
+      vol.setAttribute('aria-valuetext', formatGain(db));
+      card.querySelector('.volume-value').textContent = formatGain(db);
     });
+    vol.addEventListener('change', e => { e.stopPropagation(); return saveCurrentConfig(); });
+    updateCardPlayback(card, s);
     el.grid.appendChild(card);
   }
   updateCount();
@@ -490,12 +633,16 @@ function render() {
 
 // ─────────────────────────────── 音效库操作
 
+function applyLibraryEdit(edit) {
+  state.items = edit.items;
+  el.inKeys.value = edit.keys.join(',');
+}
+
 function removeItem(idx) {
   const it = state.items[idx];
   if (!it) return;
   if (state.running) { toast('先点「停止」再改音效库', true); return; }
-  state.items.splice(idx, 1);
-  syncHotkeys();
+  applyLibraryEdit(MixerLibrary.remove(state.items, hotkeyList(), idx));
   render();
   toast(`已移除「${it.name}」（文件没删）`);
 }
@@ -504,38 +651,14 @@ function moveItem(idx, delta) {
   const to = idx + delta;
   if (state.running) { toast('先点「停止」再改音效库', true); return; }
   if (to < 0 || to >= state.items.length) return;
-  const [it] = state.items.splice(idx, 1);
-  state.items.splice(to, 0, it);
-  // 热键是按位置对应的，音效换了位置，热键也要跟着换
-  const keys = hotkeyList();
-  if (keys.length === state.items.length) {
-    const [k] = keys.splice(idx, 1);
-    keys.splice(to, 0, k);
-    el.inKeys.value = keys.join(',');
-  }
+  applyLibraryEdit(MixerLibrary.move(state.items, hotkeyList(), idx, to));
   render();
-}
-
-/// 音效数量变了之后，把热键列表补齐到相同长度
-function syncHotkeys() {
-  const keys = hotkeyList();
-  if (keys.length !== state.items.length) {
-    el.inKeys.value = state.items.map((_, i) => keys[i] || ('F' + (i + 1))).join(',');
-  }
 }
 
 /// 双击标签区进入编辑。
 ///
 /// 分隔符同时认中英文逗号 / 顿号 / 分号 / 竖线 —— 用户打中文时很自然会用「，」，
 /// 只认英文逗号会让人以为"输了没反应"。
-const TAG_SEP = /[,|;，、；]+/;
-
-function parseTags(text) {
-  return [...new Set(
-    String(text || '').split(TAG_SEP).map(t => t.trim()).filter(Boolean)
-  )];
-}
-
 function startTagEdit(tagsEl, idx) {
   if (state.running) { toast('先点「停止」再改标签', true); return; }
   const it = state.items[idx];
@@ -543,8 +666,10 @@ function startTagEdit(tagsEl, idx) {
   const input = document.createElement('input');
   input.type = 'text';
   input.className = 'taginput';
-  input.value = itemTags(it).join(',');
-  const others = allTags().filter(t => !itemTags(it).includes(t));
+  const initialTags = itemTags(it);
+  const initialText = initialTags.join(',');
+  input.value = initialText;
+  const others = allTags().filter(t => !initialTags.includes(t));
   input.placeholder = others.length ? `可加：${others.slice(0, 3).join('、')}` : '标签1,标签2';
   tagsEl.innerHTML = '';
   tagsEl.appendChild(input);
@@ -555,7 +680,8 @@ function startTagEdit(tagsEl, idx) {
   const finish = (save) => {
     if (done) return;
     done = true;
-    if (save) it.tags = parseTags(input.value).join(',');
+    // 打开后直接离开编辑框，必须保留含字面逗号等标点的原始标签。
+    if (save) it.tags = MixerLibrary.tagsAfterEdit(initialTags, initialText, input.value);
     render();
   };
   input.addEventListener('blur', () => finish(true), { once: true });
@@ -593,22 +719,25 @@ function startRename(nameEl, idx) {
 }
 
 function volClass(db) {
-  if (db <= VOL_MIN) return 'muted';
+  if (db <= VOL_MIN) return 'quiet';
   if (db > 0) return 'boosted';
   return '';
 }
 
-// 单音效音量：先改本地状态（未启动时也不丢），启动后立即下发
-let slotGainTimer = null;
-function setSlotGain(slot, db) {
-  if (state.items[slot]) state.items[slot].gain = db;
-  if (!state.running) return;
-  clearTimeout(slotGainTimer);
-  slotGainTimer = setTimeout(() => {
-    invoke('set_slot_gain', { slot, db })
-      .then(ok => { if (ok) toast(`${slot + 1} 号音量 ${db} dB`); })
-      .catch(() => {});
-  }, 90);
+function formatGain(db) {
+  const value = Math.round(db * 10) / 10;
+  return `${value > 0 ? '+' : ''}${value} dB`;
+}
+
+// 即刻更新正在响的音效或试听。每个 ID 独立串行，只合并其等待中的最新值。
+const sendSoundGain = MixerLibrary.gainSender((soundId, db) =>
+  invoke('set_sound_gain', { soundId, db })
+    .catch(error => toast('音效音量更新失败：' + error, true)));
+function setSoundGain(soundId, db) {
+  if (!soundId || !Number.isFinite(db)) return;
+  const item = state.items.find(item => item.id === soundId);
+  if (item) item.gain = db;
+  return sendSoundGain(soundId, db);
 }
 
 function updateCount() {
@@ -616,9 +745,24 @@ function updateCount() {
   el.count.textContent = n ? `（共 ${n} 个）` : '';
 }
 
-function isActive(i) {
-  const st = state.lastStatus;
-  return !!(st && st.playing && st.active_slot === i);
+function updateCardPlayback(card, slot) {
+  const playback = MixerLibrary.playbackForSlot(state, slot);
+  const preview = playback.kind === 'preview';
+  card.classList.toggle('playing', playback.active);
+  card.classList.toggle('previewing', preview);
+  const button = card.querySelector('.prev');
+  if (button) {
+    button.classList.toggle('playing', preview);
+    button.textContent = preview ? '试听中' : '试听';
+  }
+  const label = card.querySelector('.playback-state');
+  if (label) label.textContent = playback.active
+    ? preview ? '试听中 · 仅自己听' : '播放中 · 队友听得到' : '';
+  const bar = card.querySelector('.bar');
+  if (bar) {
+    bar.style.width = playback.progress + '%';
+    bar.title = preview ? '试听进度' : '播放进度';
+  }
 }
 
 
@@ -629,10 +773,16 @@ function esc(s) {
 
 // ─────────────────────────────── 状态轮询
 
-async function poll() {
+let requestedStatus = 0;
+let appliedStatus = 0;
+async function poll(choice = audioChoice) {
+  if (choice !== audioChoice) return;
+  const request = ++requestedStatus;
   try {
     const st = await invoke('status');
-    if (!st) return;
+    // 命令会立即刷新状态；较早的轮询迟到时不能把当前音效切回旧卡片。
+    if (!st || choice !== audioChoice || request < appliedStatus) return;
+    appliedStatus = request;
     const wasRunning = state.running;
     state.running = st.running;
     state.lastStatus = st;
@@ -701,6 +851,16 @@ async function poll() {
       state.lastDeviceLost = null;
     }
 
+    // 监听有独立的健康状态；同一错误持续存在时只提醒一次。
+    if (st.monitor_error && st.monitor_error !== state.lastMonitorError) {
+      state.lastMonitorError = st.monitor_error;
+      hint('🎧 本机监听输出异常：' + st.monitor_error +
+           ' —— 请检查监听设备并重新开启监听，麦克风和音效的主输出继续运行。', 'error');
+      toast('本机监听出错，请检查监听设备；主输出继续运行', true);
+    } else if (!st.monitor_error) {
+      state.lastMonitorError = null;
+    }
+
     // 底栏指标
     // 被跳过的坏文件：必须告诉用户，否则他会以为"明明放进去了怎么没有"
     if (st.running && (st.skipped || []).length) {
@@ -740,20 +900,11 @@ async function poll() {
 
     if (wasRunning !== state.running) { syncToggle(); render(); }
 
-    // 播放进度
-    if (st.running) {
-      for (const card of el.grid.children) {
-        const i = +card.dataset.slot;
-        if (Number.isNaN(i)) continue;
-        card.classList.toggle('playing', isActive(i));
-        const bar = card.querySelector('.bar');
-        if (bar) {
-          const dur = (state.slots[i] || {}).duration || 0;
-          const pct = (isActive(i) && dur > 0)
-            ? Math.min(100, (st.playhead_secs / dur) * 100) : 0;
-          bar.style.width = pct + '%';
-        }
-      }
+    // 主播放和试听共用唯一当前音效；试听也可在未启动/待机时运行。
+    const slots = new Map(baseSlots().map(slot => [slot.index, slot]));
+    for (const card of el.grid.children) {
+      const slot = slots.get(+card.dataset.slot);
+      if (slot) updateCardPlayback(card, slot);
     }
   } catch (e) { /* 窗口关闭时忽略 */ }
 }
@@ -786,6 +937,40 @@ function fmtTime(sec) {
 
 // ─────────────────────────────── 事件绑定
 
+function syncLoopHelp() {
+  el.loopHelp.textContent = el.inLoop.checked
+    ? '循环已开启：正式播放与监听重复播放；取消后当前一遍结束即停止。试听始终只播放一次。'
+    : '循环已关闭：正式播放与监听在当前一遍结束后停止。试听始终只播放一次。';
+}
+
+let loopUpdateTail = Promise.resolve();
+let loopChoice = 0;
+function queueLoopUpdate(looping) {
+  loopUpdateTail = loopUpdateTail.catch(() => {}).then(() => invoke('set_looping', { looping }));
+  return loopUpdateTail;
+}
+el.inLoop.addEventListener('change', async () => {
+  const choice = ++loopChoice;
+  const audioWhenEdited = audioChoice;
+  const looping = !!el.inLoop.checked;
+  const hasSession = state.running || state.standby;
+  syncLoopHelp();
+  // 保存的是这次选择的快照；先等早前的音频更新，避免释放后其迟到覆盖新配置。
+  const updated = hasSession
+    ? queueLoopUpdate(looping)
+    : loopUpdateTail.catch(() => {});
+  const saved = saveCurrentConfig(updated);
+  try {
+    await updated;
+    await saved;
+    if (choice === loopChoice && audioWhenEdited === audioChoice) toast(looping
+      ? '已开启循环播放（试听仍只播放一次）'
+      : '已取消循环，当前一遍结束即停止');
+  } catch (error) {
+    if (choice === loopChoice && audioWhenEdited === audioChoice) toast('循环设置更新失败：' + error, true);
+  }
+});
+
 el.btnToggle.addEventListener('click', () => state.running ? stop() : start());
 el.btnStopAll.addEventListener('click', stopAll);
 el.btnBrowse.addEventListener('click', async () => {
@@ -794,20 +979,18 @@ el.btnBrowse.addEventListener('click', async () => {
 });
 el.btnScan.addEventListener('click', () => scanDir());
 el.btnAdd.addEventListener('click', async () => {
+  if (state.running) { toast('先点「停止」再改音效库', true); return; }
   const picked = (await invoke('add_files')) || [];
   if (!picked.length) return;
-  const have = new Set(state.items.map(it => it.file));
-  let added = 0;
-  for (const f of picked) {
-    if (!have.has(f)) { state.items.push(makeItem(f)); added++; }
-  }
-  if (!el.inKeys.value.trim() || hotkeyList().length < state.items.length) {
-    el.inKeys.value = state.items.map((_, i) => 'F' + (i + 1)).join(',');
-  }
+  if (state.running) { toast('先点「停止」再改音效库', true); return; }
+  const previousCount = state.items.length;
+  applyLibraryEdit(MixerLibrary.appendFiles(state.items, hotkeyList(), picked, makeItem));
+  const added = state.items.length - previousCount;
   render();
   hint(added ? `添加了 ${added} 个音效` : '这些文件已经在列表里了', added ? 'ok' : '');
 });
 el.btnClear.addEventListener('click', () => {
+  if (state.running) { toast('先点「停止」再改音效库', true); return; }
   state.items = []; el.inKeys.value = '';
   render(); hint('已清空音效列表');
 });
@@ -920,12 +1103,26 @@ async function calibrateMic() {
   }
 }
 el.btnRelease.addEventListener('click', async () => {
-  await invoke('release').catch(() => {});
+  const choice = newAudioChoice();
+  try {
+    if (!await confirmedAudio(await invokeAudio('release', {}, choice), choice)) return;
+  } catch (error) {
+    if (choice === audioChoice) toast('释放音频设备失败：' + error, true);
+    return;
+  }
+  if (choice !== audioChoice) return;
   state.running = false;
   state.standby = false;
   state.slots = [];
+  clearPlaybackFeedback();
   syncToggle();
   render();
+  await poll(choice);
+  if (choice !== audioChoice) return;
+  if (state.running || state.standby) {
+    toast('音频状态已被其他操作更新');
+    return;
+  }
   toast('已彻底释放音频设备');
   hint('设备已释放。⚠️ 如果游戏的麦克风还指着虚拟声卡，队友现在听不到你 —— 要么重新「启动」，' +
        '要么把游戏里的麦克风改回真实麦克风。', 'error');
@@ -1070,9 +1267,8 @@ el.inSearch.addEventListener('keydown', e => {
 });
 el.btnSort.addEventListener('click', () => {
   if (state.running) { toast('先点「停止」再排序', true); return; }
-  // 按名称排序会改变位置 → 热键也会跟着走（热键是按位置对应的）
-  state.items.sort((a, b) => a.name.localeCompare(b.name, 'zh'));
-  el.inKeys.value = state.items.map((_, i) => 'F' + (i + 1)).join(',');
+  applyLibraryEdit(MixerLibrary.sort(state.items, hotkeyList(),
+    (a, b) => a.name.localeCompare(b.name, 'zh')));
   render();
   toast('已按名称排序');
 });
@@ -1155,13 +1351,12 @@ async function toggleQr() {
 el.btnSetup.addEventListener('click', () => setSetupOpen(!setupOpen));
 
 async function runSelfTest() {
-  if (state.running) { toast('先点「停止」再自检（两边会抢同一个设备）', true); return; }
   el.btnSelfTest.disabled = true;
   el.btnSelfTest.textContent = '自检中…';
   el.testPanel.className = 'testpanel';
   el.testPanel.innerHTML = '<div class="title">正在送测试音并从环回录回来（约 4 秒）…</div>';
   try {
-    const r = await invoke('self_test', { outputDevice: el.selOut.value || null });
+    const r = await invoke('self_test', { outputDevice: el.selOut.value || null, captureDevice: null });
     const cls = r.passed ? 'ok' : 'bad';
     let html = `<div class="title ${cls}">${r.passed ? '✅' : '❌'} ${esc(r.summary)}</div>`;
     if (r.attempts > 1 && r.passed) {

@@ -30,9 +30,10 @@ else
   fail "格式" "跑 cargo fmt --all"
 fi
 
-CLIPPY_OUT=$(cargo clippy --workspace --all-targets 2>&1)
+CLIPPY_STATUS=0
+CLIPPY_OUT=$(cargo clippy --workspace --all-targets -- -D warnings 2>&1) || CLIPPY_STATUS=$?
 CLIPPY_N=$(echo "$CLIPPY_OUT" | grep -cE "^(warning|error)")
-if [ "$CLIPPY_N" -eq 0 ]; then
+if [ "$CLIPPY_STATUS" -eq 0 ] && [ "$CLIPPY_N" -eq 0 ]; then
   pass "clippy" "0 条"
 else
   fail "clippy" "$CLIPPY_N 条"
@@ -50,14 +51,22 @@ fi
 # ── ② 逻辑 ──
 step "单元测试"
 
-TEST_OUT=$(cargo test --workspace 2>&1)
+TEST_STATUS=0
+TEST_OUT=$(cargo test --workspace 2>&1) || TEST_STATUS=$?
 TEST_N=$(echo "$TEST_OUT" | grep -E "^test result: ok\." | awk '{s+=$4} END {print s+0}')
 TEST_FAIL=$(echo "$TEST_OUT" | grep -cE "^test result: FAILED")
-if [ "$TEST_FAIL" -eq 0 ] && [ "$TEST_N" -gt 0 ]; then
+if [ "$TEST_STATUS" -eq 0 ] && [ "$TEST_FAIL" -eq 0 ] && [ "$TEST_N" -gt 0 ]; then
   pass "单元测试" "$TEST_N 个"
 else
   fail "单元测试" "有失败项"
   echo "$TEST_OUT" | grep -E "^(failures|error)" -A 4 | head -10 | sed 's/^/       /'
+fi
+
+if JS_OUT=$(node --check apps/mixer-gui/dist/main.js && node --check crates/remote/src/control-page.js && node --test tools/test-gui-model.js tools/test-gui-controls.js tools/test-remote-controls.js 2>&1); then
+  pass "GUI 状态、控件与映射回归"
+else
+  fail "GUI 状态、控件与映射回归"
+  echo "$JS_OUT" | tail -12
 fi
 
 if [ "$FAST" -eq 1 ]; then
@@ -70,10 +79,6 @@ fi
 # ── ③ 端到端 ──
 step "端到端（会碰音频设备）"
 
-pkill -f mixer-gui >/dev/null 2>&1
-pkill -f "release/mixer " >/dev/null 2>&1
-sleep 2
-
 # 先打包：后面几项跑的都是 .app 里的那份
 if ./apps/mixer-gui/build-app.sh >/dev/null 2>&1; then
   pass "打包（签名 + DMG）"
@@ -83,8 +88,8 @@ fi
 
 # 冒烟要一个**有内容的**音效目录 —— 自己生成两个正弦 WAV，
 # 不依赖外部工具，也不依赖之前手工留下的临时目录（那个坑吃过一次）
-SMOKE_DIR="/tmp/mixer_check_sounds"
-rm -rf "$SMOKE_DIR" && mkdir -p "$SMOKE_DIR"
+SMOKE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/mixer-check-sounds.XXXXXX")
+trap 'rm -rf "$SMOKE_DIR"' EXIT
 python3 - "$SMOKE_DIR" <<'PYWAV'
 import math, struct, sys, wave, pathlib
 out = pathlib.Path(sys.argv[1])
@@ -100,8 +105,10 @@ for i, (freq, secs) in enumerate([(440.0, 1.0), (880.0, 0.5)]):
         w.writeframes(bytes(frames))
 PYWAV
 
-SMOKE_N=$(./target/release/mixer-gui --smoke --dir "$SMOKE_DIR" 2>&1 | grep -cE "^✅")
-if [ "${SMOKE_N:-0}" -ge 30 ]; then
+SMOKE_STATUS=0
+SMOKE_OUT=$(./target/release/mixer-gui --smoke --dir "$SMOKE_DIR" 2>&1) || SMOKE_STATUS=$?
+SMOKE_N=$(echo "$SMOKE_OUT" | grep -cE "^✅")
+if [ "$SMOKE_STATUS" -eq 0 ] && [ "${SMOKE_N:-0}" -ge 28 ] && echo "$SMOKE_OUT" | grep -q "全部通过；音频播放真实发生"; then
   pass "冒烟" "$SMOKE_N 项"
 else
   fail "冒烟" "只过了 ${SMOKE_N:-0} 项"

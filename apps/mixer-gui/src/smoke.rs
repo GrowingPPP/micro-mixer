@@ -139,6 +139,8 @@ pub fn run(dir: PathBuf) -> Result<()> {
         input_device: None,
         output_device: out_dev,
         files: files.iter().map(|p| p.display().to_string()).collect(),
+        ids: Vec::new(),
+        tags: Vec::new(),
         gains: vec![0.0; files.len()],
         // 顺手覆盖"自定义显示名"这条路径：第一个音效改名，验证引擎用的是它
         names: {
@@ -351,7 +353,7 @@ pub fn run(dir: PathBuf) -> Result<()> {
     // 说明：**"设备真的消失"这一半没法自动化**（总不能让脚本去拔你的耳机）。
     // 这里验的是另一半 —— 设备都在时不能误报，以及报警状态能正确传到界面上。
     {
-        if let Some((i, o, n)) = host.check_devices() {
+        if let Some((_, i, o, n)) = host.check_devices() {
             bail!("设备都在的情况下误报了掉线：in_lost={i} out_lost={o} 「{n}」");
         }
         println!("✅ 热插拔检测        设备正常时不误报");
@@ -426,10 +428,11 @@ pub fn run(dir: PathBuf) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(300));
 
         // 注入一条"输入侧失效" —— 应当被判定为麦克风掉线
-        backend_cpal::report_stream_error("输入", "自测注入：设备已失效");
+        let health = host.session_health().context("没有运行中的会话")?;
+        health.report_error("输入", "自测注入：设备已失效");
         let r = host.check_devices();
         match r {
-            Some((in_lost, out_lost, which)) => {
+            Some((_, in_lost, out_lost, which)) => {
                 if !in_lost || out_lost {
                     bail!("判定方向错了：in_lost={in_lost} out_lost={out_lost}");
                 }
@@ -438,19 +441,19 @@ pub fn run(dir: PathBuf) -> Result<()> {
             None => bail!("流报错没有被判定为设备掉线"),
         }
         // 信号只能消费一次 —— 否则会一直误报
-        if backend_cpal::take_stream_error().is_some() {
+        if health.take_error().is_some() {
             bail!("流错误信号被重复消费了，会一直误报掉线");
         }
 
         // 反向：输出侧
-        backend_cpal::report_stream_error("输出", "自测注入：设备已失效");
+        health.report_error("输出", "自测注入：设备已失效");
         match host.check_devices() {
-            Some((in_lost, out_lost, _)) if !in_lost && out_lost => {
+            Some((_, in_lost, out_lost, _)) if !in_lost && out_lost => {
                 println!("✅ 设备掉线检测      输出侧也能正确判定");
             }
             other => bail!("输出侧的判定不对：{other:?}"),
         }
-        backend_cpal::take_stream_error();
+        health.take_error();
         host.release();
     }
 
@@ -494,13 +497,12 @@ pub fn run(dir: PathBuf) -> Result<()> {
         }
         // panic 之后回调还会被继续调用几轮，给它一点时间置位
         std::thread::sleep(std::time::Duration::from_millis(400));
-        if !backend_cpal::engine_panicked() {
+        if !host.audio_progress().3 {
             bail!("回调 panic 没有被标记 —— 引擎状态会被当成可信的继续用");
         }
         println!("✅ 回调 panic 兜底      panic 被就地兜住、已标记引擎不可信（进程仍存活）");
 
         // 恢复到干净状态，别影响后面的检查
-        backend_cpal::clear_engine_panic();
         host.release();
     }
 

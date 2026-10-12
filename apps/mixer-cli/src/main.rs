@@ -17,14 +17,28 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use audio_core::decode::decode_file;
-use audio_core::device::{AudioBackend, DeviceId, Direction, StreamFormat};
-use audio_core::engine::{EngineParts, PlaybackControl, SfxSlot};
+use audio_core::device::{AudioBackend, Direction, StreamFormat, StreamHealth};
+use audio_session::{
+    resolve_device, DumpOptions, Library, MonitorOptions, Playback, Session, SessionOptions,
+    SoundSpec,
+};
 use backend_cpal::CpalBackend;
 use hotkeys::Hotkeys;
 
 use app_config::Config;
 use remote as remote_ctl;
+
+fn take_monitor_warning(health: &StreamHealth, warned: &mut bool) -> Option<String> {
+    let error = health.take_error();
+    if *warned {
+        return None;
+    }
+    let reason = error.or_else(|| health.panicked().then(|| "监听音频回调发生 panic".into()))?;
+    *warned = true;
+    Some(format!(
+        "[监听] ⚠ 监听音频异常：{reason}。自己听到的音效可能中断；麦克风与虚拟声卡主链路继续运行。"
+    ))
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -55,6 +69,9 @@ enum Cmd {
         /// 虚拟设备名，省略则自动探测
         #[arg(short, long)]
         device: Option<String>,
+        /// 环回录音端点，省略时自动匹配；VB-CABLE 通常为 CABLE Output
+        #[arg(long)]
+        capture: Option<String>,
         /// 测试音频率
         #[arg(long, default_value_t = 440.0)]
         freq: f32,
@@ -135,9 +152,7 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
-    // ⚠️ 必须在**主线程**登记一次（也就是这里）。
-    // Windows 上热键的隐藏窗口必须建在跑消息循环的线程上。
-    // 不登记的代价是热键**静默失效**（按了没反应，也不报错）。
+    // macOS Carbon 管理器要求主线程；Windows 管理器由 hotkeys 的消息线程拥有。
     hotkeys::note_main_thread();
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("warn,symphonia=off"),
@@ -149,7 +164,12 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::List => list_devices(&backend),
         Cmd::Doctor => cmd_doctor(&backend),
-        Cmd::Selftest { device, freq, secs } => cmd_selftest(&backend, device, freq, secs),
+        Cmd::Selftest {
+            device,
+            capture,
+            freq,
+            secs,
+        } => cmd_selftest(&backend, device, capture, freq, secs),
         Cmd::Config { args } => cmd_config(&args),
         Cmd::HotkeyTest { keys } => hotkey_test(keys),
         Cmd::Passthrough {
@@ -161,17 +181,20 @@ fn main() -> Result<()> {
             let cfg = Config::load();
             run(
                 &backend,
-                input.or(cfg.input_device),
-                output.or(cfg.output_device),
-                Vec::new(),
-                None,
-                false,
-                0.0,
-                0.0,
-                false,
-                buffer_ms,
-                duration,
-                None,
+                RunOptions {
+                    input: input.or(cfg.input_device),
+                    output: output.or(cfg.output_device),
+                    specs: Vec::new(),
+                    looping: false,
+                    mic_gain: 0.0,
+                    sfx_gain: 0.0,
+                    normalize: false,
+                    buffer_ms,
+                    duration,
+                    remote: None,
+                    monitor: false,
+                    monitor_device: None,
+                },
             )
         }
         Cmd::Play {
@@ -191,44 +214,32 @@ fn main() -> Result<()> {
         } => {
             let cfg = Config::load();
 
-            // 音效来源优先级：--file/--dir > 配置里的 sound_dirs
             let mut files = file;
             if let Some(d) = dir {
                 files.extend(collect_audio_files(&d)?);
             }
-            if files.is_empty() {
-                files = cfg.collect_sounds()?;
-            }
-            if files.is_empty() {
+            let specs = playback_specs(&cfg, &files, hotkeys.as_deref())?;
+            if specs.is_empty() {
                 anyhow::bail!(
-                    "没有音效。三种做法任选：\n  \
-                     · mixer play --file 笑.mp3\n  \
-                     · mixer play --dir ~/Sounds\n  \
-                     · mixer config set sound_dirs ~/Sounds   （之后直接 `mixer play`）"
+                    "没有音效。可用 mixer play --file 笑.mp3 或 mixer play --dir ~/Sounds；也可先设置 sound_dirs。"
                 );
             }
-
-            let hotkeys = hotkeys.or_else(|| {
-                if cfg.hotkeys.is_empty() {
-                    None
-                } else {
-                    Some(cfg.hotkeys.join(","))
-                }
-            });
-
             run(
                 &backend,
-                input.or(cfg.input_device),
-                output.or(cfg.output_device),
-                files,
-                hotkeys,
-                r#loop,
-                mic_gain.or(cfg.mic_gain_db).unwrap_or(0.0),
-                sfx_gain.or(cfg.sfx_gain_db).unwrap_or(-6.0),
-                normalize,
-                buffer_ms.or(cfg.buffer_ms).unwrap_or(20),
-                duration,
-                remote.map(|port| (port, remote_bind)),
+                RunOptions {
+                    input: input.or(cfg.input_device),
+                    output: output.or(cfg.output_device),
+                    specs,
+                    looping: r#loop,
+                    mic_gain: mic_gain.or(cfg.mic_gain_db).unwrap_or(0.0),
+                    sfx_gain: sfx_gain.or(cfg.sfx_gain_db).unwrap_or(-6.0),
+                    normalize,
+                    buffer_ms: buffer_ms.or(cfg.buffer_ms).unwrap_or(20),
+                    duration,
+                    remote: remote.map(|port| (port, remote_bind)),
+                    monitor: cfg.monitor,
+                    monitor_device: cfg.monitor_device,
+                },
             )
         }
     }
@@ -309,7 +320,7 @@ fn hotkey_test(keys: Option<String>) -> Result<()> {
              macOS 的 Carbon 热键事件由主线程运行循环派发，在别的线程创建会静默失效。"
         );
     }
-    println!("  ✓ 主线程检查通过（macOS 要求热键管理器在主线程创建）");
+    println!("  ✓ 热键事件线程检查通过");
 
     let hk = Hotkeys::bind_to_slots(&specs).context("热键绑定失败")?;
     for (spec, slot) in hk.bindings() {
@@ -317,10 +328,13 @@ fn hotkey_test(keys: Option<String>) -> Result<()> {
     }
     println!("\n  现在按一下上面任意一个键。本程序会打印收到的时间。");
     println!();
-    println!("  ⚠️ MacBook 键盘注意：F1~F12 默认是媒体键（亮度/音量），");
-    println!("     必须**按住 fn** 才是真正的 F1。若 fn+F1 仍无反应，可以：");
-    println!("       · 系统设置 → 键盘 → 键盘快捷键 → 功能键 → 把 F1/F2 用作标准功能键");
-    println!("       · 或者改用组合键，例如 --keys \"Cmd+Shift+1,Cmd+Shift+2\"");
+    #[cfg(target_os = "macos")]
+    {
+        println!("  ⚠️ MacBook 键盘注意：F1~F12 默认是媒体键（亮度/音量），");
+        println!("     必须按住 fn 才是真正的 F1。若 fn+F1 仍无反应，可以：");
+        println!("       · 系统设置 → 键盘 → 键盘快捷键 → 功能键 → 把 F1/F2 用作标准功能键");
+        println!("       · 或者改用组合键，例如 --keys \"Cmd+Shift+1,Cmd+Shift+2\"");
+    }
     println!("  先在这里试；再到游戏里（全屏）试 —— 有些游戏会吞掉全局热键。");
 
     // 轮询放**工作线程** —— 主线程必须腾出来跑应用事件循环。
@@ -330,9 +344,7 @@ fn hotkey_test(keys: Option<String>) -> Result<()> {
     let names = specs;
     // ⚠️ 只把 **poller** 移进线程，`hk` 本身留在主线程作用域里活着。
     //
-    // 原因：`Hotkeys` 持有 `GlobalHotKeyManager`，而它在 **Windows 上不是 `Send`**
-    // （就是个 `HWND`，Drop 还会跨线程 `DestroyWindow`）。但事件走的是
-    // global-hotkey 的全局通道，轮询线程压根不需要管理器 —— 拿 poller 就够。
+    // macOS 管理器保持在主线程；Windows 的原生窗口已由专属线程管理。
     let poller = hk.poller();
     std::thread::Builder::new()
         .name("hotkey-poll".into())
@@ -357,7 +369,7 @@ fn hotkey_test(keys: Option<String>) -> Result<()> {
             }
         })?;
 
-    println!("  主线程正在运行 macOS 应用事件循环（热键能收到的前提）。");
+    println!("  正在运行平台热键事件循环。");
     println!("  Ctrl-C 退出。\n");
     hotkeys::run_app_event_loop();
     Ok(())
@@ -498,9 +510,15 @@ fn cmd_doctor(backend: &CpalBackend) -> Result<()> {
     Ok(())
 }
 
-fn cmd_selftest(backend: &CpalBackend, device: Option<String>, freq: f32, secs: f32) -> Result<()> {
+fn cmd_selftest(
+    backend: &CpalBackend,
+    device: Option<String>,
+    capture: Option<String>,
+    freq: f32,
+    secs: f32,
+) -> Result<()> {
     // 自动重试：这块虚拟声卡偶发抽风，重开一次流通常就好
-    let r = selftest::run_with_retry(backend, device, freq, secs, 3)?;
+    let r = selftest::run_with_capture_retry(backend, device, capture, freq, secs, 3)?;
 
     println!("\n═══ 端到端自检 ═══");
     println!("  虚拟设备 : {}", r.device);
@@ -508,7 +526,7 @@ fn cmd_selftest(backend: &CpalBackend, device: Option<String>, freq: f32, secs: 
         "  送入信号 : {} Hz 正弦，{} 秒（@{}Hz）",
         r.freq_sent, r.secs_sent, r.sample_rate
     );
-    println!("  录音来源 : 同一设备的环回输入侧\n");
+    println!("  录音来源 : 已配对的环回录音端点\n");
     let peak_txt = if r.captured_peak_db.is_finite() {
         format!("{:.1} dBFS", r.captured_peak_db)
     } else {
@@ -519,7 +537,9 @@ fn cmd_selftest(backend: &CpalBackend, device: Option<String>, freq: f32, secs: 
         r.played_frames,
         r.played_frames as f32 / r.sample_rate as f32,
         r.captured_samples,
-        r.captured_samples as f32 / 2.0 / r.sample_rate as f32,
+        r.captured_samples as f32
+            / r.capture_format.ch() as f32
+            / r.capture_format.sample_rate as f32,
         peak_txt,
         r.capture_drops
     );
@@ -587,22 +607,20 @@ fn list_devices(b: &CpalBackend) -> Result<()> {
                 "  {:<44} {}Hz/{}ch{}",
                 d.name, d.default_sample_rate, d.max_channels, tag
             );
+            println!("    标识: {}", d.id);
         }
         println!();
     }
-    println!("提示：虚拟声卡在输入侧和输出侧各是一个设备，名字通常相同。\n");
+    println!("提示：同名端点用标识选择。VB-CABLE 输出为 CABLE Input，录音为 CABLE Output。\n");
     Ok(())
 }
 
 // ─────────────────────────────────────────── 主流程
 
-#[allow(clippy::too_many_arguments)]
-fn run(
-    b: &CpalBackend,
+struct RunOptions {
     input: Option<String>,
     output: Option<String>,
-    files: Vec<PathBuf>,
-    hotkey_spec: Option<String>,
+    specs: Vec<SoundSpec>,
     looping: bool,
     mic_gain: f32,
     sfx_gain: f32,
@@ -610,14 +628,96 @@ fn run(
     buffer_ms: u32,
     duration: Option<u64>,
     remote: Option<(u16, String)>,
-) -> Result<()> {
-    // 1. 解析设备
+    monitor: bool,
+    monitor_device: Option<String>,
+}
+
+/// 在加载前把路径、身份、增益与热键装成条目，避免过滤坏文件后再用位置拼接。
+fn playback_specs(
+    cfg: &Config,
+    files: &[PathBuf],
+    hotkey_override: Option<&str>,
+) -> Result<Vec<SoundSpec>> {
+    let entries = cfg.sound_entries();
+    let paths = if files.is_empty() {
+        cfg.collect_sounds()?
+    } else {
+        files.to_vec()
+    };
+    let configured_files = files.is_empty() && !cfg.sound_files.is_empty();
+    let mut specs: Vec<_> = paths
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(i, file)| {
+            let occurrence = paths[..i].iter().filter(|p| **p == file).count();
+            let entry = if configured_files {
+                entries.get(i)
+            } else {
+                entries.iter().filter(|e| e.path == file).nth(occurrence)
+            };
+            let hotkey = entry
+                .map(|e| e.hotkey.clone())
+                .unwrap_or_else(|| cfg.hotkeys.get(i).cloned().unwrap_or_default());
+            SoundSpec {
+                id: entry
+                    .map(|e| e.id.clone())
+                    .unwrap_or_else(|| format!("cli-{i}-{}", file.display())),
+                name: entry.map(|e| e.name.clone()).unwrap_or_default(),
+                gain_db: entry.map_or(0.0, |e| e.gain_db),
+                tags: entry.map(|e| e.tags.clone()).unwrap_or_default(),
+                hotkey: if cfg.hotkeys.is_empty() && hotkey.is_empty() && i < 12 {
+                    format!("F{}", i + 1)
+                } else {
+                    hotkey
+                },
+                file,
+            }
+        })
+        .collect();
+    if let Some(keys) = hotkey_override {
+        // 空键位保留在原槽位上，可显式禁用；数量按源文件而不是加载成功数量校验。
+        let keys: Vec<_> = keys.split(',').map(str::trim).collect();
+        anyhow::ensure!(
+            keys.len() == specs.len(),
+            "热键数量（{}）与源音效数量（{}）不一致",
+            keys.len(),
+            specs.len()
+        );
+        for (spec, key) in specs.iter_mut().zip(keys) {
+            spec.hotkey = key.to_owned();
+        }
+    }
+    Ok(specs)
+}
+
+fn run(b: &CpalBackend, options: RunOptions) -> Result<()> {
+    let RunOptions {
+        input,
+        output,
+        specs,
+        looping,
+        mic_gain,
+        sfx_gain,
+        normalize,
+        buffer_ms,
+        duration,
+        remote,
+        monitor,
+        monitor_device,
+    } = options;
+    // 1. 名称先解析为稳定标识，比较与开流都使用同一端点身份。
+    let devices = b.devices()?;
     let in_id = match input {
-        Some(n) => DeviceId::new(n),
+        Some(n) => {
+            resolve_device(&devices, &n, Direction::Input)?.context("指定的输入端点不存在")?
+        }
         None => b.default_input().context("系统没有默认输入设备")?,
     };
     let out_id = match output {
-        Some(n) => DeviceId::new(n),
+        Some(n) => {
+            resolve_device(&devices, &n, Direction::Output)?.context("指定的输出端点不存在")?
+        }
         None => b
             .guess_virtual_output()
             .context("没探测到虚拟声卡，请用 --output 指定。先跑 `mixer list` 看看")?,
@@ -645,102 +745,70 @@ fn run(
         );
     }
 
-    // 3. 解码所有音效（非实时线程，可以慢）
-    let mut slots: Vec<SfxSlot> = Vec::new();
-    // ⚠️ 单个坏文件不能拖垮整批：网上下的素材里混着空文件/截断文件/其实是网页的 .mp3
-    //    太常见了。早期版本遇到第一个就 `?` 返回，整个音效板起不来。
-    let mut skipped: Vec<(String, String)> = Vec::new();
-    for p in &files {
-        let t0 = Instant::now();
-        let mut audio = match decode_file(p, out_fmt.sample_rate) {
-            Ok(a) => a,
-            Err(e) => {
-                let name = p
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let reason = e
-                    .chain()
-                    .last()
-                    .map(|c| c.to_string())
-                    .unwrap_or_else(|| e.to_string());
-                println!("  ⏭  跳过 {name}：{reason}");
-                skipped.push((name, reason));
-                continue;
-            }
-        };
-        if audio.frames() == 0 {
-            let name = p
-                .file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default();
-            println!("  ⏭  跳过 {name}：文件里没有音频数据");
-            skipped.push((name, "文件里没有音频数据".into()));
-            continue;
-        }
-        if normalize {
-            audio.normalize_peak(0.708); // -3 dBFS
-        }
-        let name = p
-            .file_stem()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "未命名".into());
-        println!(
-            "  ✅ [{}] {:<26} {:.2}秒  峰值 {:>5.1}dBFS  解码 {}ms",
-            slots.len() + 1,
-            truncate(&name, 26),
-            audio.duration_secs,
-            20.0 * audio.peak().max(1e-9).log10(),
-            t0.elapsed().as_millis()
-        );
-        slots.push(SfxSlot::from_decoded(name, &audio, looping));
+    // 3. GUI 和 CLI 使用同一个加载器；坏文件及其所有关联元数据一起过滤。
+    let library = Library::load(&specs, out_fmt.sample_rate, looping, normalize);
+    for (name, reason) in &library.skipped {
+        println!("  ⏭  跳过 {name}：{reason}");
     }
-    if slots.is_empty() {
+    if !specs.is_empty() && library.slots.is_empty() {
         anyhow::bail!(
             "这 {} 个文件全都无法解码。第一个原因：{}",
-            files.len(),
-            skipped.first().map(|(_, r)| r.as_str()).unwrap_or("未知")
+            specs.len(),
+            library
+                .skipped
+                .first()
+                .map(|(_, r)| r.as_str())
+                .unwrap_or("未知")
         );
     }
-    if !skipped.is_empty() {
+    for (i, meta) in library.meta.iter().enumerate() {
         println!(
-            "\n  ⚠ {} 个文件被跳过（共 {} 个可用）—— 不影响其余音效使用",
-            skipped.len(),
-            slots.len()
+            "  ✅ [{}] {:<26} {:.2}秒  峰值 {:>5.1}dBFS  增益 {:>5.1}dB",
+            i + 1,
+            truncate(&meta.spec.name, 26),
+            meta.duration_secs,
+            meta.peak_db,
+            meta.spec.gain_db
         );
     }
-    let slot_names: Vec<String> = slots.iter().map(|s| s.name.clone()).collect();
-
-    // 4. 绑定全局热键
-    let specs: Vec<String> = match &hotkey_spec {
-        Some(s) => s
-            .split(',')
-            .map(|x| x.trim().to_string())
-            .filter(|x| !x.is_empty())
-            .collect(),
-        None if !slots.is_empty() => (1..=slots.len()).map(|i| format!("F{i}")).collect(),
-        None => Vec::new(),
+    let slot_names: Vec<_> = library.meta.iter().map(|m| m.spec.name.clone()).collect();
+    let keys: Vec<_> = library.meta.iter().map(|m| m.spec.hotkey.clone()).collect();
+    // 监听使用其自身协商格式；持久流与主流由同一会话拥有。
+    let monitor_options = if monitor && !library.slots.is_empty() {
+        let device = match monitor_device {
+            Some(name) => {
+                resolve_device(&devices, &name, Direction::Output)?.context("监听端点不存在")?
+            }
+            None => b.default_output().context("系统没有监听输出设备")?,
+        };
+        anyhow::ensure!(
+            device != out_id,
+            "监听设备不能与虚拟输出相同，否则音效会被叠加两次；请设置 monitor_device"
+        );
+        let format = b.output_format(&device, Some(StreamFormat::stereo(out_fmt.sample_rate)))?;
+        Some(MonitorOptions {
+            device,
+            format,
+            slots: library.monitor_slots(out_fmt.sample_rate, format.sample_rate),
+        })
+    } else {
+        None
     };
+
+    // 4. 已成功加载条目的键位已经随元数据过滤，空键位可以单独禁用。
     // RAII 保活：`Hotkeys` 一旦 Drop 就会注销所有热键，所以它必须活到程序结束。
     // 下划线开头是**故意的** —— 这个变量就是不该被读，它的作用只是"别被释放"。
     let mut _hotkey_owner: Option<Hotkeys> = None;
-    let hotkeys = if specs.is_empty() {
-        None
-    } else if specs.len() != slots.len() {
-        println!(
-            "  ⚠ 热键数量（{}）与音效数量（{}）不一致，跳过热键绑定",
-            specs.len(),
-            slots.len()
-        );
+    let hotkeys = if keys.iter().all(|k| k.is_empty()) {
         None
     } else {
-        match Hotkeys::bind_to_slots(&specs) {
+        match Hotkeys::bind_to_slots(&keys) {
             Ok(h) => {
                 println!("\n  全局热键已绑定：");
                 for (spec, slot) in h.bindings() {
                     println!("    {:<18} → [{}] {}", spec, slot + 1, slot_names[*slot]);
                 }
-                // 线程只拿 poller（Windows 上 `Hotkeys` 不是 Send）
+                // 轮询线程只拿事件句柄，原生管理器保持平台要求的所有权。
                 let poller = Arc::new(h.poller());
                 // ⚠️ 管理器必须**一直活着** —— Drop 会注销所有热键。
                 //    存进外层变量，别让它在这个 match 分支结束时就掉了。
@@ -755,78 +823,44 @@ fn run(
         }
     };
 
-    // 5. 组装引擎
-    let parts = EngineParts::build(in_fmt, out_fmt, slots, buffer_ms);
-    let control = parts.control.clone();
-    let stats = parts.stats.clone();
-    control.mic_gain_db.set(mic_gain);
-    control.sfx_gain_db.set(sfx_gain);
-
-    let mut capture = parts.capture;
-    let mut render = parts.render;
-
-    // 6. 开流 —— **先输出后输入**。
-    //    顺序很关键：输出侧先跑起来开始消费，输入侧才开始生产；
-    //    反过来的话启动那一瞬输入会把环形缓冲灌满，导致持续溢出。
-    // 诊断：MIXER_DUMP=/tmp/x.f32 可把交给声卡的原始数据存下来
-    let dump_path = std::env::var("MIXER_DUMP").ok();
-    let dump_limit: usize = std::env::var("MIXER_DUMP_FRAMES")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(48_000 * 6);
-    let mut dump_w = dump_path
-        .as_ref()
-        .and_then(|p| std::fs::File::create(p).ok())
-        .map(std::io::BufWriter::new);
-    let mut dumped = 0usize;
-
-    let out_stream = b.open_output(
-        &out_id,
-        Some(out_fmt),
-        Box::new(move |data: &mut [f32]| {
-            render.process(data);
-            if let Some(w) = dump_w.as_mut() {
-                if dumped < dump_limit {
-                    use std::io::Write;
-                    for s in data.iter() {
-                        let _ = w.write_all(&s.to_le_bytes());
-                    }
-                    dumped += data.len();
-                }
-            }
-        }),
+    // 5. 共用会话负责设备线程、格式契约、监听和统一播放控制。
+    let dump = std::env::var_os("MIXER_DUMP").map(|path| DumpOptions {
+        path: PathBuf::from(path),
+        max_frames: std::env::var("MIXER_DUMP_FRAMES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(out_fmt.sample_rate as usize * 6),
+    });
+    let session = Session::open_with_dump(
+        SessionOptions {
+            input: in_id,
+            output: out_id,
+            input_format: in_fmt,
+            output_format: out_fmt,
+            buffer_ms,
+            slots: library.slots,
+            mic_gain_db: mic_gain,
+            sfx_gain_db: sfx_gain,
+            monitor: monitor_options,
+        },
+        dump,
     )?;
-    let in_stream = b.open_input(
-        &in_id,
-        Some(in_fmt),
-        Box::new(move |data: &[f32]| capture.process(data)),
-    )?;
-
-    if in_stream.format() != in_fmt {
-        println!(
-            "  ⚠ 实际输入格式 {} 与预期 {} 不一致",
-            in_stream.format(),
-            in_fmt
-        );
-    }
-    if out_stream.format() != out_fmt {
-        println!(
-            "  ⚠ 实际输出格式 {} 与预期 {} 不一致",
-            out_stream.format(),
-            out_fmt
-        );
-    }
+    let control = session.playback.clone();
+    let stats = session.stats.clone();
+    let monitor_health = session.monitor_health.clone();
+    let mut remote_shared = None;
 
     // 手机遥控（可选）
     if let Some((port, bind)) = remote {
         let shared = Arc::new(remote_ctl::Shared::default());
-        shared.set(control.clone(), slot_names.clone());
+        configure_remote(&shared, &control, slot_names.clone());
         let self_exe = std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "mixer".into());
         let bind_all = bind == "0.0.0.0";
-        match remote_ctl::serve(shared, remote_ctl::RemoteConfig { port, bind }) {
+        match remote_ctl::serve(shared.clone(), remote_ctl::RemoteConfig { port, bind }) {
             Ok(urls) => {
+                remote_shared = Some(shared);
                 println!("\n  📱 手机遥控已开启（热键被游戏吞掉时的兜底）：");
                 for u in &urls {
                     println!("     {u}");
@@ -859,14 +893,19 @@ fn run(
     let stats_t = stats.clone();
     let steady_t = steady.clone();
     let names_t = slot_names.clone();
+    let monitor_health_t = monitor_health.clone();
     let t_start = Instant::now();
     let stats_handle = std::thread::spawn(move || {
         let mut last = (0u64, 0u64, 0u64);
         let mut warmup = true;
+        let mut monitor_warned = false;
         while running_t.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(1000));
             if !running_t.load(Ordering::Relaxed) {
                 break;
+            }
+            if let Some(warning) = take_monitor_warning(&monitor_health_t, &mut monitor_warned) {
+                println!("  {warning}");
             }
             let s = stats_t.snapshot();
             let d_cap = s.captured_frames.saturating_sub(last.0);
@@ -880,7 +919,7 @@ fn run(
             steady_t.0.fetch_add(d_run, Ordering::Relaxed);
             steady_t.1.fetch_add(d_ovr, Ordering::Relaxed);
 
-            let fill_ms = s.ring_fill as f32 / 2.0 / 48.0;
+            let fill_ms = frames_to_secs(s.ring_fill as u64 / 2, out_fmt.sample_rate) * 1000.0;
             let play = if names_t.is_empty() {
                 String::new()
             } else if s.playing && s.active_slot >= 0 {
@@ -888,7 +927,10 @@ fn run(
                     .get(s.active_slot as usize)
                     .map(|s| s.as_str())
                     .unwrap_or("?");
-                format!("▶ {n} {:.1}s", s.playhead as f32 / 48_000.0)
+                format!(
+                    "▶ {n} {:.1}s",
+                    frames_to_secs(s.playhead, out_fmt.sample_rate)
+                )
             } else {
                 "■ 待机".to_string()
             };
@@ -898,6 +940,7 @@ fn run(
                 s.limiter_gain_db
             );
         }
+        monitor_warned
     });
 
     // 8. 事件循环（同时轮询热键与终端输入）
@@ -914,13 +957,12 @@ fn run(
             let ctl = control;
             let has = !slot_names.is_empty();
             let run2 = running.clone();
-            std::thread::Builder::new()
+            let events = std::thread::Builder::new()
                 .name("cmd-loop".into())
                 .spawn(move || event_loop(ctl, Some(hk), has, duration, run2))?;
             hotkeys::run_app_event_loop();
             APP_LOOP_USED.store(false, Ordering::Relaxed);
-            // 工作线程退出后会自己结束；这里只需知道用户是不是主动退出的
-            running.load(Ordering::Relaxed) || duration.is_some()
+            events.join().unwrap_or(false)
         }
         None => event_loop(
             control,
@@ -932,9 +974,14 @@ fn run(
     };
 
     running.store(false, Ordering::Relaxed);
-    drop(in_stream);
-    drop(out_stream);
-    let _ = stats_handle.join();
+    if let Some(shared) = remote_shared {
+        shared.clear();
+    }
+    drop(session);
+    let mut monitor_warned = stats_handle.join().unwrap_or(false);
+    if let Some(warning) = take_monitor_warning(&monitor_health, &mut monitor_warned) {
+        println!("  {warning}");
+    }
 
     let s = stats.snapshot();
     let elapsed = t_start.elapsed().as_secs_f32();
@@ -963,7 +1010,8 @@ fn run(
     }
     if s.captured_frames > 0 {
         let ratio = s.rendered_frames as f64 / s.captured_frames as f64;
-        println!("  渲染/采集比     : {ratio:.4}   （稳态下应≈1.0；含启动瞬态时略偏大是正常的）");
+        let expected = out_fmt.sample_rate as f64 / in_fmt.sample_rate as f64;
+        println!("  渲染/采集比     : {ratio:.4}   （按实际采样率稳态应≈{expected:.4}；含启动瞬态时略偏大）");
     }
     if quit {
         println!("\n已退出。");
@@ -971,9 +1019,24 @@ fn run(
     Ok(())
 }
 
+fn configure_remote(shared: &remote_ctl::Shared, playback: &Arc<Playback>, names: Vec<String>) {
+    let play = playback.clone();
+    let stop = playback.clone();
+    shared.set_routed(
+        playback.control.clone(),
+        names,
+        Arc::new(move |slot| play.play(slot)),
+        Arc::new(move || stop.stop_all()),
+    );
+}
+
+fn frames_to_secs(frames: u64, sample_rate: u32) -> f32 {
+    frames as f32 / sample_rate.max(1) as f32
+}
+
 /// 事件循环：同时处理**全局热键**与终端输入。
 fn event_loop(
-    control: Arc<PlaybackControl>,
+    control: Arc<Playback>,
     hotkeys: Option<Arc<hotkeys::HotkeyPoller>>,
     has_slots: bool,
     duration: Option<u64>,
@@ -995,7 +1058,7 @@ fn app_loop_used() -> bool {
 }
 
 fn event_loop_inner(
-    control: Arc<PlaybackControl>,
+    control: Arc<Playback>,
     hotkeys: Option<Arc<hotkeys::HotkeyPoller>>,
     has_slots: bool,
     duration: Option<u64>,
@@ -1070,7 +1133,7 @@ fn event_loop_inner(
                                 println!("  没有第 {n} 个音效");
                             }
                         } else if let Ok(db) = other.parse::<f32>() {
-                            control.sfx_gain_db.set(db);
+                            control.set_gains(control.control.mic_gain_db.get(), db);
                             println!("  🔊 音效增益 → {db} dB");
                         } else {
                             println!("  未知命令「{other}」。数字=播放  s=停止  q=退出");
@@ -1105,5 +1168,178 @@ fn truncate(s: &str, max: usize) -> String {
             "{}…",
             chars[..max.saturating_sub(1)].iter().collect::<String>()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use audio_core::engine::{EngineParts, SfxSlot};
+
+    #[test]
+    fn 监听流错误只提示一次且不改变主流健康状态() {
+        let monitor_health = StreamHealth::default();
+        let primary_health = StreamHealth::default();
+        let mut warned = false;
+        assert!(take_monitor_warning(&monitor_health, &mut warned).is_none());
+        monitor_health.report_error("输出", "监听设备已断开");
+        let warning = take_monitor_warning(&monitor_health, &mut warned).unwrap();
+        assert!(warning.contains("监听设备已断开"));
+        assert!(warning.contains("主链路继续运行"));
+        monitor_health.report_error("输出", "仍未恢复");
+        monitor_health.mark_panicked();
+        assert!(take_monitor_warning(&monitor_health, &mut warned).is_none());
+        assert!(monitor_health.take_error().is_none());
+        assert!(!primary_health.panicked());
+        assert!(primary_health.take_error().is_none());
+    }
+
+    #[test]
+    fn 监听流只有_panic_标志时也必须单次提示() {
+        let health = StreamHealth::default();
+        health.mark_panicked();
+        let mut warned = false;
+        assert!(take_monitor_warning(&health, &mut warned)
+            .unwrap()
+            .contains("panic"));
+        assert!(take_monitor_warning(&health, &mut warned).is_none());
+    }
+
+    fn configured_sounds() -> Config {
+        Config {
+            sound_files: vec!["bad.wav".into(), "good.wav".into()],
+            sound_ids: vec!["bad-id".into(), "good-id".into()],
+            sound_names: vec!["坏音效".into(), "有效音效".into()],
+            sound_gains: vec![12.0, -20.0],
+            sound_tags: vec![String::new(), "B-only".into()],
+            hotkeys: vec!["F1".into(), "F2".into()],
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn 配置播放必须保留条目的身份增益名称标签和热键() {
+        let specs = playback_specs(&configured_sounds(), &[], None).unwrap();
+        assert_eq!(specs[1].id, "good-id");
+        assert_eq!(specs[1].name, "有效音效");
+        assert_eq!(specs[1].gain_db, -20.0);
+        assert_eq!(specs[1].tags, ["B-only"]);
+        assert_eq!(specs[1].hotkey, "F2");
+        let selected = playback_specs(&configured_sounds(), &["good.wav".into()], None).unwrap();
+        assert_eq!(selected[0].id, "good-id");
+        assert_eq!(
+            selected[0].hotkey, "F2",
+            "显式选取文件必须按文件身份关联配置"
+        );
+    }
+
+    #[test]
+    fn 空热键应保持原槽位且覆盖数量按源文件校验() {
+        let specs = playback_specs(&configured_sounds(), &[], Some(",F8")).unwrap();
+        assert!(specs[0].hotkey.is_empty());
+        assert_eq!(specs[1].hotkey, "F8");
+        assert!(playback_specs(&configured_sounds(), &[], Some("F8")).is_err());
+        let mut cfg = configured_sounds();
+        cfg.hotkeys = vec![String::new(), "F2".into()];
+        assert!(playback_specs(&cfg, &[], None).unwrap()[0]
+            .hotkey
+            .is_empty());
+    }
+
+    #[test]
+    fn 坏文件过滤必须同时保留正确条目和键位() {
+        let dir = std::env::temp_dir().join(format!("mixer-cli-load-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = dir.join("good.wav");
+        let frames = 80u32;
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&(36 + frames * 2).to_le_bytes());
+        wav.extend_from_slice(b"WAVEfmt ");
+        wav.extend_from_slice(&16u32.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&1u16.to_le_bytes());
+        wav.extend_from_slice(&8000u32.to_le_bytes());
+        wav.extend_from_slice(&16000u32.to_le_bytes());
+        wav.extend_from_slice(&2u16.to_le_bytes());
+        wav.extend_from_slice(&16u16.to_le_bytes());
+        wav.extend_from_slice(b"data");
+        wav.extend_from_slice(&(frames * 2).to_le_bytes());
+        for _ in 0..frames {
+            wav.extend_from_slice(&1000i16.to_le_bytes());
+        }
+        std::fs::write(&good, wav).unwrap();
+        let mut cfg = configured_sounds();
+        cfg.sound_files = vec![dir.join("missing.wav"), good];
+        let specs = playback_specs(&cfg, &[], Some("F7,F8")).unwrap();
+        let library = Library::load(&specs, 48_000, false, false);
+        let _ = std::fs::remove_dir_all(dir);
+        assert_eq!(library.slots.len(), 1);
+        assert_eq!(library.meta[0].source_index, 1);
+        assert_eq!(library.meta[0].spec.id, "good-id");
+        assert_eq!(library.meta[0].spec.hotkey, "F8");
+        assert_eq!(library.meta[0].spec.gain_db, -20.0);
+        assert_eq!(library.slots[0].name, "有效音效");
+        assert_eq!(library.slots[0].gain_db, -20.0);
+    }
+
+    #[test]
+    fn 手机遥控必须走统一播放门控并触发和停止监听() {
+        let f = StreamFormat::stereo(44_100);
+        let slot = SfxSlot {
+            name: "test".into(),
+            samples: Arc::new(vec![0.4; 8000]),
+            looping: true,
+            gain_db: 0.0,
+        };
+        let mut primary = EngineParts::build(f, f, vec![slot.clone()], 20);
+        let mut monitor = EngineParts::build(f, f, vec![slot], 20);
+        let playback = Arc::new(Playback::new(
+            primary.control.clone(),
+            Some(monitor.control.clone()),
+        ));
+        let shared = remote_ctl::Shared::default();
+        configure_remote(&shared, &playback, vec!["test".into()]);
+        playback.standby();
+        assert!(!shared.play(0));
+        playback.activate();
+        assert!(shared.play(0));
+        let mut output = vec![0.0; 2000];
+        primary.render.process(&mut output);
+        monitor.render.process(&mut output);
+        assert!(primary.control.is_playing() && monitor.control.is_playing());
+        assert_eq!(playback.monitor_plays.load(Ordering::Relaxed), 1);
+        shared.stop_all();
+        primary.render.process(&mut output);
+        monitor.render.process(&mut output);
+        assert!(!primary.control.is_playing() && !monitor.control.is_playing());
+    }
+
+    #[test]
+    fn 统计时间必须使用实际采样率() {
+        assert_eq!(frames_to_secs(44_100, 44_100), 1.0);
+        assert!((frames_to_secs(882, 44_100) * 1000.0 - 20.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn 自检支持显式录音端点参数() {
+        let cli = Cli::try_parse_from([
+            "mixer",
+            "selftest",
+            "--device",
+            "CABLE Input",
+            "--capture",
+            "CABLE Output",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Selftest {
+                device, capture, ..
+            } => {
+                assert_eq!(device.as_deref(), Some("CABLE Input"));
+                assert_eq!(capture.as_deref(), Some("CABLE Output"));
+            }
+            _ => panic!("应解析为 selftest"),
+        }
     }
 }

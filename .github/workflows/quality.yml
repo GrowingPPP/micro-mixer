@@ -1,0 +1,32 @@
+name: Desktop quality
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  regression:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace --all-targets
+      - run: node --check apps/mixer-gui/dist/main.js
+      - run: node --check crates/remote/src/control-page.js
+      - run: node --test tools/test-gui-model.js tools/test-gui-controls.js tools/test-remote-controls.js
+      - name: Windows smoke harness regression
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: .\apps\mixer-gui\build-app-windows.ps1 -TestSmokeHarness

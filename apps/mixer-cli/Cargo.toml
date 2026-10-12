@@ -4,6 +4,7 @@ version.workspace = true
 license.workspace = true
 authors.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "mixer"
@@ -11,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 audio-core = { path = "../../crates/audio-core" }
+audio-session = { path = "../../crates/audio-session" }
 backend-cpal = { path = "../../crates/backend-cpal" }
 hotkeys = { path = "../../crates/hotkeys" }
 app-config = { path = "../../crates/app-config" }

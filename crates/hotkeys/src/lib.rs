@@ -65,8 +65,13 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, Context, Result};
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+#[cfg(not(target_os = "windows"))]
+use global_hotkey::GlobalHotKeyManager;
+use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use std::sync::Arc;
+
+#[cfg(any(target_os = "windows", test))]
+mod owner;
 
 // ─────────────────────────────────────────── 平台：事件循环
 
@@ -118,10 +123,24 @@ pub fn pump_carbon_events(timeout_secs: f64) -> bool {
     }
 }
 
-/// 非 macOS：没有 Carbon，退化为 sleep。
-#[cfg(not(target_os = "macos"))]
+/// Windows：泵当前线程的消息队列。管理器自己的队列由专属 owner 线程持续派发。
+#[cfg(target_os = "windows")]
 pub fn pump_carbon_events(timeout_secs: f64) -> bool {
-    std::thread::sleep(std::time::Duration::from_secs_f64(timeout_secs.max(0.001)));
+    let handled = owner::pump_windows_messages();
+    if !handled {
+        std::thread::sleep(std::time::Duration::from_secs_f64(
+            timeout_secs.clamp(0.001, 0.05),
+        ));
+    }
+    handled
+}
+
+/// 其他平台没有 Carbon，短暂等待下一轮退出检查。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn pump_carbon_events(timeout_secs: f64) -> bool {
+    std::thread::sleep(std::time::Duration::from_secs_f64(
+        timeout_secs.clamp(0.001, 0.05),
+    ));
     false
 }
 
@@ -183,23 +202,11 @@ pub fn is_main_thread() -> bool {
     unsafe { pthread_main_np() == 1 }
 }
 
-/// Windows：主线程必须**显式登记**，否则一律当成"不是主线程"。
+/// Windows：查询由 `note_main_thread` 显式登记的应用主线程。
 ///
-/// ## 为什么不能像原来那样直接返回 `true`
-///
-/// 原来这里是 `true` —— 那不是检查，是个**桩**。后果是一条完整的静默失效链：
-///
-///   ① `bind_hotkeys_on_main_thread` 以为已经在主线程 → 不做调度
-///   ② `GlobalHotKeyManager` 在 **tokio 工作线程**上创建（隐藏窗口也建在那儿）
-///   ③ 那个线程**不泵消息** → `WM_HOTKEY` 永远不派发
-///   ④ **热键完全不响应**，而且不报任何错
-///
-/// Windows 上 `WM_HOTKEY` 是投递到**创建窗口那个线程**的消息队列的，
-/// 所以创建线程必须在跑消息循环 —— 这一点和 macOS 的 Carbon 要求**是同一类约束**。
-/// Tauri 的主线程在跑事件循环，tokio 工作线程不在。
-///
-/// 拿不准时返回 `false` 是**安全方向**：那会强制把绑定调度到主线程，
-/// 多一次往返而已；反过来的错误是热键彻底不工作。
+/// 这个信息供 GUI 的应用调度使用。热键的原生窗口由专属 owner 线程拥有，
+/// 因此 Windows 绑定和重绑不依赖调用方是否在主线程，也不依赖 Tauri 的消息循环。
+/// 未登记时返回 false，避免误把普通工作线程当成应用主线程。
 #[cfg(target_os = "windows")]
 pub fn is_main_thread() -> bool {
     use std::sync::atomic::Ordering;
@@ -253,6 +260,25 @@ pub fn note_main_thread() {}
 pub struct HotkeyPoller {
     /// 系统热键 id → 槽位索引
     id_to_slot: HashMap<u32, usize>,
+    events: Arc<EventInbox>,
+}
+
+#[derive(Default)]
+struct EventInbox {
+    #[cfg(test)]
+    local: Option<Arc<std::sync::Mutex<std::collections::VecDeque<GlobalHotKeyEvent>>>>,
+}
+impl EventInbox {
+    fn next(&self) -> Option<GlobalHotKeyEvent> {
+        #[cfg(test)]
+        if let Some(events) = &self.local {
+            return events.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+        }
+        GlobalHotKeyEvent::receiver().try_recv().ok()
+    }
+    fn discard_pending(&self) {
+        while self.next().is_some() {}
+    }
 }
 
 impl HotkeyPoller {
@@ -260,9 +286,8 @@ impl HotkeyPoller {
     ///
     /// 读的是 global-hotkey 的**全局通道** —— 这正是它可以跨线程用的原因。
     pub fn poll(&self) -> Option<usize> {
-        let rx = GlobalHotKeyEvent::receiver();
         let mut hit = None;
-        while let Ok(ev) = rx.try_recv() {
+        while let Some(ev) = self.events.next() {
             if ev.state != HotKeyState::Pressed {
                 continue;
             }
@@ -283,130 +308,157 @@ impl HotkeyPoller {
 }
 
 /// 热键管理器：把一组键位绑定到音效槽位。
+///
+/// Windows 上只持有可跨线程的消息句柄；原生窗口始终由专属线程拥有。
 pub struct Hotkeys {
-    /// 必须持有 —— Drop 时会注销所有热键
-    _manager: ManagerOwner,
-    /// 系统热键 id → 槽位索引
+    manager: Arc<HotkeyManager>,
     id_to_slot: HashMap<u32, usize>,
-    /// 便于日志与报错
     bindings: Vec<(String, usize)>,
-    /// 已注册的键对象 —— 待机时要拿它去注销
     keys: Vec<HotKey>,
 }
 
-/// 管理器的持有者。
+/// 平台管理器的安全句柄。
 ///
-/// ## 为什么需要这一层
-///
-/// `GlobalHotKeyManager` 在 **Windows 上不实现 `Send`**（它就是个 `HWND` 包装），
-/// 而我们的架构里 `Hotkeys` 必须能跨线程传递：
-/// 它在主线程创建（两个平台都要求），然后通过 channel 送回调用方，
-/// 还要存进 Tauri 的 `State<AudioHost>`（要求 `Send + Sync`）。
-///
-/// ## 为什么断言 `Send` 是成立的
-///
-/// 逐个操作核对过线程亲和性：
-///
-/// | 操作 | 线程亲和性 |
-/// |---|---|
-/// | `RegisterHotKey(hwnd, …)` | **无** —— 关联表是进程全局的；`WM_HOTKEY` 仍然投递到**创建窗口那个线程**的消息队列 |
-/// | `UnregisterHotKey(hwnd, …)` | **无** |
-/// | `Drop` → `DestroyWindow(hwnd)` | ⚠️ **有** —— 必须在创建窗口的线程上调用 |
-///
-/// 所以前两个跨线程没问题（消息的派发线程由窗口决定，而我们本来就在主线程泵消息），
-/// **只有析构是问题** —— 见下面 `Drop` 里的处理。
-///
-/// > macOS 上不需要这套：global-hotkey 自己写了 `unsafe impl Send`。
-struct ManagerOwner(Option<Arc<GlobalHotKeyManager>>);
+/// macOS 在主线程创建并由应用运行循环派发 Carbon 事件。
+/// Windows 在专属线程创建原生管理器，所有注册、注销和析构均发到该线程。
+/// 句柄中没有 HWND，也不需要声明不成立的 `unsafe impl Send/Sync`。
+pub struct HotkeyManager {
+    inner: ManagerOwner,
+    events: Arc<EventInbox>,
+}
 
-// SAFETY: 依据见上面那张表。
-// · register / unregister 无线程亲和性，跨线程调用安全；
-// · 唯一有亲和性的 DestroyWindow 被下面的 Drop 显式绕开了。
-#[cfg(target_os = "windows")]
-unsafe impl Send for ManagerOwner {}
-#[cfg(target_os = "windows")]
-unsafe impl Sync for ManagerOwner {}
+enum ManagerOwner {
+    #[cfg(not(target_os = "windows"))]
+    Native(GlobalHotKeyManager),
+    #[cfg(any(target_os = "windows", test))]
+    Worker(owner::OwnerClient),
+}
 
-impl Drop for ManagerOwner {
-    fn drop(&mut self) {
-        #[cfg(target_os = "windows")]
-        {
-            // Windows 的 `GlobalHotKeyManager::drop` 会调 `DestroyWindow`，
-            // 而那个**必须**在创建窗口的线程上做。我们保证不了析构发生在那里
-            // （`Hotkeys` 会随 `AudioHost` 一起被释放，那可能在任何线程）。
-            //
-            // 与其在错误的线程上析构（`DestroyWindow` 会失败，行为未定义），
-            // 不如**故意泄漏**：代价是一个隐藏窗口，进程退出时由系统回收。
-            // 触发频率很低 —— 只在待机↔开启切换、重新绑定时发生。
-            if let Some(m) = self.0.take() {
-                std::mem::forget(m);
+impl HotkeyManager {
+    fn register_batch(&self, keys: &[HotKey]) -> Result<()> {
+        match &self.inner {
+            #[cfg(not(target_os = "windows"))]
+            ManagerOwner::Native(manager) => {
+                self.events.discard_pending();
+                register_transaction(
+                    keys,
+                    |key| manager.register(key).map_err(Into::into),
+                    |key| manager.unregister(key).map_err(Into::into),
+                )
             }
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            self.0.take();
+            #[cfg(any(target_os = "windows", test))]
+            ManagerOwner::Worker(owner) => owner.register(keys),
         }
     }
+
+    fn unregister_all(&self, keys: &[HotKey]) -> Result<()> {
+        match &self.inner {
+            #[cfg(not(target_os = "windows"))]
+            ManagerOwner::Native(manager) => {
+                let result =
+                    unregister_every_key(keys, |key| manager.unregister(key).map_err(Into::into));
+                self.events.discard_pending();
+                result
+            }
+            #[cfg(any(target_os = "windows", test))]
+            ManagerOwner::Worker(owner) => owner.unregister(keys),
+        }
+    }
+}
+
+/// 注册任一键失败时立即撤销本次已经成功的注册。
+fn register_transaction(
+    keys: &[HotKey],
+    mut register: impl FnMut(HotKey) -> Result<()>,
+    mut unregister: impl FnMut(HotKey) -> Result<()>,
+) -> Result<()> {
+    for (index, &key) in keys.iter().enumerate() {
+        if let Err(error) = register(key) {
+            for &registered in &keys[..index] {
+                if let Err(rollback_error) = unregister(registered) {
+                    log::error!("撤销热键注册失败: {rollback_error:#}");
+                }
+            }
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// 注销错误不能阻止释放同一批次的其他按键。
+fn unregister_every_key(
+    keys: &[HotKey],
+    mut unregister: impl FnMut(HotKey) -> Result<()>,
+) -> Result<()> {
+    let mut first_error = None;
+    for &key in keys {
+        if let Err(error) = unregister(key) {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn parse_bindings(keys: &[String]) -> Result<Vec<(usize, HotKey)>> {
+    let mut seen = std::collections::HashSet::new();
+    keys.iter()
+        .enumerate()
+        .filter(|(_, spec)| !spec.trim().is_empty())
+        .map(|(slot, spec)| {
+            let key = parse_hotkey(spec)
+                .with_context(|| format!("热键「{spec}」无法解析（第 {} 个）", slot + 1))?;
+            if !seen.insert(key.id()) {
+                anyhow::bail!("热键「{spec}」重复；每个键只能绑定一个音效");
+            }
+            Ok((slot, key))
+        })
+        .collect()
 }
 
 impl Hotkeys {
     /// 把 `keys[i]` 绑定到槽位 `i`。
-    ///
-    /// 键位写法：`F1`、`F12`、`Cmd+Shift+A`、`Ctrl+Alt+1`、`Numpad1`、`Backslash`。
     pub fn bind_to_slots(keys: &[String]) -> Result<Self> {
-        let manager = Arc::new(Self::new_manager()?);
-        Self::bind_with(manager, keys)
+        // 先完整验证配置，不为无效配置创建平台窗口。
+        parse_bindings(keys)?;
+        Self::bind_with(Arc::new(Self::new_manager()?), keys)
     }
 
-    /// 只创建管理器，不绑定。**macOS 上必须在主线程调用**。
-    ///
-    /// GUI 用它先在主线程把管理器建好（Tauri 的 `run_on_main_thread`），
-    /// 之后再按用户选的音效去绑定。
-    pub fn new_manager() -> Result<GlobalHotKeyManager> {
-        if !is_main_thread() {
-            anyhow::bail!(
-                "全局热键管理器必须在**主线程**创建（当前不在主线程）。\
-                 macOS 的 Carbon 热键事件由主线程运行循环派发，在别的线程创建会静默失效。"
-            );
-        }
-        GlobalHotKeyManager::new().context("初始化全局热键管理器失败")
+    /// 创建安全管理器句柄；macOS 必须在主线程调用，Windows 可从任意线程调用。
+    pub fn new_manager() -> Result<HotkeyManager> {
+        let events = Arc::new(EventInbox::default());
+        #[cfg(target_os = "windows")]
+        let inner = ManagerOwner::Worker(owner::OwnerClient::new(events.clone())?);
+        #[cfg(not(target_os = "windows"))]
+        let inner = {
+            if !is_main_thread() {
+                anyhow::bail!("macOS 全局热键管理器必须在主线程创建，且主线程需要运行应用事件循环");
+            }
+            ManagerOwner::Native(GlobalHotKeyManager::new().context("初始化全局热键管理器失败")?)
+        };
+        Ok(HotkeyManager { inner, events })
     }
 
-    /// 用一个已有的管理器绑定键位。
-    pub fn bind_with(manager: Arc<GlobalHotKeyManager>, keys: &[String]) -> Result<Self> {
-        let mut id_to_slot = HashMap::new();
-        let mut bindings = Vec::new();
-
-        let mut raw = Vec::new();
-        for (slot, spec) in keys.iter().enumerate() {
-            let hk = parse_hotkey(spec)
-                .with_context(|| format!("热键「{spec}」无法解析（第 {} 个）", slot + 1))?;
-            manager
-                .register(hk)
-                .with_context(|| format!("热键「{spec}」注册失败 —— 可能已被系统或其他程序占用"))?;
-            id_to_slot.insert(hk.id(), slot);
-            bindings.push((spec.clone(), slot));
-            raw.push(hk);
-        }
-
+    /// 用已有的安全管理器句柄绑定键位。
+    pub fn bind_with(manager: Arc<HotkeyManager>, keys: &[String]) -> Result<Self> {
+        let parsed = parse_bindings(keys)?;
+        let raw: Vec<_> = parsed.iter().map(|(_, key)| *key).collect();
+        manager
+            .register_batch(&raw)
+            .context("注册热键失败；可能已被系统或其他程序占用")?;
         Ok(Self {
-            _manager: ManagerOwner(Some(manager)),
-            id_to_slot,
-            bindings,
+            manager,
+            id_to_slot: parsed.iter().map(|(slot, key)| (key.id(), *slot)).collect(),
+            bindings: parsed
+                .iter()
+                .map(|(slot, _)| (keys[*slot].clone(), *slot))
+                .collect(),
             keys: raw,
         })
     }
 
-    /// 注销全部热键，**把按键还给系统（游戏）**。
-    ///
-    /// 用途：切到「待机（只转发麦克风）」时必须注销 —— 否则 F1/F2 仍然被我们截走，
-    /// 用户在游戏里按这两个键会毫无反应。
-    /// 保留 `bindings`（配置），这样重新激活时不用再问用户要键位。
+    /// 注销全部热键，把按键还给游戏；保留显示用的配置供重新激活。
     pub fn unbind_all(&mut self) -> Result<()> {
-        if self.keys.is_empty() {
-            return Ok(());
-        }
-        self.manager()?
+        self.manager
             .unregister_all(&self.keys)
             .context("注销热键失败")?;
         self.keys.clear();
@@ -414,55 +466,43 @@ impl Hotkeys {
         Ok(())
     }
 
-    /// 当前是否真的有键处于注册状态。
     pub fn is_bound(&self) -> bool {
         !self.keys.is_empty()
     }
 
-    /// 注销后用**同一个管理器**重新绑定。
-    ///
-    /// 为什么不重新 `new_manager()`：macOS 上创建 Carbon 热键管理器要求主线程 +
-    /// 事件循环正在跑，在"刚注销完"的时机再建一个会超时（实测报 Operation timed out）。
-    /// 复用已有的管理器既稳又快。
+    /// 使用同一平台管理器重新绑定。新配置失败时恢复旧绑定。
     pub fn rebind(&mut self, keys: &[String]) -> Result<()> {
-        self.unbind_all()?;
-        let mut id_to_slot = HashMap::new();
-        let mut bindings = Vec::new();
-        let mut raw = Vec::new();
-        for (slot, spec) in keys.iter().enumerate() {
-            let hk = parse_hotkey(spec)
-                .with_context(|| format!("热键「{spec}」无法解析（第 {} 个）", slot + 1))?;
-            self.manager()?
-                .register(hk)
-                .with_context(|| format!("热键「{spec}」重新注册失败"))?;
-            id_to_slot.insert(hk.id(), slot);
-            bindings.push((spec.clone(), slot));
-            raw.push(hk);
+        let parsed = parse_bindings(keys)?;
+        let raw: Vec<_> = parsed.iter().map(|(_, key)| *key).collect();
+        self.manager.unregister_all(&self.keys)?;
+        if let Err(error) = self.manager.register_batch(&raw) {
+            if let Err(rollback_error) = self.manager.register_batch(&self.keys) {
+                self.keys.clear();
+                self.id_to_slot.clear();
+                return Err(error.context(format!("恢复原热键也失败: {rollback_error:#}")));
+            }
+            return Err(error.context("重新注册热键失败，已恢复原绑定"));
         }
-        self.id_to_slot = id_to_slot;
-        self.bindings = bindings;
+        self.id_to_slot = parsed.iter().map(|(slot, key)| (key.id(), *slot)).collect();
+        self.bindings = parsed
+            .iter()
+            .map(|(slot, _)| (keys[*slot].clone(), *slot))
+            .collect();
         self.keys = raw;
         Ok(())
     }
 
-    /// 取管理器。正常路径上它一定在 —— `None` 只可能出现在析构过程中。
-    fn manager(&self) -> Result<&GlobalHotKeyManager> {
-        self._manager.0.as_deref().context("热键管理器已被释放")
-    }
-
-    /// 拿一个可以跨线程用的轮询句柄。
     pub fn poller(&self) -> HotkeyPoller {
         HotkeyPoller {
             id_to_slot: self.id_to_slot.clone(),
+            events: self.manager.events.clone(),
         }
     }
 
-    /// 非阻塞取出一个被按下的槽位（本线程内直接用，等价于 `self.poller().poll()`）。
     pub fn poll(&self) -> Option<usize> {
         self.poller().poll()
     }
 
-    /// 已绑定的键位数。
     pub fn len(&self) -> usize {
         self.id_to_slot.len()
     }
@@ -471,9 +511,16 @@ impl Hotkeys {
         self.id_to_slot.is_empty()
     }
 
-    /// 返回 `(键位写法, 槽位)` 列表，用于启动时打印。
     pub fn bindings(&self) -> &[(String, usize)] {
         &self.bindings
+    }
+}
+
+impl Drop for Hotkeys {
+    fn drop(&mut self) {
+        if let Err(error) = self.manager.unregister_all(&self.keys) {
+            log::error!("释放热键失败: {error:#}");
+        }
     }
 }
 
@@ -608,8 +655,11 @@ fn capitalize(s: &str) -> String {
 mod platform_tests {
     use super::*;
 
+    static LOOP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn 事件循环必须能被外部打断() {
+        let _guard = LOOP_TEST_LOCK.lock().unwrap();
         // 回归测试：早期用 Carbon 原生的 RunApplicationEventLoop，
         // QuitApplicationEventLoop 在纯命令行进程里打不断它 —— 实测挂死。
         //
@@ -617,7 +667,7 @@ mod platform_tests {
         // 真实 ReceiveNextEvent 不是线程安全的，并行测试会偶发 SIGSEGV。
         // 真实泵由 examples/app_loop_test.rs 单线程验证。
         reset_app_event_loop();
-        std::thread::spawn(|| {
+        let worker = std::thread::spawn(|| {
             std::thread::sleep(std::time::Duration::from_millis(300));
             quit_app_event_loop();
         });
@@ -630,14 +680,16 @@ mod platform_tests {
         let el = t0.elapsed().as_secs_f64();
         assert!(el < 3.0, "事件循环没被打断，耗时 {el:.2}s");
         assert!(pumped > 5, "循环应该真的转了很多轮，实际 {pumped}");
+        worker.join().unwrap();
     }
 
     #[test]
     fn 退出标志必须在起线程前重置才不丢信号() {
+        let _guard = LOOP_TEST_LOCK.lock().unwrap();
         // 如果工作线程在进入循环前就决定退出，而循环入口又重置了标志，
         // 主线程就会永久阻塞。这里锁住"重置由调用方负责"这个约定。
-        quit_app_event_loop(); // 提前置位
         reset_app_event_loop();
+        quit_app_event_loop(); // 工作线程在进入循环前提前置位
         let t0 = std::time::Instant::now();
         run_loop_until_quit(|| {});
         assert!(t0.elapsed().as_secs_f64() < 0.5);
@@ -703,8 +755,11 @@ mod main_thread_tests {
     #![allow(non_snake_case)]
     use super::*;
 
+    static MAIN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn 没登记时必须返回_false_而不是_true() {
+        let _guard = MAIN_TEST_LOCK.lock().unwrap();
         // 这是安全方向：false → 强制调度到主线程（多一次往返）；
         // true → 可能在 tokio 工作线程上建窗口，热键**静默失效**。
         //
@@ -725,12 +780,14 @@ mod main_thread_tests {
 
     #[test]
     fn 登记函数在不支持的平台上也能编译通过() {
+        let _guard = MAIN_TEST_LOCK.lock().unwrap();
         // 让调用方不必到处写 cfg
         note_main_thread();
     }
 
     #[test]
     fn 当前平台上_is_main_thread_能安全调用() {
+        let _guard = MAIN_TEST_LOCK.lock().unwrap();
         let _ = is_main_thread();
     }
 }

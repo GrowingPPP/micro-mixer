@@ -11,9 +11,9 @@
 
 | 需要 | 说明 |
 |---|---|
-| **Rust** | `rust-version = "1.75"`（`Cargo.toml`）。国内网络建议走 [USTC 镜像](https://mirrors.ustc.edu.cn/help/rust-static.html) |
-| **Node.js** | 只用于 Tauri 打包（`tauri-cli`）。前端本身**没有构建步骤** —— 是纯静态的 `dist/` |
-| **macOS** | 当前只实现了 macOS 后端。Windows 后端尚未开始 |
+| **Rust** | `rust-version = "1.88"`（`Cargo.toml`）。国内网络建议走 [USTC 镜像](https://mirrors.ustc.edu.cn/help/rust-static.html) |
+| **Node.js 22** | 用于 Tauri 打包与 GUI 模型回归；前端是纯静态 `dist/`，没有构建步骤 |
+| **macOS / Windows** | CoreAudio / WASAPI 后端均已实现；Windows 真实驱动与安装包验收需要 Windows 宿主 |
 | **虚拟声卡** | 跑真实链路需要（本机开发推荐 `brew install --cask blackhole-2ch`） |
 
 ```bash
@@ -37,17 +37,18 @@ apps/
   mixer-gui/      Tauri 图形界面（dist/ 是纯静态前端，无打包器）
 crates/
   audio-core/     引擎：混音、重采样、限幅、解码、设备抽象 —— **平台无关**
+  audio-session/  GUI/CLI 共用素材库、播放门控、监听和流所有者线程
   backend-cpal/   音频后端（cpal：macOS CoreAudio / Windows WASAPI）
-  hotkeys/        全局热键（macOS Carbon）
-  app-config/     配置读写（手写解析器，无 serde）
+  hotkeys/        全局热键（macOS 主线程 Carbon / Windows 专属消息循环）
+  app-config/     TOML 配置读写、结构化音效条目、旧格式迁移
   remote/         手机遥控（局域网 HTTP）
   selftest/       端到端自检
 m0/               M0 可行性验证的工具与产物（已结项）
 docs/             设计与计划文档，见 docs/README.md
 ```
 
-**分层原则**：引擎和界面 100% 跨平台共用，**只有后端和打包方式分平台**。
-加 Windows 支持是"补后端"，不是"重写"。
+音频引擎、会话和界面跨平台共用；后端设备身份、热键线程与打包方式按平台实现。
+主会话、监听、试听和自检使用独立 `StreamHealth`，恢复逻辑只消费主会话的错误。
 
 ---
 
@@ -78,8 +79,9 @@ lint 策略集中在根 `Cargo.toml` 的 `[workspace.lints]`，各 crate 用
   ```
 - **测试函数名用中文**，读起来就是一句断言：`fn 坏文件不应拖垮整批()`。
 - **音效/用户可见的文案用中文**；日志前缀用 `[模块]`，如 `[待机]`、`[热插拔]`。
-- **实时音频回调里不许分配、不许加锁、不许 IO。** 用 SPSC 环形缓冲传数据、
-  原子量传增益。这条没有例外。
+- **实时 DSP 不分配、不阻塞、不做 IO。** 用 SPSC 环形缓冲传数据、原子量传增益。
+  会话的生命周期壳只使用一次非阻塞 `try_lock`，获取失败立即静音；关闭流后在所有者线程回收素材，
+  以处理驱动保留回调闭包的情况。诊断 dump 同样通过预分配队列交给所有者线程写入。
 - **异步/回调里不许让 panic 跑出去。** 见下。
 
 ### 平台相关的逻辑要写成能测的
@@ -105,6 +107,27 @@ fn base_dir_on(p: Platform, env: EnvFn, tmp: &Path) -> PathBuf { … }
 
 配套的测试都在文件末尾（`path_tests` / `panic_path_tests` / `platform_info_tests`），
 **它们跑在 macOS 上，验证的却是 Windows 的分支**。
+
+### macOS 与 Windows 的共用功能必须一致
+
+音效卡片、音量调节、试听、停止播放及配置保存使用同一份 `apps/mixer-gui/dist/`、
+Tauri 命令和音频业务实现。修改这些功能时，在共用路径修复并补共用回归；
+仅系统设备 API、热键管理和平台安装引导等确有系统差异的部分使用平台分支。
+
+`.github/workflows/quality.yml` 在 macOS 和 Windows 上执行同一套 Rust 与前端回归，
+包括试听中实时增益、未启动时试听、停止及加载期间取消、卡片身份隔离、连续调整和保存顺序。
+单音效约束在共用引擎保证；卡片、数字键、热键、手机与 CLI 都须经过共用播放入口。
+主输出、监听和试听的互斥应通过实际 PCM 回归验证，覆盖快速切换、排满队列、等待停止确认及迟到解码，
+前端须验证唯一高亮、真实进度和迟到状态响应。不得只在前端先发停止命令来满足单音效要求。
+循环开关必须实时更新主播放与监听，保留当前游标；关闭后本轮结束，试听仍只播放一次。
+布尔设置必须保存及恢复显式 `false`，覆盖运行中、待机、未启动和连续快速切换。
+后台任务调度顺序不得替代用户操作顺序。GUI 在提交播放、试听、停止与启停请求前领取 Host 操作票据，
+Host 在接纳前及关闭旧试听后的发布点复核；解码和流关闭不得占用预定票据的短状态锁。
+已接纳试听由自己的代次控制，拒绝的播放不得取消其解码；过期启动仅清理自己尚未提交的会话，
+不能释放复用的麦克风会话。手机、热键和托盘参与同一意图序列，过期结果不得报告成功。
+回归应覆盖穷举短操作序列、固定种子长序列、迟到后台任务、跨入口操作和即时卡片状态。
+两端发布包必须来自同一 Git 提交及同一 `Cargo.lock`，共享逻辑改动后两端都需要重新构建。
+Windows 交叉类型检查通过应记录为编译验证；Windows 的设备、WebView 和安装包验收仍需在 Windows 上完成。
 
 ### panic 策略（改之前先读完这段）
 
@@ -154,9 +177,19 @@ Tauri 配置里的错误（键名拼错、枚举值写错）**在 macOS 上完�
 ### 提交前必须跑
 
 ```bash
-cargo test --workspace                       # 68 个单元测试
-cargo build --release --workspace            # 0 告警
+cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-targets
+node --check apps/mixer-gui/dist/main.js
+node --check crates/remote/src/control-page.js
+node --test tools/test-gui-model.js tools/test-gui-controls.js tools/test-remote-controls.js
+cargo build --locked --release --workspace
 ```
+
+`.github/workflows/quality.yml` 在 macOS / Windows 宿主运行上述回归。
+Windows 另执行 `build-app-windows.ps1 -TestSmokeHarness`，验证受控 WAV、构建参数与失败退出码门禁；
+该检查无需虚拟声卡。`tools/win-cross-check.sh` 在 macOS 检查 Windows 所有目标（包含测试），
+但不链接安装包，不能替代 Windows 上的真实 WASAPI、热键、WebView 与 NSIS 验收。
 
 ### 改到音频链路时，还要跑
 

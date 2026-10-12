@@ -48,13 +48,19 @@ impl AtomicF32 {
 #[derive(Debug, Clone, Copy)]
 pub enum Command {
     /// 从头播放某个槽位
-    Play { slot: u8 },
+    Play { slot: usize },
     /// 淡出并停止某个槽位
-    Stop { slot: u8 },
+    Stop { slot: usize },
     /// 停止全部
     StopAll,
     /// 调整某个槽位的音量（dB），**运行时立即生效**
-    SetGain { slot: u8, db: f32 },
+    SetGain { slot: usize, db: f32 },
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QueuedCommand {
+    epoch: u64,
+    command: Command,
 }
 
 // ─────────────────────────────────────────── 音效槽位
@@ -186,7 +192,13 @@ pub struct StatsSnapshot {
 pub struct PlaybackControl {
     /// 用 Mutex 包住是因为 rtrb 的 Producer 是单生产者（非 Sync），
     /// 而句柄要在多个控制线程间共享。控制路径不在实时线程上，加锁无妨。
-    cmd: Mutex<Producer<Command>>,
+    cmd: Mutex<Producer<QueuedCommand>>,
+    /// 高优先级停止独立于有界队列，排满播放命令也不能阻止停止。
+    stop_epoch: AtomicU64,
+    /// 输出回调完成停止淡出和限幅器尾音后确认的代次。
+    stopped_epoch: AtomicU64,
+    /// 0 保留各槽位初值；1 关闭循环；2 开启循环。持久参数独立于命令队列。
+    looping_override: AtomicU32,
     pub mic_gain_db: AtomicF32,
     pub sfx_gain_db: AtomicF32,
     stats: Arc<EngineStats>,
@@ -196,17 +208,123 @@ pub struct PlaybackControl {
 impl PlaybackControl {
     fn send(&self, cmd: Command) -> bool {
         match self.cmd.lock() {
-            Ok(mut p) => p.push(cmd).is_ok(),
+            Ok(mut p) => p
+                .push(QueuedCommand {
+                    epoch: self.stop_epoch.load(Ordering::Acquire),
+                    command: cmd,
+                })
+                .is_ok(),
             Err(_) => false,
         }
     }
 
     /// 从头播放指定槽位（对应"按下热键"）。
     pub fn play(&self, slot: usize) -> bool {
+        self.play_with_barrier(slot, || {})
+    }
+
+    /// 接纳播放前执行控制线程屏障，例如关闭独立试听。
+    /// 槽位无效或队列满时不会执行屏障；成功接纳时正好执行一次。
+    /// 屏障持有生产者锁，不得重新调用该控制器的命令方法。
+    pub fn play_with_barrier(&self, slot: usize, before_submit: impl FnOnce()) -> bool {
+        self.play_with_checked_barrier(slot, || {
+            before_submit();
+            true
+        })
+    }
+
+    /// 屏障结束时仍可拒绝过期请求；返回 false 不提交任何播放命令。
+    /// 有效槽位和容量先检查。屏障持有生产者锁，不得再次调用命令方法。
+    pub fn play_with_checked_barrier(
+        &self,
+        slot: usize,
+        before_submit: impl FnOnce() -> bool,
+    ) -> bool {
         if slot >= self.slot_count {
             return false;
         }
-        self.send(Command::Play { slot: slot as u8 })
+        let Ok(mut queue) = self.cmd.lock() else {
+            return false;
+        };
+        if queue.is_full() {
+            return false;
+        }
+        if !before_submit() {
+            return false;
+        }
+        queue
+            .push(QueuedCommand {
+                epoch: self.stop_epoch.load(Ordering::Acquire),
+                command: Command::Play { slot },
+            })
+            .is_ok()
+    }
+
+    /// 同步向主输出和监听提交单音效选择。任何一路背压都拒绝整个请求。
+    ///
+    /// 两个生产者只在控制线程加锁；固定地址顺序避免反向调用时产生锁循环。
+    pub fn play_linked(&self, slot: usize, monitor: &Self) -> bool {
+        self.play_linked_with_barrier(slot, monitor, || {})
+    }
+
+    /// 两路都能接纳请求后、提交任何一路之前执行一次控制线程屏障。
+    /// 屏障持有两路生产者锁，不得重新调用这两个控制器的命令方法。
+    pub fn play_linked_with_barrier(
+        &self,
+        slot: usize,
+        monitor: &Self,
+        before_submit: impl FnOnce(),
+    ) -> bool {
+        self.play_linked_with_checked_barrier(slot, monitor, || {
+            before_submit();
+            true
+        })
+    }
+
+    /// 两路容量确认后执行可取消屏障；返回 false 时两路都不提交。
+    /// 屏障持有两个生产者锁，不得重新调用这两个控制器的命令方法。
+    pub fn play_linked_with_checked_barrier(
+        &self,
+        slot: usize,
+        monitor: &Self,
+        before_submit: impl FnOnce() -> bool,
+    ) -> bool {
+        if slot >= self.slot_count || slot >= monitor.slot_count {
+            return false;
+        }
+        if std::ptr::eq(self, monitor) {
+            return self.play_with_checked_barrier(slot, before_submit);
+        }
+        let (first, second) =
+            if std::ptr::from_ref(self).addr() < std::ptr::from_ref(monitor).addr() {
+                (self, monitor)
+            } else {
+                (monitor, self)
+            };
+        let (Ok(mut first_queue), Ok(mut second_queue)) = (first.cmd.lock(), second.cmd.lock())
+        else {
+            return false;
+        };
+        if first_queue.is_full() || second_queue.is_full() {
+            return false;
+        }
+        if !before_submit() {
+            return false;
+        }
+        // 持有两路生产者锁后，消费者只能增加空位，所以下面两次 push 都能成功。
+        let first_ok = first_queue
+            .push(QueuedCommand {
+                epoch: first.stop_epoch.load(Ordering::Acquire),
+                command: Command::Play { slot },
+            })
+            .is_ok();
+        let second_ok = second_queue
+            .push(QueuedCommand {
+                epoch: second.stop_epoch.load(Ordering::Acquire),
+                command: Command::Play { slot },
+            })
+            .is_ok();
+        first_ok && second_ok
     }
 
     /// 淡出并停止指定槽位。
@@ -214,12 +332,15 @@ impl PlaybackControl {
         if slot >= self.slot_count {
             return false;
         }
-        self.send(Command::Stop { slot: slot as u8 })
+        self.send(Command::Stop { slot })
     }
 
     /// 停止全部音效（**人声照常透传**）。
     pub fn stop_all(&self) -> bool {
-        self.send(Command::StopAll)
+        // 与 send 串行，停止之前/之后的播放命令都有明确的代次。
+        let _guard = self.cmd.lock().unwrap_or_else(|e| e.into_inner());
+        self.stop_epoch.fetch_add(1, Ordering::Release);
+        true
     }
 
     /// 调整某个槽位的音量（dB）。**下一帧就生效**，不必重播。
@@ -227,10 +348,13 @@ impl PlaybackControl {
         if slot >= self.slot_count {
             return false;
         }
-        self.send(Command::SetGain {
-            slot: slot as u8,
-            db,
-        })
+        self.send(Command::SetGain { slot, db })
+    }
+
+    /// 运行时更新全部音效的循环模式，不重启当前音效，也不受命令队列背压影响。
+    pub fn set_looping(&self, looping: bool) {
+        self.looping_override
+            .store(if looping { 2 } else { 1 }, Ordering::Release);
     }
 
     pub fn slot_count(&self) -> usize {
@@ -239,6 +363,13 @@ impl PlaybackControl {
 
     pub fn is_playing(&self) -> bool {
         self.stats.playing.load(Ordering::Relaxed)
+    }
+
+    /// 最近一次 stop_all 已经由输出回调完成，含淡出和固定限幅延迟。
+    /// 在提交 stop_all 后查询，避免尚未消费的播放命令造成假静音。
+    pub fn stop_all_finished(&self) -> bool {
+        self.stopped_epoch.load(Ordering::Acquire) == self.stop_epoch.load(Ordering::Acquire)
+            && !self.is_playing()
     }
 
     pub fn active_slot(&self) -> i32 {
@@ -270,17 +401,27 @@ struct FilePlayer {
     fade: f32,
     /// +1 淡入 / -1 淡出 / 0 稳态
     fade_dir: f32,
-    /// 淡出结束后是否要重启（用于"播放中再次触发"）
-    restart_after_fade: bool,
     /// 每帧的淡变步进
     fade_step: f32,
     /// 结尾淡出长度（帧）
     end_fade_frames: usize,
+    /// 循环尾部与头部重叠，避免每圈淡出到零又硬跳到头部。
+    loop_crossfade_frames: usize,
 }
 
 impl FilePlayer {
     fn new(slot: &SfxSlot, sample_rate: u32) -> Self {
         let fade_frames = (sample_rate as f32 * FADE_MS / 1000.0).max(1.0);
+        // 预计算潜在循环边界，初始单次播放也能运行时开启平滑循环。
+        // 原本连续的循环保持原时长；只有首尾不连续时才重叠尾部和头部。
+        let needs_loop_crossfade = slot.frames() >= 2
+            && (0..2).any(|c| {
+                let last = slot.frames() * 2 - 2 + c;
+                let head_slope = slot.samples[2 + c] - slot.samples[c];
+                let tail_slope = slot.samples[last] - slot.samples[last - 2];
+                let join_slope = slot.samples[c] - slot.samples[last];
+                (join_slope - (head_slope + tail_slope) * 0.5).abs() > 0.001
+            });
         Self {
             samples: slot.samples.clone(),
             pos: 0,
@@ -289,9 +430,13 @@ impl FilePlayer {
             active: false,
             fade: 0.0,
             fade_dir: 0.0,
-            restart_after_fade: false,
             fade_step: 1.0 / fade_frames,
             end_fade_frames: fade_frames as usize,
+            loop_crossfade_frames: if needs_loop_crossfade {
+                (fade_frames as usize).min(slot.frames() / 4)
+            } else {
+                0
+            },
         }
     }
 
@@ -301,24 +446,12 @@ impl FilePlayer {
         self.active = true;
         self.fade = 0.0;
         self.fade_dir = 1.0;
-        self.restart_after_fade = false;
-    }
-
-    /// 请求播放。若正在播放，先快速淡出再重启（避免波形突变的咔哒声）。
-    fn trigger(&mut self) {
-        if self.active && self.fade > 0.001 {
-            self.restart_after_fade = true;
-            self.fade_dir = -1.0;
-        } else {
-            self.start();
-        }
     }
 
     /// 请求停止（淡出）。
     fn stop(&mut self) {
         if self.active {
             self.fade_dir = -1.0;
-            self.restart_after_fade = false;
         }
     }
 
@@ -326,20 +459,21 @@ impl FilePlayer {
         self.active
     }
 
-    /// **实时安全**：把本槽位的输出**叠加**到 `out`（交错立体声）。
+    /// **实时安全**：把本槽位的输出写入 `out`（交错立体声）。
+    /// 返回占用的帧数，停止后的余下帧可以接着播放下一个音效。
     #[inline]
-    fn render_add(&mut self, out: &mut [f32]) {
+    fn render_add(&mut self, out: &mut [f32]) -> usize {
         if !self.active {
-            return;
+            return 0;
         }
         let total = self.samples.len();
         if total < 2 {
             self.active = false;
-            return;
+            return 0;
         }
         let g = db_to_lin(self.gain.get());
 
-        for frame in out.as_chunks_mut::<2>().0 {
+        for (frame_index, frame) in out.as_chunks_mut::<2>().0.iter_mut().enumerate() {
             // 淡变推进（每帧一次，而不是每样本）
             if self.fade_dir > 0.0 {
                 self.fade = (self.fade + self.fade_step).min(1.0);
@@ -351,36 +485,48 @@ impl FilePlayer {
                 if self.fade <= 0.0 {
                     self.fade_dir = 0.0;
                     self.active = false;
-                    if self.restart_after_fade {
-                        self.start();
-                    }
-                    return; // 后续帧保持不动（此前的值是累加前的）
+                    return frame_index + 1;
                 }
             }
 
             // 到达结尾
             if self.pos + 2 > total {
                 if self.looping {
-                    self.pos = 0;
+                    // 头部已在尾部交叉淡变中播放过，继续从其后读取。
+                    self.pos = self.loop_crossfade_frames * 2;
                 } else {
                     self.active = false;
-                    return;
+                    return frame_index;
                 }
             }
 
             // 结尾淡出：避免文件在波形中段突然结束产生咔哒
             let remaining = (total - self.pos) / 2;
-            let end_env = if remaining < self.end_fade_frames {
+            let end_env = if !self.looping && remaining < self.end_fade_frames {
                 remaining as f32 / self.end_fade_frames as f32
             } else {
                 1.0
             };
 
             let a = self.fade * end_env * g;
-            frame[0] += self.samples[self.pos] * a;
-            frame[1] += self.samples[self.pos + 1] * a;
+            if self.looping
+                && self.loop_crossfade_frames > 0
+                && remaining <= self.loop_crossfade_frames
+            {
+                let head_frame = self.loop_crossfade_frames - remaining;
+                let blend = (head_frame + 1) as f32 / self.loop_crossfade_frames as f32;
+                for (c, out_sample) in frame.iter_mut().enumerate() {
+                    let tail = self.samples[self.pos + c];
+                    let head = self.samples[head_frame * 2 + c];
+                    *out_sample += (tail + (head - tail) * blend) * a;
+                }
+            } else {
+                frame[0] += self.samples[self.pos] * a;
+                frame[1] += self.samples[self.pos + 1] * a;
+            }
             self.pos += 2;
         }
+        out.len() / 2
     }
 }
 
@@ -407,37 +553,37 @@ impl CaptureProcessor {
             return;
         }
 
-        // 1. 下混为单声道 —— 保证单声道兼容性（人声居中，下混不衰减）
-        self.mono.clear();
-        if ch == 1 {
-            self.mono.extend_from_slice(&data[..frames]);
-        } else {
-            let inv = 1.0 / ch as f32;
-            for f in data[..frames * ch].chunks_exact(ch) {
-                self.mono.push(f.iter().sum::<f32>() * inv);
-            }
-        }
-
-        // 2. 时钟漂移控制：按缓冲水位微调重采样比率
+        // 1. 时钟漂移控制：按缓冲水位微调重采样比率
         //    （读的是推送前的水位 —— 控制环要看的是"当前积压了多少"）
         let fill_before = self.capacity.saturating_sub(self.ring.slots());
         self.resampler.set_ratio(self.drift.ratio_for(fill_before));
 
-        // 3. 重采样到输出采样率
-        let need = (self.mono.len() as f64 * self.resampler.ratio()).ceil() as usize + 8;
-        if self.resampled.len() < need {
-            self.resampled.resize(need, 0.0);
-        }
-        let n = self.resampler.process(&self.mono, &mut self.resampled);
-
-        // 4. 单声道 → 立体声，写入环形缓冲
-        for &s in &self.resampled[..n] {
-            if self.ring.slots() < 2 {
-                self.stats.overruns.fetch_add(1, Ordering::Relaxed);
-                break;
+        // 2. 固定缓冲分块下混与重采样。任意设备回调大小都不会触发 Vec 增容。
+        let inv = 1.0 / ch as f32;
+        let mut overrun = false;
+        for chunk in data[..frames * ch].chunks(self.mono.len() * ch) {
+            let chunk_frames = chunk.len() / ch;
+            for (mono, frame) in self.mono[..chunk_frames]
+                .iter_mut()
+                .zip(chunk.chunks_exact(ch))
+            {
+                *mono = frame.iter().sum::<f32>() * inv;
             }
-            let _ = self.ring.push(s);
-            let _ = self.ring.push(s);
+            let n = self
+                .resampler
+                .process(&self.mono[..chunk_frames], &mut self.resampled);
+            // 3. 单声道 → 立体声。缓冲满时丢弃本块余下输出，但仍消耗全部输入。
+            for &s in &self.resampled[..n] {
+                if self.ring.slots() < 2 {
+                    overrun = true;
+                    break;
+                }
+                let _ = self.ring.push(s);
+                let _ = self.ring.push(s);
+            }
+        }
+        if overrun {
+            self.stats.overruns.fetch_add(1, Ordering::Relaxed);
         }
         // 推送之后记录水位 —— 这才是"缓冲区里现在有多少数据"
         self.stats.ring_fill.store(
@@ -484,12 +630,19 @@ pub fn panic_hook_fired() -> bool {
 
 pub struct RenderProcessor {
     ring: Consumer<f32>,
-    cmd: Consumer<Command>,
+    cmd: Consumer<QueuedCommand>,
+    stop_epoch: u64,
     out_channels: usize,
     frames_cap: usize,
     mic: Vec<f32>,
     sfx: Vec<f32>,
     players: Vec<FilePlayer>,
+    /// 只有该播放器可以写入 PCM；下一次触发覆盖 pending，而不会叠加。
+    active_player: Option<usize>,
+    pending_player: Option<usize>,
+    applied_looping_override: u32,
+    /// 没有音效写入的连续帧数，用于确认限幅器内旧音效已经输出完毕。
+    sfx_idle_frames: usize,
     limiter: Limiter,
     limiter_enabled: bool,
     ctl: Arc<PlaybackControl>,
@@ -525,40 +678,125 @@ impl RenderProcessor {
         }
 
         let dev_ch = self.out_channels.max(1);
-        let frames = (out.len() / dev_ch).min(self.frames_cap);
+        let frames = out.len() / dev_ch;
         if frames == 0 {
             out.fill(0.0);
             return;
         }
-        let used = frames * 2; // 内部立体声：交错 L/R
-
         // 0. 处理控制命令（无锁取出）
-        while let Ok(cmd) = self.cmd.pop() {
-            match cmd {
+        self.apply_stop_epoch();
+        while let Ok(queued) = self.cmd.pop() {
+            self.apply_stop_epoch();
+            // 增益是持久参数，停止不能取消参数更新；旧播放/停止请求一律失效。
+            if queued.epoch != self.stop_epoch && !matches!(queued.command, Command::SetGain { .. })
+            {
+                continue;
+            }
+            match queued.command {
                 Command::Play { slot } => {
-                    if let Some(p) = self.players.get_mut(slot as usize) {
-                        p.trigger();
+                    if slot < self.players.len() {
+                        self.pending_player = Some(slot);
+                        if let Some(active) = self.active_player {
+                            self.players[active].stop();
+                        }
                     }
                 }
                 Command::Stop { slot } => {
-                    if let Some(p) = self.players.get_mut(slot as usize) {
-                        p.stop();
+                    if self.pending_player == Some(slot) {
+                        self.pending_player = None;
+                    }
+                    if self.active_player == Some(slot) {
+                        self.players[slot].stop();
                     }
                 }
                 Command::StopAll => {
-                    for p in self.players.iter_mut() {
-                        p.stop();
-                    }
+                    self.stop_players();
                 }
                 Command::SetGain { slot, db } => {
-                    if let Some(p) = self.players.get_mut(slot as usize) {
+                    if let Some(p) = self.players.get_mut(slot) {
                         p.gain.set(db);
                     }
                 }
             }
         }
 
+        // 设备可能提交超过预分配容量的回调；逐块处理全部帧，容量只决定内部块大小。
+        for chunk in out[..frames * dev_ch].chunks_mut(self.frames_cap * dev_ch) {
+            self.process_block(chunk);
+        }
+        out[frames * dev_ch..].fill(0.0);
+    }
+
+    fn apply_stop_epoch(&mut self) {
+        let epoch = self.ctl.stop_epoch.load(Ordering::Acquire);
+        if epoch != self.stop_epoch {
+            self.stop_players();
+            self.stop_epoch = epoch;
+        }
+    }
+
+    fn stop_players(&mut self) {
+        self.pending_player = None;
+        if let Some(active) = self.active_player {
+            self.players[active].stop();
+        }
+    }
+
+    fn render_sfx(&mut self, used: usize) {
+        let looping_override = self.ctl.looping_override.load(Ordering::Acquire);
+        if looping_override != self.applied_looping_override {
+            for player in &mut self.players {
+                player.looping = looping_override == 2;
+            }
+            self.applied_looping_override = looping_override;
+        }
+        self.sfx[..used].fill(0.0);
+        let mut offset = 0;
+        while offset < used {
+            if self.active_player.is_none() {
+                if let Some(next) = self.pending_player.take() {
+                    self.players[next].start();
+                    self.active_player = Some(next);
+                } else {
+                    self.sfx_idle_frames = self.sfx_idle_frames.saturating_add((used - offset) / 2);
+                    break;
+                }
+            }
+            let active = self.active_player.unwrap();
+            let player = &mut self.players[active];
+            self.sfx_idle_frames = 0;
+            offset += player.render_add(&mut self.sfx[offset..used]) * 2;
+            if player.is_active() {
+                break;
+            }
+            self.active_player = None;
+        }
+        // 切换淡出期间 UI 立即显示最后接受的选择，进度从新音效的开头计算。
+        let selected = self.pending_player.or(self.active_player);
+        self.stats
+            .playing
+            .store(selected.is_some(), Ordering::Relaxed);
+        self.stats
+            .active_slot
+            .store(selected.map_or(-1, |s| s as i32), Ordering::Relaxed);
+        self.stats.playhead.store(
+            if self.pending_player.is_some() {
+                0
+            } else {
+                selected.map_or(0, |s| (self.players[s].pos / 2) as u64)
+            },
+            Ordering::Relaxed,
+        );
+    }
+
+    fn process_block(&mut self, out: &mut [f32]) {
+        self.apply_stop_epoch();
+        let dev_ch = self.out_channels.max(1);
+        let frames = out.len() / dev_ch;
+        let used = frames * 2; // 内部立体声：交错 L/R
+
         // 1. 从环形缓冲取麦克风数据（立体声）
+        self.render_sfx(used);
         let mic = &mut self.mic[..used];
         let mut underrun = false;
         for f in mic.as_chunks_mut::<2>().0 {
@@ -586,25 +824,8 @@ impl RenderProcessor {
             .ring_fill
             .store(self.ring.slots(), Ordering::Relaxed);
 
-        // 2. 渲染所有音效槽位（累加）
-        let sfx = &mut self.sfx[..used];
-        sfx.fill(0.0);
-        let mut any_active = false;
-        let mut active_slot = -1i32;
-        let mut playhead = 0u64;
-        for (i, p) in self.players.iter_mut().enumerate() {
-            p.render_add(sfx);
-            if p.is_active() {
-                any_active = true;
-                if active_slot < 0 {
-                    active_slot = i as i32;
-                    playhead = (p.pos / 2) as u64;
-                }
-            }
-        }
-        self.stats.playing.store(any_active, Ordering::Relaxed);
-        self.stats.active_slot.store(active_slot, Ordering::Relaxed);
-        self.stats.playhead.store(playhead, Ordering::Relaxed);
+        // 2. 单个音效已经按顺序完成淡出/淡入，不同槽位不会同时写入同一帧。
+        let sfx = &self.sfx[..used];
 
         // 3. 混音（增益在实时线程读取，无锁）
         let mg = db_to_lin(self.ctl.mic_gain_db.get());
@@ -621,6 +842,19 @@ impl RenderProcessor {
                     as u32,
                 Ordering::Relaxed,
             );
+        }
+        let tail_frames = if self.limiter_enabled {
+            self.limiter.latency_frames()
+        } else {
+            0
+        };
+        if self.active_player.is_none()
+            && self.pending_player.is_none()
+            && self.sfx_idle_frames >= tail_frames
+        {
+            self.ctl
+                .stopped_epoch
+                .store(self.stop_epoch, Ordering::Release);
         }
 
         // 4.5 电平表 —— 量的是**限幅之后、真正送出去**的信号
@@ -672,11 +906,6 @@ impl RenderProcessor {
                 }
             }
         }
-        let dev_used = frames * dev_ch;
-        if dev_used < out.len() {
-            out[dev_used..].fill(0.0);
-        }
-
         self.stats
             .rendered_frames
             .fetch_add(frames as u64, Ordering::Relaxed);
@@ -709,6 +938,8 @@ impl EngineParts {
     /// * `output_format` —— 虚拟设备的格式（通常 48kHz / 2ch）
     /// * `slots` —— 音效槽位（已预解码并重采样到输出采样率）
     /// * `buffer_ms` —— 环形缓冲目标水位（毫秒），越大越稳、延迟越高
+    ///
+    /// 最终限幅另有固定 2ms 前视延迟（向上取整到输出采样率的完整帧）。
     pub fn build(
         input_format: StreamFormat,
         output_format: StreamFormat,
@@ -723,7 +954,7 @@ impl EngineParts {
 
         let (producer, consumer) = RingBuffer::<f32>::new(capacity);
         // 命令队列容量给足即可，控制事件频率极低
-        let (cmd_tx, cmd_rx) = RingBuffer::<Command>::new(256);
+        let (cmd_tx, cmd_rx) = RingBuffer::<QueuedCommand>::new(256);
 
         let stats = Arc::new(EngineStats {
             active_slot: AtomicI32::new(-1),
@@ -731,6 +962,9 @@ impl EngineParts {
         });
         let control = Arc::new(PlaybackControl {
             cmd: Mutex::new(cmd_tx),
+            stop_epoch: AtomicU64::new(0),
+            stopped_epoch: AtomicU64::new(0),
+            looping_override: AtomicU32::new(0),
             mic_gain_db: AtomicF32::new(0.0),
             sfx_gain_db: AtomicF32::new(-6.0),
             stats: stats.clone(),
@@ -739,10 +973,14 @@ impl EngineParts {
 
         let base_ratio = output_format.sample_rate as f64 / input_format.sample_rate.max(1) as f64;
 
+        let max_capture_ratio = base_ratio * 1.02;
+        let capture_chunk_frames = ((8192.0 / max_capture_ratio).floor() as usize).clamp(1, 1024);
+        let capture_output_samples =
+            ((capture_chunk_frames + 1) as f64 * max_capture_ratio).ceil() as usize + 8;
         let capture = CaptureProcessor {
             in_channels: input_format.ch(),
-            mono: Vec::with_capacity(8192),
-            resampled: vec![0.0; 32768],
+            mono: vec![0.0; capture_chunk_frames],
+            resampled: vec![0.0; capture_output_samples],
             resampler: LinearResampler::new(base_ratio),
             drift: DriftController::new(base_ratio, target_samples),
             ring: producer,
@@ -750,7 +988,7 @@ impl EngineParts {
             stats: stats.clone(),
         };
 
-        // 输出回调的缓冲通常 ≤ 4096 帧，给到 8192 帧足够
+        // 固定内部分块容量；更大的设备回调会完整处理成多个块。
         const FRAMES_CAP: usize = 8192;
         let players = slots
             .iter()
@@ -760,12 +998,17 @@ impl EngineParts {
         let render = RenderProcessor {
             ring: consumer,
             cmd: cmd_rx,
+            stop_epoch: 0,
             out_channels: output_format.ch(),
             frames_cap: FRAMES_CAP,
             mic: vec![0.0; FRAMES_CAP * 2],
             sfx: vec![0.0; FRAMES_CAP * 2],
             players,
-            limiter: Limiter::with_sample_rate(output_format.sample_rate),
+            active_player: None,
+            pending_player: None,
+            applied_looping_override: 0,
+            sfx_idle_frames: 0,
+            limiter: Limiter::with_channels(output_format.sample_rate, 2),
             limiter_enabled: true,
             ctl: control.clone(),
             stats: stats.clone(),
@@ -788,6 +1031,49 @@ impl EngineParts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    struct TrackingAllocator;
+    thread_local! {
+        static ALLOCATIONS: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    // 只记录当前测试线程的分配，避免并行测试影响结果。
+    unsafe impl GlobalAlloc for TrackingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let _ = ALLOCATIONS.try_with(|count| {
+                if let Some(n) = count.get() {
+                    count.set(Some(n + 1));
+                }
+            });
+            // SAFETY: 原样转发调用方提供的合法分配布局。
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: 使用与 System.alloc 相同的布局释放其返回的指针。
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static TEST_ALLOCATOR: TrackingAllocator = TrackingAllocator;
+
+    fn count_allocations(f: impl FnOnce()) -> usize {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ALLOCATIONS.with(|count| count.set(None));
+            }
+        }
+        ALLOCATIONS.with(|count| count.set(Some(0)));
+        let reset = Reset;
+        f();
+        let n = ALLOCATIONS.with(|count| count.get().unwrap());
+        drop(reset);
+        n
+    }
 
     fn 空槽位() -> Vec<SfxSlot> {
         Vec::new()
@@ -809,6 +1095,235 @@ mod tests {
             空槽位(),
             20,
         )
+    }
+
+    #[test]
+    fn exclusive_new_trigger_replaces_prior_pcm_and_reports_latest_slot() {
+        // Distinct channel fingerprints reveal overlap directly: A only in L,
+        // B only in R. Both remain long enough that natural completion cannot hide it.
+        let a = 构造槽位([0.25, 0.0].repeat(48_000), true);
+        let b = 构造槽位([0.0, 0.4].repeat(48_000), true);
+        let format = StreamFormat::stereo(48_000);
+        let mut e = EngineParts::build(format, format, vec![a, b], 20);
+        e.control.mic_gain_db.set(-100.0);
+        e.control.sfx_gain_db.set(0.0);
+        let mut output = vec![0.0; 4_096];
+        assert!(e.control.play(0));
+        e.render.process(&mut output);
+        assert!((output[3_000] - 0.25).abs() < 1e-6);
+        assert!(e.control.play(1));
+        e.render.process(&mut output);
+        let left = output[3_000];
+        let right = output[3_001];
+        let active_slot = e.control.active_slot();
+        assert!(left.abs() < 1e-6 && (right - 0.4).abs() < 1e-6 && active_slot == 1,
+            "B must replace A with exclusive PCM and active_slot=1; got L={left}, R={right}, active_slot={active_slot}");
+        assert!(
+            output
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|f| f[0].abs() < 1e-6 || f[1].abs() < 1e-6),
+            "旧音效和新音效不得在任何一帧重叠，包括限幅器的固定延迟"
+        );
+        let max_step = output
+            .as_chunks::<2>()
+            .0
+            .windows(2)
+            .flat_map(|w| [(w[1][0] - w[0][0]).abs(), (w[1][1] - w[0][1]).abs()])
+            .fold(0.0, f32::max);
+        assert!(max_step < 0.002, "顺序淡出/淡入应避免切换跳变: {max_step}");
+    }
+
+    #[test]
+    fn rapid_switch_keeps_latest_selection_without_render_allocation() {
+        let format = StreamFormat::stereo(48_000);
+        let mut e = EngineParts::build(
+            format,
+            format,
+            vec![
+                构造槽位([0.25, 0.0].repeat(48_000), true),
+                构造槽位([0.0, 0.4].repeat(48_000), true),
+            ],
+            20,
+        );
+        e.control.sfx_gain_db.set(0.0);
+        let mut output = vec![0.0; 4096];
+        assert!(e.control.play(0));
+        e.render.process(&mut output);
+        assert!(e.control.play(1));
+        e.render.process(&mut output[..64]);
+        assert_eq!(e.control.active_slot(), 1, "淡出期间 UI 也应选择 B");
+        assert_eq!(e.control.playhead_frames(), 0);
+        assert!(e.control.play(0));
+        assert!(e.control.play(1));
+        assert!(e.control.play(0));
+        assert!(!e.control.play(99), "无效槽位不能中断最后有效选择");
+        let allocations = count_allocations(|| e.render.process(&mut output));
+        assert_eq!(allocations, 0, "连续切换的回调仍须零分配");
+        assert_eq!(e.control.active_slot(), 0);
+        assert!(
+            output.as_chunks::<2>().0.iter().all(|f| f[1] == 0.0),
+            "尚未开始的 B 应被最新 A 取代，不能先播放 B"
+        );
+        assert!((output[3000] - 0.25).abs() < 1e-6);
+        assert_eq!(e.render.players.iter().filter(|p| p.active).count(), 1);
+    }
+
+    #[test]
+    fn play_barrier_runs_once_before_pcm_and_never_for_rejected_requests() {
+        let format = StreamFormat::stereo(48_000);
+        let mut e =
+            EngineParts::build(format, format, vec![构造槽位(vec![0.25; 96_000], true)], 20);
+        let control = e.control.clone();
+        control.sfx_gain_db.set(0.0);
+        let calls = Cell::new(0);
+        assert!(!control.play_with_barrier(99, || calls.set(calls.get() + 1)));
+        for _ in 0..256 {
+            assert!(control.play(0));
+        }
+        assert!(!control.play_with_barrier(0, || calls.set(calls.get() + 1)));
+        assert_eq!(calls.get(), 0, "拒绝请求不能关闭正在试听的音效");
+        control.stop_all();
+        let mut output = vec![0.0; 4096];
+        e.render.process(&mut output);
+        assert!(control.play_with_barrier(0, || {
+            calls.set(calls.get() + 1);
+            e.render.process(&mut output);
+            assert!(output.iter().all(|s| *s == 0.0), "屏障完成前新音效不能开始");
+        }));
+        assert_eq!(calls.get(), 1);
+        e.render.process(&mut output);
+        assert!((output[3000] - 0.25).abs() < 1e-6);
+        control.stop_all();
+        e.render.process(&mut output);
+        assert!(control.play_linked_with_barrier(0, &control, || calls.set(calls.get() + 1)));
+        assert_eq!(calls.get(), 2, "同一控制器作镜像时屏障也只能执行一次");
+    }
+
+    #[test]
+    fn cancelled_barrier_must_not_publish_a_late_play_after_stop() {
+        let format = StreamFormat::stereo(48_000);
+        let mut e = EngineParts::build(
+            format,
+            format,
+            vec![构造槽位([0.25, 0.0].repeat(4800), true)],
+            20,
+        );
+        let control = e.control.clone();
+        control.mic_gain_db.set(-100.0);
+        control.sfx_gain_db.set(0.0);
+        let cancelled = true;
+        let accepted = control.play_with_checked_barrier(0, || {
+            // A newer Stop arrives while the control barrier is retiring an
+            // older preview; the pending Play must be cancellable afterwards.
+            control.stop_epoch.fetch_add(1, Ordering::Release);
+            !cancelled
+        });
+        let mut output = vec![0.0; 9000 * 2];
+        e.render.process(&mut output);
+        assert!(
+            output.iter().all(|s| *s == 0.0),
+            "cancelled older Play emitted audible PCM after Stop"
+        );
+        assert!(!accepted);
+        assert!(control.stop_all_finished());
+    }
+
+    #[test]
+    fn checked_barrier_rejection_keeps_current_sound_position_and_microphone() {
+        let format = StreamFormat::stereo(48_000);
+        let mut e = EngineParts::build(
+            format,
+            format,
+            vec![
+                构造槽位([0.25, 0.0].repeat(4800), true),
+                构造槽位([0.0, 0.4].repeat(4800), true),
+            ],
+            20,
+        );
+        let control = e.control.clone();
+        control.sfx_gain_db.set(0.0);
+        assert!(control.play(0));
+        let mut output = vec![0.0; 1000 * 2];
+        e.render.process(&mut output);
+        let before = control.playhead_frames();
+        let calls = Cell::new(0);
+        assert!(!control.play_with_checked_barrier(1, || {
+            calls.set(calls.get() + 1);
+            false
+        }));
+        e.capture.process(&vec![0.2; 8192]);
+        assert_eq!(count_allocations(|| e.render.process(&mut output)), 0);
+        assert_eq!(control.active_slot(), 0);
+        assert_eq!(control.playhead_frames(), before + 1000);
+        assert!(
+            output[500 * 2..]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|f| { (f[0] - 0.45).abs() < 1e-5 && (f[1] - 0.2).abs() < 1e-5 }),
+            "cancelled switch must retain A and uninterrupted microphone PCM"
+        );
+        assert_eq!(calls.get(), 1);
+        assert!(!control.play_with_checked_barrier(99, || {
+            calls.set(99);
+            true
+        }));
+        for _ in 0..256 {
+            assert!(control.set_slot_gain(0, 0.0));
+        }
+        assert!(!control.play_with_checked_barrier(1, || {
+            calls.set(99);
+            true
+        }));
+        assert_eq!(
+            calls.get(),
+            1,
+            "invalid/full requests must not run a cancellation barrier"
+        );
+        e.render.process(&mut output);
+        assert_eq!(control.active_slot(), 0);
+        // The same endpoint supplied as both linked routes is still invoked
+        // once and uses the checked result, without self-deadlocking.
+        assert!(!control.play_linked_with_checked_barrier(1, &control, || {
+            calls.set(calls.get() + 1);
+            false
+        }));
+        assert_eq!(calls.get(), 2);
+        e.render.process(&mut output);
+        assert_eq!(control.active_slot(), 0);
+    }
+
+    #[test]
+    fn stop_ack_waits_for_callback_fade_and_limiter_tail_while_mic_continues() {
+        let format = StreamFormat::stereo(48_000);
+        let mut e =
+            EngineParts::build(format, format, vec![构造槽位(vec![0.25; 96_000], true)], 20);
+        e.control.sfx_gain_db.set(0.0);
+        assert!(e.control.play(0));
+        let mut output = vec![0.0; 4096];
+        e.render.process(&mut output);
+        e.capture.process(&vec![0.2; 8192]);
+        assert!(e.control.stop_all());
+        assert!(
+            !e.control.stop_all_finished(),
+            "未观察停止代次时不能确认静音"
+        );
+        e.render.process(&mut output[..64]);
+        assert!(!e.control.stop_all_finished(), "淡出尚未完成");
+        e.render.process(&mut output);
+        assert!(e.control.stop_all_finished());
+        assert!(
+            output[2000..].iter().all(|s| *s > 0.1),
+            "停止音效后麦克风仍应透传"
+        );
+        // 统计尚未反映的排队播放也不能绕过停止确认。
+        assert!(e.control.play(0));
+        assert!(e.control.stop_all());
+        assert!(!e.control.stop_all_finished());
+        e.render.process(&mut output);
+        assert!(e.control.stop_all_finished());
     }
 
     /// 渲染若干个缓冲区并返回观测到的峰值
@@ -928,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn 多槽位应独立工作且可叠加() {
+    fn 多槽位切换应始终只播放最后触发的音效() {
         let mut e = EngineParts::build(
             StreamFormat::new(48_000, 1),
             StreamFormat::new(48_000, 2),
@@ -957,10 +1472,12 @@ mod tests {
             "槽位 1 应独立可播"
         );
 
-        // 叠加：槽位 1 + 2 应约为 0.6
+        // 新选择代替前一槽位；先越过顺序淡出/淡入，再测稳态。
         ctl.play(2);
+        let _ = 渲染取峰值(&mut e, 4);
         let p = 渲染取峰值(&mut e, 6);
-        assert!((p - 0.6).abs() < 0.08, "两路叠加应约 0.6，实际 {p}");
+        assert!((p - 0.2).abs() < 0.01, "只应播放最后选择的 0.2，实际 {p}");
+        assert_eq!(ctl.active_slot(), 2);
 
         // 全部停止
         ctl.stop_all();
@@ -983,6 +1500,8 @@ mod tests {
 
         // 调低 12 dB
         assert!(ctl.set_slot_gain(0, -12.0), "设置应被接受");
+        // 前视限幅保留了 2ms 旧信号；先越过固定延迟再测量新增益。
+        let _ = 渲染取峰值(&mut e, 1);
         let quiet = 渲染取峰值(&mut e, 6);
         let delta = 20.0 * (quiet / full).log10();
         assert!(
@@ -992,6 +1511,7 @@ mod tests {
 
         // 调回去
         ctl.set_slot_gain(0, 0.0);
+        let _ = 渲染取峰值(&mut e, 1);
         let back = 渲染取峰值(&mut e, 6);
         assert!((back - full).abs() < 0.05, "调回 0dB 应恢复原幅度");
 
@@ -1145,6 +1665,335 @@ mod tests {
     }
 
     #[test]
+    fn looping_static_false_finishes_once_while_true_repeats_in_actual_pcm() {
+        let format = StreamFormat::stereo(48_000);
+        for looping in [false, true] {
+            let mut e = EngineParts::build(
+                format,
+                format,
+                vec![构造槽位(vec![0.3; 2048 * 2], looping)],
+                20,
+            );
+            e.control.sfx_gain_db.set(0.0);
+            assert!(e.control.play(0));
+            let mut output = vec![0.0; 6000 * 2];
+            e.render.process(&mut output);
+            assert!((output[1500 * 2] - 0.3).abs() < 1e-6);
+            let repeated_peak = output[2500 * 2..]
+                .iter()
+                .map(|s| s.abs())
+                .fold(0.0, f32::max);
+            if looping {
+                assert!((repeated_peak - 0.3).abs() < 1e-6);
+                assert!(e.control.is_playing());
+            } else {
+                assert_eq!(repeated_peak, 0.0, "静态 loop=false 不能进入第二轮");
+                assert!(!e.control.is_playing());
+            }
+        }
+    }
+
+    #[test]
+    fn looping_runtime_disable_finishes_current_cycle_without_repeating_head() {
+        let format = StreamFormat::stereo(48_000);
+        let samples: Vec<_> = (0..2048)
+            .flat_map(|i| if i < 1024 { [0.25, 0.0] } else { [0.0, 0.4] })
+            .collect();
+        let mut e = EngineParts::build(format, format, vec![构造槽位(samples, true)], 20);
+        e.control.sfx_gain_db.set(0.0);
+        assert!(e.control.play(0));
+        e.render.process(&mut vec![0.0; 1000 * 2]);
+        assert_eq!(e.control.playhead_frames(), 1000);
+        e.control.set_looping(false);
+        let mut output = vec![0.0; 3000 * 2];
+        let allocations = count_allocations(|| e.render.process(&mut output));
+        assert_eq!(allocations, 0);
+        assert!(
+            (output[400 * 2 + 1] - 0.4).abs() < 1e-6,
+            "关闭后继续当前轮，不立即停下或重启"
+        );
+        assert!(
+            output[120 * 2..]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|f| f[0] == 0.0),
+            "关闭循环后尾部不得交叉混入下一轮头部"
+        );
+        assert!(output[1200 * 2..].iter().all(|s| *s == 0.0));
+        assert!(!e.control.is_playing());
+        assert!(e.control.play(0));
+        e.render.process(&mut output);
+        assert!(
+            output[2200 * 2..].iter().all(|s| *s == 0.0),
+            "下一次触发也只播一轮"
+        );
+    }
+
+    #[test]
+    fn looping_runtime_enable_preserves_position_and_smooths_future_boundaries() {
+        let format = StreamFormat::stereo(48_000);
+        let samples: Vec<_> = (0..4800)
+            .flat_map(|i| {
+                let sample = i as f32 / 4800.0 * 1.6 - 0.8;
+                [sample, sample]
+            })
+            .collect();
+        let mut e = EngineParts::build(format, format, vec![构造槽位(samples, false)], 20);
+        e.control.sfx_gain_db.set(0.0);
+        assert!(e.control.play(0));
+        e.render.process(&mut vec![0.0; 1000 * 2]);
+        e.control.set_looping(true);
+        e.render.process(&mut [0.0; 128 * 2]);
+        assert_eq!(e.control.playhead_frames(), 1128, "开启循环不能倒退游标");
+        let mut output = vec![0.0; 20_000 * 2];
+        e.render.process(&mut output);
+        let max_step = output
+            .as_chunks::<2>()
+            .0
+            .windows(2)
+            .map(|w| (w[1][0] - w[0][0]).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            max_step < 0.01,
+            "初始非循环的素材也必须准备平滑循环边界: {max_step}"
+        );
+        assert!(e.control.is_playing());
+        assert!(output[10_000 * 2..].iter().any(|s| s.abs() > 0.2));
+    }
+
+    #[test]
+    fn looping_runtime_updates_survive_full_queue_and_never_revive_stopped_selection() {
+        let format = StreamFormat::stereo(48_000);
+        let mut e = EngineParts::build(
+            format,
+            format,
+            vec![
+                构造槽位([0.25, 0.0].repeat(2048), true),
+                构造槽位([0.0, 0.4].repeat(2048), true),
+            ],
+            20,
+        );
+        e.control.sfx_gain_db.set(0.0);
+        assert!(e.control.play(0));
+        e.render.process(&mut [0.0; 1000 * 2]);
+        for _ in 0..256 {
+            assert!(e.control.set_slot_gain(0, 0.0));
+        }
+        assert!(!e.control.play(1));
+        e.control.set_looping(false);
+        let mut output = vec![0.0; 6000 * 2];
+        e.render.process(&mut output);
+        assert!(!e.control.is_playing(), "满队列不能阻止循环参数更新");
+        e.control.set_looping(true);
+        e.render.process(&mut output);
+        assert!(
+            output.iter().all(|s| *s == 0.0),
+            "参数更新不能复活已结束音效"
+        );
+        assert!(e.control.play(0));
+        e.render.process(&mut [0.0; 1000 * 2]);
+        assert!(e.control.play(1));
+        e.render.process(&mut [0.0; 64 * 2]);
+        e.control.set_looping(false);
+        e.control.set_looping(true);
+        e.control.set_looping(false);
+        e.render.process(&mut output);
+        assert!(output
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|f| f[0] == 0.0 || f[1] == 0.0));
+        assert!(output[4000 * 2..].iter().all(|s| *s == 0.0));
+        assert!(
+            !e.control.is_playing(),
+            "快速切换按最后一次 false，仅播 B 一轮"
+        );
+        for _ in 0..256 {
+            assert!(e.control.play(0));
+        }
+        e.control.stop_all();
+        e.control.set_looping(true);
+        e.render.process(&mut output);
+        assert!(
+            output.iter().all(|s| *s == 0.0),
+            "开启循环不能恢复 stop 取消的排队选择"
+        );
+        assert!(e.control.stop_all_finished());
+    }
+
+    // Channel fingerprints make the product's single-sound contract observable
+    // in the rendered PCM, including fade transitions and limiter lookahead.
+    fn assert_single_sound_pcm(output: &[f32], channels: usize) {
+        assert!(
+            output.chunks_exact(channels).all(|frame| {
+                frame.iter().all(|sample| sample.is_finite())
+                    && (frame[0].abs() < 1e-6 || frame[1].abs() < 1e-6)
+            }),
+            "a rendered frame must never contain both A (L) and B (R)"
+        );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ComboAction {
+        PlayA,
+        PlayB,
+        Stop,
+        LoopOff,
+        LoopOn,
+    }
+
+    #[test]
+    fn combination_all_three_action_sequences_keep_one_sound_and_final_loop_choice() {
+        const ACTIONS: [ComboAction; 5] = [
+            ComboAction::PlayA,
+            ComboAction::PlayB,
+            ComboAction::Stop,
+            ComboAction::LoopOff,
+            ComboAction::LoopOn,
+        ];
+        // 125 triples × 3 initial selections × 2 initial modes × 3 callback
+        // schedules. The clip outlasts all intervening callbacks, so this
+        // independent oracle needs only the user's last play/stop and mode.
+        let format = StreamFormat::stereo(48_000);
+        let slots = [
+            构造槽位([0.25, 0.0].repeat(4800), false),
+            构造槽位([0.0, 0.4].repeat(4800), false),
+        ];
+        let mut output = vec![0.0; 9000 * 2];
+        for initial_selection in [None, Some(0), Some(1)] {
+            for initial_loop in [false, true] {
+                for callback_frames in [0, 17, 997] {
+                    for first in ACTIONS {
+                        for second in ACTIONS {
+                            for third in ACTIONS {
+                                let sequence = [first, second, third];
+                                let mut e = EngineParts::build(format, format, slots.to_vec(), 20);
+                                e.control.mic_gain_db.set(-100.0);
+                                e.control.sfx_gain_db.set(0.0);
+                                e.control.set_looping(initial_loop);
+                                if let Some(slot) = initial_selection {
+                                    assert!(e.control.play(slot));
+                                    e.render.process(&mut output[..1000 * 2]);
+                                    assert_single_sound_pcm(&output[..1000 * 2], 2);
+                                }
+                                let mut selected = initial_selection;
+                                let mut looping = initial_loop;
+                                for action in sequence {
+                                    match action {
+                                        ComboAction::PlayA => {
+                                            assert!(e.control.play(0));
+                                            selected = Some(0);
+                                        }
+                                        ComboAction::PlayB => {
+                                            assert!(e.control.play(1));
+                                            selected = Some(1);
+                                        }
+                                        ComboAction::Stop => {
+                                            assert!(e.control.stop_all());
+                                            selected = None;
+                                        }
+                                        ComboAction::LoopOff => {
+                                            e.control.set_looping(false);
+                                            looping = false;
+                                        }
+                                        ComboAction::LoopOn => {
+                                            e.control.set_looping(true);
+                                            looping = true;
+                                        }
+                                    }
+                                    let pcm = &mut output[..callback_frames * 2];
+                                    assert_eq!(count_allocations(|| e.render.process(pcm)), 0);
+                                    assert_single_sound_pcm(pcm, 2);
+                                }
+                                assert_eq!(count_allocations(|| e.render.process(&mut output)), 0);
+                                assert_single_sound_pcm(&output, 2);
+                                let expected = selected.filter(|_| looping);
+                                assert_eq!(e.control.active_slot(), expected.map_or(-1, |s| s as i32),
+                                    "selection={initial_selection:?}, initial_loop={initial_loop}, callback={callback_frames}, sequence={sequence:?}");
+                                assert_eq!(e.control.is_playing(), expected.is_some());
+                                match expected {
+                                    Some(0) => assert!(output[8000 * 2..]
+                                        .as_chunks::<2>()
+                                        .0
+                                        .iter()
+                                        .all(|f| (f[0] - 0.25).abs() < 1e-6 && f[1] == 0.0)),
+                                    Some(1) => assert!(output[8000 * 2..]
+                                        .as_chunks::<2>()
+                                        .0
+                                        .iter()
+                                        .all(|f| f[0] == 0.0 && (f[1] - 0.4).abs() < 1e-6)),
+                                    None => {
+                                        assert!(output[8000 * 2..].iter().all(|s| *s == 0.0));
+                                        assert!(e.control.stop_all_finished());
+                                    }
+                                    _ => unreachable!(),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn combination_seeded_long_trace_handles_tiny_and_oversized_callbacks_without_overlap() {
+        let format = StreamFormat::stereo(48_000);
+        let mut e = EngineParts::build(
+            format,
+            format,
+            vec![
+                构造槽位([0.25, 0.0].repeat(4800), false),
+                构造槽位([0.0, 0.4].repeat(4800), false),
+            ],
+            20,
+        );
+        e.control.mic_gain_db.set(-100.0);
+        e.control.sfx_gain_db.set(0.0);
+        let mut output = vec![0.0; 17_003 * 2];
+        let mut seed = 0x8d7a_54b9_37c2_120fu64;
+        for step in 0..4096 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            match (seed >> 32) % 7 {
+                0 | 1 => assert!(e.control.play(((seed >> 32) % 7) as usize)),
+                2 => {
+                    assert!(e.control.stop_all());
+                }
+                3 => e.control.set_looping(false),
+                4 => e.control.set_looping(true),
+                5 => assert!(!e.control.play(99)),
+                _ => {}
+            }
+            let frames = [0, 1, 17, 128, 997, 8193, 17_003][(seed as usize >> 8) % 7];
+            let pcm = &mut output[..frames * 2];
+            assert_eq!(
+                count_allocations(|| e.render.process(pcm)),
+                0,
+                "step={step}"
+            );
+            assert_single_sound_pcm(pcm, 2);
+            if step % 127 == 0 {
+                // Stopping, toggling either direction, then waiting must never
+                // resurrect a queued, active, or naturally completed sound.
+                e.control.stop_all();
+                e.control.set_looping(false);
+                e.control.set_looping(true);
+                assert_eq!(count_allocations(|| e.render.process(&mut output)), 0);
+                assert_single_sound_pcm(&output, 2);
+                assert!(output[8000 * 2..].iter().all(|s| *s == 0.0));
+                assert!(e.control.stop_all_finished());
+                assert!(!e.control.is_playing());
+            }
+        }
+        e.control.set_looping(false);
+        e.render.process(&mut output);
+        assert_single_sound_pcm(&output, 2);
+        assert!(output[8000 * 2..].iter().all(|s| *s == 0.0));
+        assert!(!e.control.is_playing());
+    }
+
+    #[test]
     fn 过载信号也不削波() {
         let mut e = 构造引擎();
         let input: Vec<f32> = (0..9600).map(|i| (i as f32 * 0.1).sin() * 8.0).collect();
@@ -1156,25 +2005,21 @@ mod tests {
     }
 
     #[test]
-    fn 音效叠加过载时限幅器应介入() {
+    fn 单个音效过载时限幅器应介入() {
         let mut e = EngineParts::build(
             StreamFormat::new(48_000, 1),
             StreamFormat::new(48_000, 2),
-            vec![
-                构造槽位(vec![0.9f32; 96000], true),
-                构造槽位(vec![0.9f32; 96000], true),
-            ],
+            vec![构造槽位(vec![1.8f32; 96000], true)],
             20,
         );
         let ctl = e.control.clone();
         ctl.sfx_gain_db.set(0.0);
         ctl.play(0);
-        ctl.play(1);
         let _ = 渲染取峰值(&mut e, 8);
         let s = ctl.stats();
         assert!(
             s.limiter_gain_db < -0.5,
-            "两路 0.9 叠加应触发限幅，实际增益 {}dB",
+            "单路 1.8 过载应触发限幅，实际增益 {}dB",
             s.limiter_gain_db
         );
         let peak = 渲染取峰值(&mut e, 4);
@@ -1310,5 +2155,192 @@ mod tests {
             0,
             "不应发生缓冲溢出"
         );
+    }
+
+    #[test]
+    fn 第两百五十七槽位的播放增益和停止应独立() {
+        let slots: Vec<_> = (0..257)
+            .map(|i| 构造槽位(vec![if i == 256 { 0.6 } else { 0.2 }; 4000], true))
+            .collect();
+        let mut e = EngineParts::build(
+            StreamFormat::new(48_000, 1),
+            StreamFormat::stereo(48_000),
+            slots,
+            20,
+        );
+        e.control.sfx_gain_db.set(0.0);
+        assert!(e.control.set_slot_gain(256, -6.0));
+        assert!(e.control.play(256));
+        let peak = 渲染取峰值(&mut e, 6);
+        assert!((peak - 0.6 * db_to_lin(-6.0)).abs() < 0.01);
+        assert_eq!(e.control.active_slot(), 256);
+        assert!(!e.render.players[0].active);
+        assert_eq!(e.render.players[0].gain.get(), 0.0);
+        assert!(e.control.stop(256));
+        let _ = 渲染取峰值(&mut e, 4);
+        assert!(渲染取峰值(&mut e, 2) < 1e-6);
+    }
+
+    #[test]
+    fn 停止全部必须取消排满队列的播放命令() {
+        let mut e = EngineParts::build(
+            StreamFormat::stereo(48_000),
+            StreamFormat::stereo(48_000),
+            vec![构造槽位(vec![0.5; 10_000], true)],
+            20,
+        );
+        for _ in 0..256 {
+            assert!(e.control.play(0));
+        }
+        assert!(!e.control.play(0), "满队列应返回背压");
+        assert!(e.control.stop_all(), "高优先级停止不能被队列占满阻止");
+        let mut out = vec![0.0; 2000];
+        e.render.process(&mut out);
+        assert!(
+            out.iter().all(|&s| s == 0.0),
+            "停止前的待播命令必须全部失效"
+        );
+        assert!(!e.control.is_playing());
+        assert!(e.control.play(0));
+        assert!(渲染取峰值(&mut e, 4) > 0.2, "消费旧队列后新播放应正常");
+    }
+
+    #[test]
+    fn 停止之后立即播放的新代次不能被旧停止清掉() {
+        let mut e = EngineParts::build(
+            StreamFormat::stereo(48_000),
+            StreamFormat::stereo(48_000),
+            vec![构造槽位(vec![0.5; 10_000], true)],
+            20,
+        );
+        assert!(e.control.set_slot_gain(0, -12.0));
+        assert!(e.control.play(0));
+        assert!(e.control.stop_all());
+        assert!(e.control.play(0));
+        assert!(渲染取峰值(&mut e, 4) > 0.05);
+        assert_eq!(
+            e.render.players[0].gain.get(),
+            -12.0,
+            "旧代次持久增益仍应生效"
+        );
+        assert!(e.control.is_playing());
+    }
+
+    #[test]
+    fn 循环直流每圈不应出现音量凹陷() {
+        let slot = 构造槽位(vec![0.5; 2000], true);
+        let mut p = FilePlayer::new(&slot, 48_000);
+        p.start();
+        let mut out = vec![0.0; 10_000];
+        p.render_add(&mut out);
+        for &s in &out[1000..] {
+            assert!((s - 0.5).abs() < 1e-6, "循环边界不得淡出到零：{s}");
+        }
+    }
+
+    #[test]
+    fn 不连续循环首尾应交叉淡变() {
+        let samples: Vec<_> = (0..2000)
+            .flat_map(|i| {
+                let s = i as f32 / 2000.0 * 1.6 - 0.8;
+                [s, s]
+            })
+            .collect();
+        let slot = 构造槽位(samples, true);
+        let mut p = FilePlayer::new(&slot, 48_000);
+        p.start();
+        let mut out = vec![0.0; 20_000];
+        p.render_add(&mut out);
+        let max_step = out
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|f| f[0])
+            .collect::<Vec<_>>()
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_step < 0.01, "原始首尾跳变约 1.6，应被平滑：{max_step}");
+    }
+
+    #[test]
+    fn 重触发淡出结束应立即进入淡入而不留整块静音() {
+        let slot = 构造槽位(vec![0.5; 20_000], true);
+        let format = StreamFormat::stereo(48_000);
+        let mut big = EngineParts::build(format, format, vec![slot.clone()], 20);
+        let mut small = EngineParts::build(format, format, vec![slot], 20);
+        for engine in [&mut big, &mut small] {
+            engine.control.sfx_gain_db.set(0.0);
+            engine.control.play(0);
+            engine.render.process(&mut vec![0.0; 2000]);
+            engine.control.play(0);
+        }
+        let mut actual = vec![0.0; 4000];
+        let mut expected = vec![0.0; 4000];
+        big.render.process(&mut actual);
+        for chunk in expected.chunks_mut(128) {
+            small.render.process(chunk);
+        }
+        assert_eq!(
+            actual, expected,
+            "重触发时音频不得因回调大小产生不同静音间隔"
+        );
+        assert!(actual[2000] > 0.49);
+    }
+
+    #[test]
+    fn 超大输出回调应完整渲染且与小块波形一致() {
+        for channels in [1, 2, 6] {
+            let slot = 构造槽位(vec![0.5; 48_000], true);
+            let mut big = EngineParts::build(
+                StreamFormat::new(48_000, 1),
+                StreamFormat::new(48_000, channels),
+                vec![slot.clone()],
+                20,
+            );
+            let mut small = EngineParts::build(
+                StreamFormat::new(48_000, 1),
+                StreamFormat::new(48_000, channels),
+                vec![slot],
+                20,
+            );
+            big.control.play(0);
+            small.control.play(0);
+            let mut actual = vec![f32::NAN; 20_000 * channels as usize];
+            let mut expected = vec![f32::NAN; actual.len()];
+            big.render.process(&mut actual);
+            for chunk in expected.chunks_mut(257 * channels as usize) {
+                small.render.process(chunk);
+            }
+            assert_eq!(big.control.stats().rendered_frames, 20_000);
+            assert!(actual[10_000 * channels as usize..]
+                .iter()
+                .all(|s| s.abs() > 0.2));
+            assert_eq!(
+                actual, expected,
+                "{channels}声道的大回调不得截断或改变消费速率"
+            );
+        }
+    }
+
+    #[test]
+    fn 大采集回调与高比率转换不得在实时路径分配() {
+        for (in_rate, out_rate) in [(48_000, 48_000), (8_000, 192_000), (192_000, 8_000)] {
+            let mut e = EngineParts::build(
+                StreamFormat::new(in_rate, 6),
+                StreamFormat::stereo(out_rate),
+                vec![],
+                20,
+            );
+            let input = vec![0.3; 20_000 * 6];
+            let mut out = vec![0.0; 20_000 * 2];
+            let n = count_allocations(|| {
+                e.capture.process(&input);
+                e.render.process(&mut out);
+            });
+            assert_eq!(n, 0, "{in_rate}→{out_rate} 采集和渲染必须零分配");
+            assert_eq!(e.control.stats().captured_frames, 20_000);
+            assert_eq!(e.control.stats().rendered_frames, 20_000);
+        }
     }
 }

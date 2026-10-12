@@ -72,6 +72,9 @@ extern "C" {
 
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
+    fn CFRelease(value: *const std::ffi::c_void);
+    fn CFStringGetLength(value: *const std::ffi::c_void) -> isize;
+    fn CFStringGetMaximumSizeForEncoding(length: isize, encoding: u32) -> isize;
     fn CFStringGetCString(
         s: *const std::ffi::c_void,
         buf: *mut i8,
@@ -116,10 +119,16 @@ fn device_name(id: AudioObjectID) -> String {
     if rc != 0 || cfstr.is_null() {
         return String::new();
     }
-    let mut buf = [0i8; 256];
+    let capacity =
+        unsafe { CFStringGetMaximumSizeForEncoding(CFStringGetLength(cfstr), 0x0800_0100) + 1 };
+    let mut buf = vec![0i8; capacity.max(1) as usize];
     // kCFStringEncodingUTF8 = 0x08000100
     let ok =
         unsafe { CFStringGetCString(cfstr, buf.as_mut_ptr(), buf.len() as isize, 0x0800_0100) };
+    // CoreAudio transfers ownership of this CFString to the caller.
+    unsafe {
+        CFRelease(cfstr);
+    }
     if !ok {
         return String::new();
     }
@@ -174,56 +183,6 @@ pub fn input_devices() -> Vec<(u32, String)> {
 /// 设备有没有输入流（用它区分麦克风和扬声器）。
 pub fn has_input_stream(id: AudioObjectID) -> bool {
     let addr = AudioObjectPropertyAddress::new(fourcc(b"stm#"), SCOPE_INPUT);
-    let mut size: u32 = 0;
-    let rc = unsafe { AudioObjectGetPropertyDataSize(id, &addr, 0, std::ptr::null(), &mut size) };
-    rc == 0 && size > 0
-}
-
-/// 所有**有输出流**的设备。
-///
-/// ⚠️ 热插拔检测必须用它，**不能用 cpal 的 `devices()`** ——
-/// 实测：在另一个线程里创建第二个 cpal 后端做枚举，会和主线程"开音频流"直接撞死
-/// （`start()` 卡住不动，日志停在参数打印那一行之后）。
-/// 这里的实现只做一次轻量的 CoreAudio 查询，不碰 cpal。
-pub fn output_devices() -> Vec<(u32, String)> {
-    let addr = AudioObjectPropertyAddress::new(fourcc(b"dev#"), SCOPE_GLOBAL);
-    let mut size: u32 = 0;
-    let rc = unsafe {
-        AudioObjectGetPropertyDataSize(
-            K_AUDIO_OBJECT_SYSTEM_OBJECT,
-            &addr,
-            0,
-            std::ptr::null(),
-            &mut size,
-        )
-    };
-    if rc != 0 {
-        return Vec::new();
-    }
-    let n = size as usize / std::mem::size_of::<u32>();
-    let mut ids = vec![0u32; n];
-    let rc = unsafe {
-        AudioObjectGetPropertyData(
-            K_AUDIO_OBJECT_SYSTEM_OBJECT,
-            &addr,
-            0,
-            std::ptr::null(),
-            &mut size,
-            ids.as_mut_ptr() as *mut std::ffi::c_void,
-        )
-    };
-    if rc != 0 {
-        return Vec::new();
-    }
-    ids.into_iter()
-        .filter(|&id| has_output_stream(id))
-        .map(|id| (id, device_name(id)))
-        .collect()
-}
-
-/// 设备有没有输出流。
-pub fn has_output_stream(id: AudioObjectID) -> bool {
-    let addr = AudioObjectPropertyAddress::new(fourcc(b"stm#"), u32::from_be_bytes(*b"outp"));
     let mut size: u32 = 0;
     let rc = unsafe { AudioObjectGetPropertyDataSize(id, &addr, 0, std::ptr::null(), &mut size) };
     rc == 0 && size > 0

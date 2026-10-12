@@ -26,6 +26,51 @@ fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
+/// Progress counters only have meaning inside the session that produced them.
+#[derive(Default)]
+struct AudioWatchdog {
+    generation: u64,
+    last: (u64, u64),
+    stalled: u32,
+}
+
+impl AudioWatchdog {
+    fn observe(&mut self, progress: (u64, u64, u64, bool)) -> Option<&'static str> {
+        let (generation, rendered, captured, panicked) = progress;
+        if generation == 0 {
+            *self = Self::default();
+            return None;
+        }
+        let frames = (rendered, captured);
+        if self.generation != generation {
+            self.generation = generation;
+            self.last = frames;
+            self.stalled = 0;
+            return None;
+        }
+        let why = if panicked {
+            Some("音频回调里发生过 panic")
+        } else if captured == self.last.1 {
+            Some("麦克风采集回调已停止推进")
+        } else if rendered == self.last.0 {
+            Some("音频渲染回调已停止推进")
+        } else {
+            None
+        };
+        self.last = frames;
+        if why.is_some() {
+            self.stalled += 1;
+        } else {
+            self.stalled = 0;
+        }
+        if self.stalled >= 3 {
+            why
+        } else {
+            None
+        }
+    }
+}
+
 // ─────────────────────────────────────────── 设备与文件
 
 #[tauri::command]
@@ -68,31 +113,29 @@ fn shellexpand_tilde(p: &str) -> String {
 // ─────────────────────────────────────────── 音频控制
 
 #[tauri::command]
-fn start(app: tauri::AppHandle, host: State<'_, AudioHost>, cfg: StartConfig) -> Res<()> {
-    // 启动失败**一定要进日志**。打包后的 App 没有控制台，错误只回到前端的话，
-    // 用户看到的是一个弹一下就消失的 toast，我们事后什么都查不到。
-    // （排查"点了启动没反应"时正是卡在这里：错误只在前端，日志里一片正常。）
-    let r = start_inner(app, host, cfg);
-    if let Err(e) = &r {
-        println!("[启动] ❌ 失败: {e}");
-    }
-    r
+fn begin_playback_operation(host: State<'_, AudioHost>) -> u64 {
+    // Only allocate an intent here. Slow device opens, preview decoding and
+    // stream closure remain on workers; a stop can supersede them immediately.
+    host.reserve_audio_request()
 }
 
-fn start_inner(app: tauri::AppHandle, host: State<'_, AudioHost>, cfg: StartConfig) -> Res<()> {
-    // 快路（设备没变就只重新激活）在 host.start 里面 —— 放那儿冒烟测试也能覆盖到。
-    println!(
-        "[启动] 前端送来的参数：monitor={} monitor_device={:?} output={:?} 文件 {} 个",
-        cfg.monitor,
-        cfg.monitor_device,
-        cfg.output_device,
-        cfg.files.len()
-    );
-    host.start(cfg, Some(&app)).map_err(|e| {
-        let msg = format!("{e:#}");
-        host.record_error(msg.clone());
-        msg
+#[tauri::command]
+async fn start(app: tauri::AppHandle, cfg: StartConfig, operation: Option<u64>) -> Res<bool> {
+    let ticket = operation.unwrap_or_else(|| app.state::<AudioHost>().reserve_audio_request());
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = app.state::<AudioHost>();
+        let result = host.start_requested(cfg, Some(&app), ticket);
+        result
+            .map(|()| host.audio_request_is_current(ticket))
+            .map_err(|e| {
+                let message = format!("{e:#}");
+                println!("[启动] ❌ 失败: {message}");
+                host.record_error(message.clone());
+                message
+            })
     })
+    .await
+    .map_err(err)?
 }
 
 /// 停止音效 —— **但继续转发麦克风**（队友照常听得到你说话）。
@@ -100,16 +143,30 @@ fn start_inner(app: tauri::AppHandle, host: State<'_, AudioHost>, cfg: StartConf
 /// 语义是「关掉音效」而不是「把我变成哑巴」：游戏的麦克风一直指着虚拟声卡，
 /// 一旦连转发也断了，虚拟声卡里就是一片死寂，队友会突然听不到你。
 #[tauri::command]
-fn stop(host: State<'_, AudioHost>) {
-    host.stop();
+async fn stop(app: tauri::AppHandle, operation: Option<u64>) -> Res<bool> {
+    let ticket = operation.unwrap_or_else(|| app.state::<AudioHost>().reserve_audio_request());
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = app.state::<AudioHost>();
+        host.stop_requested(ticket);
+        host.audio_request_is_current(ticket)
+    })
+    .await
+    .map_err(err)
 }
 
 /// 彻底释放音频设备（换设备、退出时用）。
 ///
 /// ⚠️ 释放后虚拟声卡里就没人写了 —— 游戏的麦克风如果还指着它，队友会听不到你。
 #[tauri::command]
-fn release(host: State<'_, AudioHost>) {
-    host.release();
+async fn release(app: tauri::AppHandle, operation: Option<u64>) -> Res<bool> {
+    let ticket = operation.unwrap_or_else(|| app.state::<AudioHost>().reserve_audio_request());
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = app.state::<AudioHost>();
+        host.release_requested(ticket);
+        host.audio_request_is_current(ticket)
+    })
+    .await
+    .map_err(err)
 }
 
 /// 一键切回真实麦克风。
@@ -122,7 +179,14 @@ fn release(host: State<'_, AudioHost>) {
 /// 对"跟随系统默认"的程序立刻生效。**但显式指定了设备的游戏改不了** ——
 /// 所以返回里带上"有没有真的改成功"和需要手动改的提醒。
 #[tauri::command]
-fn revert_to_real_mic(host: State<'_, AudioHost>) -> Res<serde_json::Value> {
+async fn revert_to_real_mic(app: tauri::AppHandle) -> Res<serde_json::Value> {
+    tauri::async_runtime::spawn_blocking(move || revert_mic_inner(&app))
+        .await
+        .map_err(err)?
+}
+
+fn revert_mic_inner(app: &tauri::AppHandle) -> Res<serde_json::Value> {
+    let host = app.state::<AudioHost>();
     #[cfg(target_os = "macos")]
     {
         let (ok, device, current) = host.revert_to_real_mic().map_err(err)?;
@@ -155,13 +219,28 @@ fn revert_to_real_mic(host: State<'_, AudioHost>) -> Res<serde_json::Value> {
 }
 
 #[tauri::command]
-fn play(host: State<'_, AudioHost>, slot: usize) -> Res<bool> {
-    host.play(slot).map_err(err)
+async fn play(app: tauri::AppHandle, slot: usize, operation: Option<u64>) -> Res<bool> {
+    let ticket = operation.unwrap_or_else(|| app.state::<AudioHost>().reserve_audio_request());
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = app.state::<AudioHost>();
+        host.play_requested(slot, ticket).map_err(err)
+    })
+    .await
+    .map_err(err)?
 }
 
 #[tauri::command]
-fn stop_all(host: State<'_, AudioHost>) -> Res<()> {
-    host.stop_all().map_err(err)
+async fn stop_all(app: tauri::AppHandle, operation: Option<u64>) -> Res<bool> {
+    let ticket = operation.unwrap_or_else(|| app.state::<AudioHost>().reserve_audio_request());
+    // 停止试听需要等待输出线程释放设备，不能阻塞 GUI 主线程。
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = app.state::<AudioHost>();
+        host.stop_all_requested(ticket)
+            .map(|()| host.audio_request_is_current(ticket))
+            .map_err(err)
+    })
+    .await
+    .map_err(err)?
 }
 
 #[tauri::command]
@@ -169,10 +248,29 @@ fn set_gains(host: State<'_, AudioHost>, mic_db: f32, sfx_db: f32) {
     host.set_gains(mic_db, sfx_db);
 }
 
+#[tauri::command]
+async fn set_looping(app: tauri::AppHandle, looping: bool) -> Res<bool> {
+    tauri::async_runtime::spawn_blocking(move || app.state::<AudioHost>().set_looping(looping))
+        .await
+        .map_err(err)
+}
+
 /// 调整单个音效的音量。
 #[tauri::command]
 fn set_slot_gain(host: State<'_, AudioHost>, slot: usize, db: f32) -> Res<bool> {
     host.set_slot_gain(slot, db).map_err(err)
+}
+
+/// 稳定音效 ID 同时定位主播放、监听与独立试听。
+#[tauri::command]
+async fn set_sound_gain(app: tauri::AppHandle, sound_id: String, db: f32) -> Res<bool> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<AudioHost>()
+            .set_sound_gain(&sound_id, db)
+            .map_err(err)
+    })
+    .await
+    .map_err(err)?
 }
 
 /// 前端 JS 出问题时把错误送到后端打出来。
@@ -344,10 +442,16 @@ fn remote_qr(host: State<'_, AudioHost>) -> Res<serde_json::Value> {
 /// 只能在**停止状态**跑 —— 引擎运行时两边会抢同一个设备。
 /// 用 async 让它跑在异步线程上，否则 4 秒的阻塞会把界面冻住。
 #[tauri::command]
-async fn self_test(output_device: Option<String>) -> Res<serde_json::Value> {
-    let b = backend_cpal::CpalBackend::new();
+async fn self_test(
+    app: tauri::AppHandle,
+    output_device: Option<String>,
+    capture_device: Option<String>,
+) -> Res<serde_json::Value> {
     let r = tauri::async_runtime::spawn_blocking(move || {
-        selftest::run_with_retry(&b, output_device, 440.0, 2.0, 3)
+        app.state::<AudioHost>().with_suspended(Some(&app), || {
+            let backend = backend_cpal::CpalBackend::new();
+            selftest::run_with_capture_retry(&backend, output_device, capture_device, 440.0, 2.0, 3)
+        })
     })
     .await
     .map_err(|e| format!("自检线程失败: {e}"))?
@@ -401,13 +505,37 @@ fn open_url(url: String) -> Res<()> {
 
 /// 试听：只放给自己听，不送进虚拟麦克风。
 #[tauri::command]
-fn preview(host: State<'_, AudioHost>, file: String, gain_db: f32) -> Res<()> {
-    host.preview(PathBuf::from(file), gain_db).map_err(err)
+async fn preview(
+    app: tauri::AppHandle,
+    file: String,
+    gain_db: f32,
+    sound_id: Option<String>,
+    operation: Option<u64>,
+) -> Res<bool> {
+    let ticket = operation.unwrap_or_else(|| app.state::<AudioHost>().reserve_audio_request());
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = app.state::<AudioHost>();
+        match sound_id {
+            Some(id) => host.preview_sound_requested(id, PathBuf::from(file), gain_db, ticket),
+            None => host.preview_requested(PathBuf::from(file), gain_db, ticket),
+        }
+        .map(|()| host.audio_request_is_current(ticket))
+        .map_err(err)
+    })
+    .await
+    .map_err(err)?
 }
 
 #[tauri::command]
-fn stop_preview(host: State<'_, AudioHost>) {
-    host.stop_preview();
+async fn stop_preview(app: tauri::AppHandle, operation: Option<u64>) -> Res<bool> {
+    let ticket = operation.unwrap_or_else(|| app.state::<AudioHost>().reserve_audio_request());
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = app.state::<AudioHost>();
+        host.stop_preview_requested(ticket);
+        host.audio_request_is_current(ticket)
+    })
+    .await
+    .map_err(err)
 }
 
 /// 多选音频文件（原生文件选择框）。
@@ -433,78 +561,19 @@ fn status(host: State<'_, AudioHost>) -> StatusDto {
 
 /// 前端加载完成后主动上报 —— 用来证明 WebView 真的渲染并执行了 JS。
 /// `--probe` 模式下会把它打印出来，供自动化验证。
-/// 读取上次保存的配置（音效目录、设备、增益、热键）。
-#[tauri::command]
-fn load_config() -> serde_json::Value {
-    let c = Config::load();
-    // 音效库条目：路径 / 显示名 / 音量 / 标签
-    let items: Vec<serde_json::Value> = if c.sound_files.is_empty() {
-        // 没有显式列表时退回扫目录，此时没有自定义名与标签
-        c.collect_sounds()
-            .unwrap_or_default()
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                serde_json::json!({
-                    "file": p.display().to_string(),
-                    "name": p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
-                    "gain": c.normalized_gains(i + 1).get(i).copied().unwrap_or(0.0),
-                    "tags": "",
-                })
-            })
-            .collect()
-    } else {
-        c.sound_items()
-            .iter()
-            .map(|it| {
-                serde_json::json!({
-                    "file": it.path.display().to_string(),
-                    "name": it.name,
-                    "gain": it.gain_db,
-                    "tags": it.tags.join(","),
-                })
-            })
-            .collect()
-    };
+fn sound_item_dto(item: &app_config::SoundEntry) -> serde_json::Value {
     serde_json::json!({
-        "items": items,
-        "monitor": c.monitor,
-        "monitor_device": c.monitor_device,
-        "dir": c.sound_dirs.first().map(|p| p.display().to_string()).unwrap_or_default(),
-        "input_device": c.input_device,
-        "output_device": c.output_device,
-        "buffer_ms": c.buffer_ms.unwrap_or(20),
-        "mic_gain_db": c.mic_gain_db.unwrap_or(0.0),
-        "sfx_gain_db": c.sfx_gain_db.unwrap_or(-6.0),
-        "hotkeys": c.hotkeys.join(","),
-        "path": Config::path().display().to_string(),
+        "id": item.id,
+        "file": item.path.display().to_string(),
+        "name": item.name,
+        "gain": item.gain_db,
+        "tags": item.tags,
+        "hotkey": item.hotkey,
     })
 }
 
-/// 保存当前设置，下次打开自动恢复。
-#[tauri::command]
-#[allow(clippy::too_many_arguments)]
-fn save_config(
-    items: Vec<serde_json::Value>,
-    monitor: bool,
-    monitor_device: Option<String>,
-    dir: String,
-    input_device: Option<String>,
-    output_device: Option<String>,
-    buffer_ms: u32,
-    mic_gain_db: f32,
-    sfx_gain_db: f32,
-    hotkeys: String,
-) -> Result<(), String> {
-    let mut c = Config::load();
-    c.set("sound_dirs", &dir).map_err(err)?;
-    c.set("monitor", if monitor { "true" } else { "false" })
-        .map_err(err)?;
-    c.set("monitor_device", monitor_device.as_deref().unwrap_or(""))
-        .map_err(err)?;
-
-    // 音效库：整组覆盖（路径/音量/名字/标签），保持并行数组一一对应
-    let parsed: Vec<app_config::SoundItem> = items
+fn parse_sound_items(items: &[serde_json::Value]) -> Vec<app_config::SoundEntry> {
+    items
         .iter()
         .filter_map(|v| {
             let file = v.get("file")?.as_str()?.to_string();
@@ -523,23 +592,115 @@ fn save_config(
                         .unwrap_or_else(|| "未命名".into())
                 });
             let gain = v.get("gain").and_then(|x| x.as_f64()).unwrap_or(0.0) as f32;
-            let tags: Vec<String> = v
-                .get("tags")
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .split([',', '|', ';'])
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-                .collect();
-            Some(app_config::SoundItem {
+            let tags = match v.get("tags") {
+                Some(serde_json::Value::Array(tags)) => tags
+                    .iter()
+                    .filter_map(|tag| tag.as_str().map(str::to_owned))
+                    .collect(),
+                Some(serde_json::Value::String(tags)) => tags
+                    .split([',', '|', ';'])
+                    .map(|tag| tag.trim().to_owned())
+                    .filter(|tag| !tag.is_empty())
+                    .collect(),
+                _ => Vec::new(),
+            };
+            Some(app_config::SoundEntry {
+                id: v
+                    .get("id")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
+                hotkey: v
+                    .get("hotkey")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_owned(),
                 path,
                 name,
                 gain_db: gain,
                 tags,
             })
         })
-        .collect();
-    c.set_sound_items(&parsed);
+        .collect()
+}
+
+/// 读取上次保存的配置（音效目录、设备、增益、热键）。
+#[tauri::command]
+fn load_config() -> serde_json::Value {
+    let c = Config::load();
+    saved_config_dto(&c)
+}
+
+fn saved_config_dto(c: &Config) -> serde_json::Value {
+    // 音效库条目：路径 / 显示名 / 音量 / 标签
+    let items: Vec<serde_json::Value> = if c.sound_files.is_empty() {
+        // 没有显式列表时退回扫目录，此时没有自定义名与标签
+        c.collect_sounds()
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                serde_json::json!({
+                    "file": p.display().to_string(),
+                    "name": p.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(),
+                    "gain": c.normalized_gains(i + 1).get(i).copied().unwrap_or(0.0),
+                    "tags": Vec::<String>::new(),
+                })
+            })
+            .collect()
+    } else {
+        c.sound_entries().iter().map(sound_item_dto).collect()
+    };
+    serde_json::json!({
+        "items": items,
+        "monitor": c.monitor,
+        "looping": c.looping,
+        "monitor_device": c.monitor_device,
+        "dir": c.sound_dirs.first().map(|p| p.display().to_string()).unwrap_or_default(),
+        "input_device": c.input_device,
+        "output_device": c.output_device,
+        "buffer_ms": c.buffer_ms.unwrap_or(20),
+        "mic_gain_db": c.mic_gain_db.unwrap_or(0.0),
+        "sfx_gain_db": c.sfx_gain_db.unwrap_or(-6.0),
+        "hotkeys": c.hotkeys.join(","),
+        "path": Config::path().display().to_string(),
+    })
+}
+
+/// 保存当前设置，下次打开自动恢复。
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn save_config(
+    items: Vec<serde_json::Value>,
+    monitor: bool,
+    looping: Option<bool>,
+    monitor_device: Option<String>,
+    dir: String,
+    input_device: Option<String>,
+    output_device: Option<String>,
+    buffer_ms: u32,
+    mic_gain_db: f32,
+    sfx_gain_db: f32,
+    hotkeys: String,
+) -> Result<(), String> {
+    let mut c = Config::load();
+    c.sound_dirs = if dir.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![PathBuf::from(dir)]
+    };
+    c.set("monitor", if monitor { "true" } else { "false" })
+        .map_err(err)?;
+    if let Some(looping) = looping {
+        c.set("looping", if looping { "true" } else { "false" })
+            .map_err(err)?;
+    }
+    c.set("monitor_device", monitor_device.as_deref().unwrap_or(""))
+        .map_err(err)?;
+
+    // 音效库：整组覆盖（路径/音量/名字/标签），保持并行数组一一对应
+    let parsed = parse_sound_items(&items);
+    c.set_sound_entries(&parsed);
     c.set("input_device", input_device.as_deref().unwrap_or("none"))
         .map_err(err)?;
     c.set("output_device", output_device.as_deref().unwrap_or("none"))
@@ -566,7 +727,7 @@ fn frontend_ready(info: String) {
 /// 菜单栏图标 + 菜单。关闭窗口后靠它把窗口找回来、或真正退出。
 fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
-    let stop = MenuItem::with_id(app, "stop", "全部停止音效", true, None::<&str>)?;
+    let stop = MenuItem::with_id(app, "stop", "停止音效与试听", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     // 「切回真实麦克风」目前只有 macOS 实现（改的是系统默认输入设备）。
     // Windows 上要改的是"默认通信设备"，那是另一套 API —— 见 TODO。
@@ -595,25 +756,23 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         .on_menu_event(|app, ev| match ev.id.as_ref() {
             "show" => show_window(app),
             "stop" => {
-                let _ = app.state::<AudioHost>().stop_all();
-                println!("[菜单栏] 已全部停止");
+                let ticket = app.state::<AudioHost>().reserve_audio_request();
+                let app = app.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    match app.state::<AudioHost>().stop_all_requested(ticket) {
+                        Ok(()) => println!("[菜单栏] 已停止音效与试听"),
+                        Err(e) => println!("[菜单栏] 停止失败: {e}"),
+                    }
+                });
             }
             #[cfg(target_os = "macos")]
             "revert" => {
-                // 用户点这个就说明他不想再用虚拟麦克风了 —— 把系统默认输入切回真实麦克风。
-                // ⚠️ 显式指定了麦克风的游戏改不了，要提醒用户自己进去改。
-                match app.state::<AudioHost>().revert_to_real_mic() {
-                    Ok((true, dev, _)) => println!("[菜单栏] 已切回真实麦克风：{dev}"),
-                    Ok((false, dev, cur)) => {
-                        println!("[菜单栏] ⚠ 切到「{dev}」没生效，当前仍是「{cur}」")
-                    }
-                    Err(e) => println!("[菜单栏] ❌ 切回失败: {e:#}"),
-                }
+                let app = app.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    if let Err(e) = revert_mic_inner(&app) { println!("[菜单栏] ❌ 切回失败: {e}"); }
+                });
             }
-            "quit" => {
-                app.state::<AudioHost>().stop();
-                app.exit(0);
-            }
+            "quit" => request_exit(app),
             _ => {}
         })
         .on_tray_icon_event(|tray, ev| {
@@ -652,13 +811,27 @@ fn acquire_single_instance() -> Option<std::net::TcpListener> {
     std::net::TcpListener::bind(("127.0.0.1", SINGLE_INSTANCE_PORT)).ok()
 }
 
+/// Keep the native event loop responsive until thread-owned resources are released.
+fn request_exit(app: &tauri::AppHandle) {
+    if !app.state::<AudioHost>().begin_shutdown() {
+        return;
+    }
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = app.state::<AudioHost>();
+        #[cfg(target_os = "macos")]
+        if let Err(e) = host.revert_to_real_mic() {
+            println!("[退出] 恢复真实麦克风失败: {e:#}");
+        }
+        host.release();
+        host.finish_shutdown();
+        app.exit(0);
+    });
+}
+
 fn main() {
-    // ⚠️ 必须在**主线程**登记一次（也就是这里）。
-    //
-    // Windows 上热键的隐藏窗口必须建在跑消息循环的线程上 —— 拿不准的话
-    // `is_main_thread()` 返回 false，会把绑定调度到主线程；但要是
-    // 主线程压根没登记，那个调度判断就没有依据。
-    // 不登记的代价是热键**静默失效**（按了没反应，也不报错）。
+    // macOS 的 Carbon 热键在应用主线程创建和注销，需要先登记该线程。
+    // Windows 热键由独立的消息线程拥有和派发。
     hotkeys::note_main_thread();
     // 最先装 —— 越早装，越不会漏掉启动阶段的 panic
     host::install_panic_hook();
@@ -732,44 +905,52 @@ fn main() {
                     .name("hotplug".into())
                     .spawn(move || {
                         use tauri::Manager;
-                        let mut last = String::new();
+                        let mut last: Option<(u64, String)> = None;
                         loop {
                             std::thread::sleep(std::time::Duration::from_secs(2));
                             let host = h.state::<AudioHost>();
-                            let Some((in_lost, out_lost, name)) = host.check_devices() else {
-                                if !last.is_empty() {
-                                    host.set_device_lost(None);
-                                    last.clear();
+                            if host.is_quitting() { break; }
+                            let Some((generation, in_lost, out_lost, name)) = host.check_devices() else {
+                                if let Some((generation, _)) = last.take() {
+                                    host.set_device_lost_for(generation, None);
                                 }
                                 continue;
                             };
                             let key = format!("{in_lost}/{out_lost}/{name}");
-                            if key == last {
+                            if last.as_ref().is_some_and(|previous| previous.0 == generation && previous.1 == key) {
                                 continue; // 同一件事不重复报
                             }
-                            last = key;
+                            last = Some((generation, key));
 
                             if out_lost {
                                 let msg = format!(
                                     "虚拟声卡「{name}」不见了 —— 队友现在听不到你。\
                                      请重新选一个输出设备，再点「启动」。"
                                 );
-                                println!("[热插拔] ❌ {msg}");
-                                host.set_device_lost(Some(msg));
+                                if host.set_device_lost_for(generation, Some(msg.clone())) {
+                                    println!("[热插拔] ❌ {msg}");
+                                }
                             } else if in_lost {
+                                if !host.set_device_lost_for(generation, Some(format!(
+                                    "麦克风「{name}」已断开，正在自动切到系统默认麦克风…"
+                                ))) {
+                                    continue;
+                                }
                                 println!(
                                     "[热插拔] ⚠ 麦克风「{name}」已断开，自动切到系统默认麦克风…"
                                 );
-                                match host.recover_input_device(Some(&h)) {
-                                    Ok(old) => {
-                                        println!("[热插拔] ✅ 已从「{old}」切到系统默认麦克风");
-                                        host.set_device_lost(Some(format!(
+                                match host.recover_input_device(generation, Some(&h)) {
+                                    Ok(Some((new_generation, old))) => {
+                                        if host.set_device_lost_for(new_generation, Some(format!(
                                             "麦克风「{old}」已断开，已自动切到系统默认麦克风。"
-                                        )));
+                                        ))) {
+                                            println!("[热插拔] ✅ 已从「{old}」切到系统默认麦克风");
+                                        }
                                     }
+                                    Ok(None) => {}
                                     Err(e) => {
                                         println!("[热插拔] ❌ 自动恢复失败: {e:#}");
-                                        host.set_device_lost(Some(format!(
+                                        host.set_device_lost_for(generation, Some(format!(
                                             "麦克风「{name}」已断开，且自动恢复失败：{e}"
                                         )));
                                     }
@@ -796,54 +977,37 @@ fn main() {
                     .name("audio-watchdog".into())
                     .spawn(move || {
                         use tauri::Manager;
-                        let mut last = 0u64;
-                        let mut stalled = 0u32;
+                        let mut watchdog = AudioWatchdog::default();
                         loop {
                             std::thread::sleep(std::time::Duration::from_secs(1));
                             let host = h.state::<AudioHost>();
-                            if !host.audio_alive() {
-                                // 引擎本来就没跑 —— 不算"卡死"，清掉报警
-                                stalled = 0;
-                                last = 0;
-                                if host.status().audio_stalled.is_some() {
-                                    host.set_audio_stalled(None);
-                                }
-                                continue;
-                            }
-                            let frames = host.rendered_frames();
-                            let panicked = backend_cpal::engine_panicked();
-                            if frames == last || panicked {
-                                stalled += 1;
-                                if stalled >= 3 {
-                                    let why = if panicked {
-                                        "音频回调里发生过 panic"
-                                    } else {
-                                        "音频回调已停止推进（流可能已经死了）"
-                                    };
-                                    println!("[看门狗] ⚠ {why} —— 自动重启音频");
-                                    host.set_audio_stalled(Some(format!("{why}，正在自动重启…")));
-                                    match host.restart_audio(Some(&h)) {
-                                        Ok(()) => {
-                                            println!("[看门狗] ✅ 音频已自动恢复");
-                                            host.set_audio_stalled(Some(format!(
-                                                "{why} —— 已自动恢复，如果队友那边断过，让他们重新连一下"
-                                            )));
-                                        }
-                                        Err(e) => {
-                                            println!("[看门狗] ❌ 自动恢复失败: {e:#}");
-                                            host.set_audio_stalled(Some(format!(
-                                                "{why}，且自动恢复失败：{e}。请手动点「启动」重试"
-                                            )));
-                                        }
-                                    }
-                                    stalled = 0;
-                                    last = host.rendered_frames();
+                            if host.is_quitting() { break; }
+                            let progress = host.audio_progress();
+                            let generation = progress.0;
+                            if let Some(why) = watchdog.observe(progress) {
+                                if !host.set_audio_stalled_for(generation, Some(format!("{why}，正在自动重启…"))) {
+                                    watchdog = AudioWatchdog::default();
                                     continue;
                                 }
-                            } else {
-                                stalled = 0;
+                                println!("[看门狗] ⚠ {why} —— 自动重启音频");
+                                match host.restart_audio(generation, Some(&h)) {
+                                    Ok(Some(new_generation)) => {
+                                        if host.set_audio_stalled_for(new_generation, Some(format!(
+                                            "{why} —— 已自动恢复，如果队友那边断过，让他们重新连一下"
+                                        ))) {
+                                            println!("[看门狗] ✅ 音频已自动恢复");
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        println!("[看门狗] ❌ 自动恢复失败: {e:#}");
+                                        host.set_audio_stalled_for(generation, Some(format!(
+                                            "{why}，且自动恢复失败：{e}。请手动点「启动」重试"
+                                        )));
+                                    }
+                                }
+                                watchdog = AudioWatchdog::default();
                             }
-                            last = frames;
                         }
                     })
                     .ok();
@@ -904,7 +1068,7 @@ fn main() {
                     );
                     println!("[探针] {msg}");
                     let _ = std::fs::write("/tmp/close_probe.txt", &msg);
-                    h.exit(0);
+                    request_exit(&h);
                 });
             }
             Ok(())
@@ -919,6 +1083,7 @@ fn main() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            begin_playback_operation,
             list_devices,
             guess_output,
             scan_dir,
@@ -930,7 +1095,9 @@ fn main() {
             play,
             stop_all,
             set_gains,
+            set_looping,
             set_slot_gain,
+            set_sound_gain,
             add_files,
             preview,
             stop_preview,
@@ -947,8 +1114,67 @@ fn main() {
             load_config,
             save_config,
         ])
-        .run(tauri::generate_context!())
-        .expect("启动界面失败");
+        .build(tauri::generate_context!())
+        .expect("构建界面失败")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                if !app.state::<AudioHost>().shutdown_done() { api.prevent_exit(); request_exit(app); }
+            }
+        });
+}
+
+#[cfg(test)]
+mod watchdog_tests {
+    use super::AudioWatchdog;
+
+    #[test]
+    fn 切换会话后不能沿用旧的停滞次数或进度基线() {
+        let mut watchdog = AudioWatchdog::default();
+        assert_eq!(watchdog.observe((1, 100, 100, false)), None);
+        assert_eq!(watchdog.observe((1, 200, 100, false)), None);
+        assert_eq!(watchdog.observe((1, 300, 100, false)), None);
+        assert_eq!(watchdog.observe((2, 0, 0, false)), None);
+        assert_eq!(watchdog.observe((2, 100, 100, false)), None);
+        assert_eq!(watchdog.observe((2, 200, 100, false)), None);
+        assert_eq!(watchdog.observe((2, 300, 100, false)), None);
+        assert_eq!(
+            watchdog.observe((2, 400, 100, false)),
+            Some("麦克风采集回调已停止推进")
+        );
+    }
+
+    #[test]
+    fn 释放会话后重新启动要重新累计且持续推进会清掉停滞() {
+        let mut watchdog = AudioWatchdog::default();
+        watchdog.observe((1, 100, 100, false));
+        watchdog.observe((1, 100, 200, false));
+        watchdog.observe((1, 100, 300, false));
+        assert_eq!(watchdog.observe((0, 0, 0, false)), None);
+        assert_eq!(watchdog.observe((2, 0, 0, false)), None);
+        assert_eq!(watchdog.observe((2, 0, 100, false)), None);
+        assert_eq!(watchdog.observe((2, 0, 200, false)), None);
+        assert_eq!(watchdog.observe((2, 100, 300, false)), None);
+        assert_eq!(watchdog.observe((2, 100, 400, false)), None);
+        assert_eq!(watchdog.observe((2, 100, 500, false)), None);
+        assert_eq!(
+            watchdog.observe((2, 100, 600, false)),
+            Some("音频渲染回调已停止推进")
+        );
+    }
+
+    #[test]
+    fn 回调_panic_即使进度还在推进也会被发现且不会跨会话() {
+        let mut watchdog = AudioWatchdog::default();
+        watchdog.observe((1, 100, 100, true));
+        assert_eq!(watchdog.observe((1, 200, 200, true)), None);
+        assert_eq!(watchdog.observe((1, 300, 300, true)), None);
+        assert_eq!(
+            watchdog.observe((1, 400, 400, true)),
+            Some("音频回调里发生过 panic")
+        );
+        assert_eq!(watchdog.observe((2, 0, 0, false)), None);
+        assert_eq!(watchdog.observe((2, 100, 100, false)), None);
+    }
 }
 
 #[cfg(test)]
@@ -1063,5 +1289,55 @@ mod platform_info_tests {
                 "{p:?} 把 x-apple.systempreferences: 下发到前端了"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod sound_item_dto_tests {
+    use super::*;
+
+    #[test]
+    fn loop_preference_is_a_boolean_in_the_gui_config_dto() {
+        for looping in [false, true] {
+            let config = Config::parse(&format!(
+                "looping = {looping}\nsound_files = [\"fixture.wav\"]\n"
+            ));
+            assert_eq!(
+                saved_config_dto(&config)["looping"],
+                serde_json::json!(looping)
+            );
+        }
+        assert_eq!(
+            saved_config_dto(&Config::default())["looping"],
+            serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn structured_tags_ids_and_empty_hotkey_survive_gui_json_roundtrip() {
+        let item = app_config::SoundEntry {
+            id: "stable-sound-id".into(),
+            path: PathBuf::from("声音,a.wav"),
+            name: "A/B 鼓点".into(),
+            gain_db: -12.0,
+            hotkey: String::new(),
+            tags: vec![
+                "a,b".into(),
+                "x|y".into(),
+                "鼓;点".into(),
+                "；中文，标签".into(),
+            ],
+        };
+        let dto = sound_item_dto(&item);
+        let saved = parse_sound_items(&[serde_json::from_str(&dto.to_string()).unwrap()]);
+        assert_eq!(saved, vec![item]);
+    }
+
+    #[test]
+    fn legacy_tag_text_remains_readable() {
+        let parsed = parse_sound_items(&[serde_json::json!({
+            "file": "legacy.wav", "tags": " old, second| third; ",
+        })]);
+        assert_eq!(parsed[0].tags, ["old", "second", "third"]);
     }
 }

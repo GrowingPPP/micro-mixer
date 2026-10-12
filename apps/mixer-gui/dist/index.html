@@ -59,8 +59,8 @@
     <label class="narrow">音效
       <span class="withunit"><input id="inSfxGain" type="number" value="-6" step="1"><i>dB</i></span>
     </label>
-    <label class="check">
-      <input id="inLoop" type="checkbox"> 循环
+    <label class="check" title="循环播放正式音效与监听；取消后当前一遍结束即停止。试听始终只播放一次。">
+      <input id="inLoop" type="checkbox" aria-label="循环播放" aria-describedby="loopHelp"> 循环播放
     </label>
     <label class="check" title="触发的音效同时放给你自己听 —— 游戏里唯一能确认「按下去了」的反馈">
       <input id="inMonitor" type="checkbox" checked> 监听
@@ -69,6 +69,8 @@
       <input id="inRemote" type="checkbox" checked> 手机遥控
     </label>
   </div>
+
+  <p id="loopHelp" class="hint">循环已关闭：正式播放与监听在当前一遍结束后停止。试听始终只播放一次。</p>
 
   <div class="calibrow">
     <button id="btnCalib" class="ghost" title="测 5 秒，自动算出麦克风该补多少增益，省得你来回拖滑杆试">
@@ -109,9 +111,10 @@
   <span id="remote" class="remote"></span>
   <button id="btnQr" class="ghost">二维码</button>
   <span id="toast" class="toast"></span>
-  <button id="btnStopAll" class="ghost" title="把正在响的音效掐掉（长音效不用等它放完）。不影响麦克风转发，也不影响热键。">停止播放 <kbd>空格</kbd></button>
+  <button id="btnStopAll" class="ghost" title="立即停止音效播放和本机试听（长音效不用等它放完）。不影响麦克风转发，也不影响热键。">停止播放 / 试听 <kbd>空格</kbd></button>
 </footer>
 
+<script src="library-model.js"></script>
 <script src="main.js"></script>
 </body>
 </html>

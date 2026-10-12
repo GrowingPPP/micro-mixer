@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     在 Windows 上构建「音效板」并打出 NSIS 安装包。
 
@@ -17,7 +17,9 @@ param(
     # 跳过 NSIS 安装包，只出 exe（调试用，快很多）
     [switch]$NoInstaller,
     # 构建后自动跑一次无窗口冒烟测试
-    [switch]$SkipSmoke
+    [switch]$SkipSmoke,
+    # 只验证 WAV fixture 和冒烟结果门禁（无需编译、设备或虚拟声卡）
+    [switch]$TestSmokeHarness
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,6 +30,106 @@ function Step($n, $msg) { Write-Host "`n── $n $msg ──" }
 function Ok($msg)   { Write-Host "  [OK] $msg"   -ForegroundColor Green }
 function Bad($msg)  { Write-Host "  [!!] $msg"   -ForegroundColor Red }
 function Warn($msg) { Write-Host "  [??] $msg"   -ForegroundColor Yellow }
+
+function Get-TauriBuildArguments([bool]$WithoutInstaller) {
+    if ($WithoutInstaller) { return @('build', '--no-bundle') }
+    return @('build', '--bundles', 'nsis')
+}
+
+function New-SmokeWave([string]$Path) {
+    # 两秒 440 Hz / -14 dBFS 的 48 kHz 立体声 PCM WAV。
+    # 超过 smoke 进度检查所需的 0.8 秒，且电平足够覆盖真实播放检查。
+    $rate = 48000
+    $frames = $rate * 2
+    $channels = 2
+    $dataBytes = $frames * $channels * 2
+    $stream = [IO.File]::Create($Path)
+    $writer = [IO.BinaryWriter]::new($stream)
+    try {
+        $writer.Write([Text.Encoding]::ASCII.GetBytes('RIFF'))
+        $writer.Write([int]($dataBytes + 36))
+        $writer.Write([Text.Encoding]::ASCII.GetBytes('WAVEfmt '))
+        $writer.Write([int]16)
+        $writer.Write([int16]1)
+        $writer.Write([int16]$channels)
+        $writer.Write([int]$rate)
+        $writer.Write([int]($rate * $channels * 2))
+        $writer.Write([int16]($channels * 2))
+        $writer.Write([int16]16)
+        $writer.Write([Text.Encoding]::ASCII.GetBytes('data'))
+        $writer.Write([int]$dataBytes)
+        for ($i = 0; $i -lt $frames; $i++) {
+            $value = [int16][math]::Round(0.2 * 32767 * [math]::Sin(2 * [math]::PI * 440 * $i / $rate))
+            $writer.Write($value)
+            $writer.Write($value)
+        }
+    } finally {
+        $writer.Dispose()
+    }
+}
+
+function Test-SmokeResult([int]$ExitCode, [string]$Output) {
+    $check = [regex]::Escape([string][char]0x2705)
+    $cross = [string][char]0x274C
+    $passed = ([regex]::Matches($Output, "(?m)^\s*$check")).Count
+    if ($ExitCode -ne 0) { throw "冒烟进程退出码 $ExitCode（通过 $passed 项）" }
+    if ($Output.Contains($cross)) { throw "冒烟输出包含失败标记（通过 $passed 项）" }
+    # 空输出、程序提前退出和部分完成均不得通过发布门禁。
+    if ($passed -lt 28) { throw "冒烟检查不完整：仅通过 $passed 项，要求至少 28 项" }
+    foreach ($item in @('list_devices', 'scan_dir', 'start', 'play\(0\)', 'status',
+                       'stop_all', 'set_gains', 'set_slot_gain', 'preview', 'stop_preview', 'release')) {
+        if ($Output -notmatch "(?m)^\s*$check\s+$item(?:\s|$)") {
+            throw "冒烟检查缺少成功项：$item"
+        }
+    }
+    if ($Output -notmatch '全部通过；音频播放真实发生') { throw '冒烟检查没有完成总结' }
+    return $passed
+}
+
+if ($TestSmokeHarness) {
+    $testDir = Join-Path ([IO.Path]::GetTempPath()) ('mixer_smoke_gate_' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $testDir | Out-Null
+    try {
+        $plainBuildArguments = @(Get-TauriBuildArguments $true)
+        if (($plainBuildArguments -join ' ') -ne 'build --no-bundle' -or
+            $plainBuildArguments -contains '--bundles') { throw 'NoInstaller 构建参数错误' }
+        $installerBuildArguments = @(Get-TauriBuildArguments $false)
+        if (($installerBuildArguments -join ' ') -ne 'build --bundles nsis' -or
+            $installerBuildArguments -contains '--no-bundle') { throw 'NSIS 构建参数错误' }
+        $wave = Join-Path $testDir 'controlled.wav'
+        New-SmokeWave $wave
+        $bytes = [IO.File]::ReadAllBytes($wave)
+        if ($bytes.Length -ne (44 + 48000 * 2 * 2 * 2) -or
+            [Text.Encoding]::ASCII.GetString($bytes, 0, 4) -ne 'RIFF' -or
+            [BitConverter]::ToInt16($bytes, 22) -ne 2 -or
+            [BitConverter]::ToInt32($bytes, 24) -ne 48000 -or
+            [BitConverter]::ToInt16($bytes, 34) -ne 16) { throw 'WAV fixture 格式错误' }
+        if ([BitConverter]::ToInt16($bytes, 48) -eq 0) { throw 'WAV fixture 必须含非零信号' }
+        $items = @('list_devices', 'scan_dir', 'start', 'play(0)', 'status', 'stop_all',
+                   'set_gains', 'set_slot_gain', 'preview', 'stop_preview', 'release')
+        $items += 1..17 | ForEach-Object { "extra_$_" }
+        $good = (($items | ForEach-Object { "$([char]0x2705) $_ 通过" }) -join "`n") +
+                "`n全部通过；音频播放真实发生"
+        if ((Test-SmokeResult 0 $good) -ne 28) { throw '完整成功结果应通过门禁' }
+        $cases = @(
+            @{ Exit = 1; Output = $good },
+            @{ Exit = 0; Output = '' },
+            @{ Exit = 0; Output = "$([char]0x2705) start" },
+            @{ Exit = 0; Output = ($good + "`n$([char]0x274C) 失败") },
+            @{ Exit = 0; Output = $good.Replace('release', 'missing_release') },
+            @{ Exit = 0; Output = $good.Replace('全部通过；音频播放真实发生', '') }
+        )
+        foreach ($case in $cases) {
+            $rejected = $false
+            try { Test-SmokeResult $case.Exit $case.Output | Out-Null } catch { $rejected = $true }
+            if (-not $rejected) { throw '失败或不完整结果被误判为通过' }
+        }
+        Ok '冒烟门禁回归通过：构建参数 + WAV + 正常完成 + 6 类失败/不完整结果'
+    } finally {
+        Remove-Item -Recurse -Force $testDir
+    }
+    exit 0
+}
 
 # ── 0. 环境检查 ────────────────────────────────────────────────
 Step '0/4' '环境检查'
@@ -58,8 +160,8 @@ if ($null -eq $wv2) {
 # ── 1. 构建 ────────────────────────────────────────────────────
 Step '1/4' '构建'
 
-$bundles = if ($NoInstaller) { 'app' } else { 'nsis' }
-& "$Root\node_modules\.bin\tauri.cmd" build --bundles $bundles
+$tauriBuildArguments = @(Get-TauriBuildArguments $NoInstaller.IsPresent)
+& "$Root\node_modules\.bin\tauri.cmd" @tauriBuildArguments
 if ($LASTEXITCODE -ne 0) { Bad 'tauri build 失败'; exit 1 }
 
 $exe = Join-Path $Root 'target\release\mixer-gui.exe'
@@ -72,21 +174,40 @@ Step '2/4' '冒烟测试（验证二进制真能跑）'
 if ($SkipSmoke) {
     Warn '已跳过'
 } else {
-    # 用一个临时目录当音效库，避免依赖用户的实际配置
-    $sounds = Join-Path $env:TEMP 'mixer_smoke_sounds'
-    New-Item -ItemType Directory -Force -Path $sounds | Out-Null
-
-    Write-Host '  跑 --smoke（无窗口，跑通界面调用的全部命令 + 异常路径）…'
-    $out = & $exe --smoke --dir $sounds 2>&1 | Out-String
-    $passed = ([regex]::Matches($out, '(?m)^\s*✅')).Count
-    $failed = ([regex]::Matches($out, '(?m)^\s*❌')).Count
-
-    if ($out -match '❌') {
-        Bad "冒烟测试有失败项（通过 $passed / 失败 $failed）"
-        $out -split "`n" | Where-Object { $_ -match '❌' } | Select-Object -First 8 | ForEach-Object { Write-Host "     $_" }
+    $smokeDir = Join-Path ([IO.Path]::GetTempPath()) ('mixer_smoke_' + [guid]::NewGuid().ToString('N'))
+    $sounds = Join-Path $smokeDir 'sounds'
+    New-Item -ItemType Directory -Path $sounds | Out-Null
+    $smokeProcess = $null
+    $out = ''
+    try {
+        New-SmokeWave (Join-Path $sounds 'controlled_440Hz.wav')
+        $stdout = Join-Path $smokeDir 'stdout.log'
+        $stderr = Join-Path $smokeDir 'stderr.log'
+        Write-Host '  跑 --smoke（受控 WAV、真实音频播放与异常路径）…'
+        # release exe 为 Windows GUI subsystem，显式重定向并等待进程，避免空输出假通过。
+        $smokeProcess = Start-Process -FilePath $exe -ArgumentList ('--smoke --dir "{0}"' -f $sounds) `
+                   -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+        # 在等待之前保留句柄，Windows PowerShell 5.1 也能可靠回读退出码。
+        $null = $smokeProcess.Handle
+        if (-not $smokeProcess.WaitForExit(240000)) {
+            $smokeProcess.Kill()
+            $smokeProcess.WaitForExit()
+            throw '冒烟测试超过 240 秒，已终止'
+        }
+        $smokeProcess.Refresh()
+        $out = (Get-Content -Raw -Encoding UTF8 $stdout) + "`n" + (Get-Content -Raw -Encoding UTF8 $stderr)
+        $exitCode = $smokeProcess.ExitCode
+        if ($null -eq $exitCode) { throw '无法读取冒烟进程退出码' }
+        $passed = Test-SmokeResult $exitCode $out
+        Ok "冒烟测试通过（$passed 项，退出码 0）"
+    } catch {
+        Bad "冒烟测试失败：$($_.Exception.Message)"
+        if ($out) { $out -split "`n" | Select-Object -Last 18 | ForEach-Object { Write-Host "     $_" } }
         exit 1
+    } finally {
+        if ($smokeProcess) { $smokeProcess.Dispose() }
+        Remove-Item -Recurse -Force $smokeDir
     }
-    Ok "冒烟测试通过（$passed 项）"
 }
 
 # ── 3. 安装包 ──────────────────────────────────────────────────

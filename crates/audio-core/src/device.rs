@@ -4,14 +4,17 @@
 //! 上层的混音引擎、UI、配置逻辑完全复用。
 //!
 //! **实时约束**：`CaptureCallback` / `RenderCallback` 运行在音频实时线程上，
-//! 实现里禁止分配内存、加锁、做文件 IO。
+//! 实时 DSP 禁止分配内存、阻塞或做文件 IO。会话生命周期壳使用一次
+//! 非阻塞 `try_lock`；获取失败立即返回静音，不等待所有者线程。
 
 use anyhow::Result;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// 设备标识。
 ///
-/// 用设备名作为标识：虚拟声卡的名字是固定的（`VB-Cable`、`XXX Mic`），
-/// 而 cpal 不提供稳定的设备 ID。
+/// 后端提供 CoreAudio UID / WASAPI endpoint ID；旧配置的设备名仍可解析，
+/// 但同名歧义必须报错，不能任意选第一个设备。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DeviceId(String);
 
@@ -95,6 +98,35 @@ pub type CaptureCallback = Box<dyn FnMut(&[f32]) + Send>;
 /// 渲染回调。必须把 `out` 全部填满。
 pub type RenderCallback = Box<dyn FnMut(&mut [f32]) + Send>;
 
+/// 每个音频会话自己的健康状态，监听和预览的故障不会触发主混音恢复。
+#[derive(Debug, Default)]
+pub struct StreamHealth {
+    error: Mutex<Option<String>>,
+    panicked: AtomicBool,
+}
+
+impl StreamHealth {
+    pub fn take_error(&self) -> Option<String> {
+        self.error.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+    pub fn report_error(&self, direction: &str, message: &str) {
+        let mut error = self.error.lock().unwrap_or_else(|e| e.into_inner());
+        if error.is_none() {
+            *error = Some(format!("{direction}: {message}"));
+        }
+    }
+    pub fn panicked(&self) -> bool {
+        self.panicked.load(Ordering::Acquire)
+    }
+    pub fn mark_panicked(&self) -> bool {
+        !self.panicked.swap(true, Ordering::AcqRel)
+    }
+    pub fn clear(&self) {
+        self.panicked.store(false, Ordering::Release);
+        self.error.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+}
+
 /// 一个已打开的音频流。**Drop 即停止。**
 ///
 /// 注意：**故意不要求 `Send`** —— cpal 的 macOS 后端里 `Stream` 不是 `Send`
@@ -103,6 +135,9 @@ pub type RenderCallback = Box<dyn FnMut(&mut [f32]) + Send>;
 pub trait AudioStream {
     fn format(&self) -> StreamFormat;
     fn device_name(&self) -> &str;
+    fn health(&self) -> Option<Arc<StreamHealth>> {
+        None
+    }
 }
 
 /// 平台音频后端。
@@ -110,7 +145,7 @@ pub trait AudioBackend: Send + Sync {
     /// 后端名字，用于日志（`coreaudio` / `wasapi`）。
     fn backend_name(&self) -> &'static str;
 
-    /// 枚举所有输入与输出设备。同名设备只出现一次（虚拟声卡通常两侧同名）。
+    /// 枚举所有输入与输出端点，保留不同标识的同名设备。
     fn devices(&self) -> Result<Vec<DeviceInfo>>;
 
     fn default_input(&self) -> Option<DeviceId>;
@@ -122,7 +157,7 @@ pub trait AudioBackend: Send + Sync {
     fn input_format(&self, id: &DeviceId, prefer: Option<StreamFormat>) -> Result<StreamFormat>;
     fn output_format(&self, id: &DeviceId, prefer: Option<StreamFormat>) -> Result<StreamFormat>;
 
-    /// 打开采集流。`prefer` 为期望格式，后端会挑选最接近的可用配置。
+    /// 打开采集流。`Some(format)` 必须精确使用该格式或报错；`None` 才允许默认协商。
     fn open_input(
         &self,
         id: &DeviceId,

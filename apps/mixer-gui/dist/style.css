@@ -350,6 +350,12 @@ label.check input { width: auto; }
   border-color: var(--accent);
   background: linear-gradient(180deg, rgba(59,130,246,.20), rgba(59,130,246,.07));
 }
+.card.previewing {
+  border-color: var(--accent2);
+  background: linear-gradient(180deg, rgba(34,197,94,.16), rgba(34,197,94,.05));
+}
+.card .playback-state { min-height: 14px; margin-top: 5px; font-size: 10px; color: var(--accent); }
+.card.previewing .playback-state { color: var(--accent2); }
 
 .card .name {
   font-size: 14px; font-weight: 600;
@@ -361,7 +367,7 @@ label.check input { width: auto; }
 }
 .card .prev {
   display: inline-flex; align-items: center; justify-content: center;
-  width: 20px; height: 20px; flex: 0 0 auto;
+  padding: 0 5px; height: 20px; flex: 0 0 auto;
   border-radius: 5px; background: #0c0e12; border: 1px solid var(--line);
   color: #a9b2c3; font-size: 9px; line-height: 1;
   cursor: pointer; transition: background .12s, color .12s;
@@ -381,12 +387,20 @@ label.check input { width: auto; }
 }
 .count { color: var(--dim); font-weight: 400; margin-left: 6px; }
 
+.card .volume-control { margin-top: 10px; cursor: default; }
+.card .volume-heading {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  font-size: 11px; line-height: 16px;
+}
+.card .volume-label { color: #a9b2c3; cursor: pointer; }
+.card .volume-value { color: var(--fg); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.card .volume-help { margin-top: 2px; font-size: 10px; color: var(--dim); line-height: 14px; }
 .card .vol {
   -webkit-appearance: none;
   appearance: none;
   width: 100%;
-  height: 14px;
-  margin: 6px 0 0;
+  height: 18px;
+  margin: 2px 0 0;
   background: transparent;
   cursor: pointer;
 }
@@ -405,12 +419,14 @@ label.check input { width: auto; }
 }
 .card .vol:hover::-webkit-slider-thumb { background: var(--accent); }
 .card .vol.boosted::-webkit-slider-thumb { background: var(--warn); }
-.card .vol.muted::-webkit-slider-thumb { background: var(--danger); }
+.card .vol.quiet::-webkit-slider-thumb { background: var(--dim); }
+.card .vol:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
 
 .card .bar {
   position: absolute; left: 0; bottom: 0; height: 3px; width: 0%;
   background: var(--accent); transition: width .1s linear;
 }
+.card.previewing .bar { background: var(--accent2); }
 
 .empty {
   grid-column: 1 / -1;

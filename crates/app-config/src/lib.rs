@@ -2,8 +2,7 @@
 //!
 //! 目的：让日常使用只需要一条命令。设备名、音效目录、增益这些不该每次重敲。
 //!
-//! 故意不引入 serde/toml：这里只需要一个扁平的 key = value 文件，
-//! 手写解析器约 60 行、零依赖、构建快，也更容易给出友好的报错。
+//! 使用 TOML 解析器处理字符串转义、空数组和多行配置；旧版扁平配置仍可读取。
 
 use std::path::{Path, PathBuf};
 
@@ -22,6 +21,17 @@ pub struct SoundItem {
     pub tags: Vec<String>,
 }
 
+/// 持久化音效记录；稳定标识使过滤无效文件和排序不会改变条目身份。
+#[derive(Debug, Clone, PartialEq)]
+pub struct SoundEntry {
+    pub id: String,
+    pub path: PathBuf,
+    pub name: String,
+    pub gain_db: f32,
+    pub tags: Vec<String>,
+    pub hotkey: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
     /// 真实麦克风（省略则用系统默认）
@@ -35,6 +45,8 @@ pub struct Config {
     pub sound_dirs: Vec<PathBuf>,
     /// 显式音效文件列表 —— **非空时优先于 sound_dirs**
     pub sound_files: Vec<PathBuf>,
+    /// 结构化配置中的持久标识。旧配置通过路径生成确定性标识。
+    pub sound_ids: Vec<String>,
     /// 每个音效的音量（dB），与 sound_files 一一对应
     pub sound_gains: Vec<f32>,
     /// 每个音效的**显示名**（与 sound_files 一一对应；空串表示用文件名）
@@ -43,6 +55,8 @@ pub struct Config {
     pub sound_tags: Vec<String>,
     /// 监听：触发的音效同时放给自己听（默认开）
     pub monitor: bool,
+    /// 循环当前音效；旧配置没有此项时默认关闭。
+    pub looping: bool,
     /// 监听输出到哪个设备。空 = 系统默认输出。
     /// 用途：默认输出可能是虚拟声卡或别的东西，用户希望监听走耳机。
     pub monitor_device: Option<String>,
@@ -70,12 +84,14 @@ impl Default for Config {
             sfx_gain_db: None,
             sound_dirs: Vec::new(),
             sound_files: Vec::new(),
+            sound_ids: Vec::new(),
             sound_gains: Vec::new(),
             sound_names: Vec::new(),
             sound_tags: Vec::new(),
             // 默认**开启**监听：没有它，用户在游戏里按键后自己听不到任何声音，
             // 只能盲猜队友有没有收到 —— 这是实打实的可用性问题。
             monitor: true,
+            looping: false,
             monitor_device: None,
             hotkeys: Vec::new(),
             unknown_lines: Vec::new(),
@@ -211,123 +227,248 @@ impl Config {
 
     // ── 解析
 
+    /// 严格解析 TOML，供调用方在载入失败时向用户报告错误。
+    pub fn try_parse(text: &str) -> Result<Self> {
+        let table = text.parse::<toml::Table>().context("配置不是有效 TOML")?;
+        Ok(Self::from_table(table))
+    }
+
     pub fn parse(text: &str) -> Self {
-        let mut c = Config::default();
+        if let Ok(c) = Self::try_parse(text) {
+            return c;
+        }
+        // 兼容早期写入的未加引号热键以及无效的独立行。所有有效值仍由 TOML
+        // 解析，不能再把带逗号的引号字符串拆成不同音效。
+        let mut table = toml::Table::new();
+        let mut unknown = Vec::new();
         for raw in text.lines() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let Some((k, v)) = line.split_once('=') else {
+            let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
-            let key = k.trim();
-            let val = v.trim();
-            match key {
-                "input_device" => c.input_device = parse_str(val),
-                "output_device" => c.output_device = parse_str(val),
-                "buffer_ms" => c.buffer_ms = val.parse().ok(),
-                "mic_gain_db" => c.mic_gain_db = val.parse().ok(),
-                "sfx_gain_db" => c.sfx_gain_db = val.parse().ok(),
-                "sound_dirs" => c.sound_dirs = parse_list(val).into_iter().map(expand).collect(),
-                "sound_names" => c.sound_names = parse_list(val),
-                "sound_tags" => c.sound_tags = parse_list(val),
-                "sound_files" => c.sound_files = parse_list(val).into_iter().map(expand).collect(),
-                "monitor" => c.monitor = parse_bool(val),
-                "monitor_device" => c.monitor_device = parse_str(val),
-                "sound_gains" => {
-                    c.sound_gains = parse_list(val)
-                        .iter()
-                        .map(|x| x.parse::<f32>().unwrap_or(0.0))
-                        .collect()
-                }
-                "hotkeys" => c.hotkeys = parse_list(val),
-                // 不认识的键**原样留着**，保存时写回去。
-                //
-                // 早先这里是 `_ => {}`（丢掉）—— 解析上"向前兼容"了，
-                // 但保存时会把用户手加的内容和未来版本的键**静默抹掉**。
-                // 丢数据比不认识一个键糟糕得多。
-                _ => c.unknown_lines.push(raw.trim_end().to_string()),
+            let key = key.trim();
+            if !KNOWN_KEYS.contains(&key) {
+                unknown.push(raw.trim_end().to_owned());
+                continue;
+            }
+            if let Ok(row) = line.parse::<toml::Table>() {
+                table.extend(row);
+            } else if matches!(
+                key,
+                "sound_files" | "sound_dirs" | "sound_names" | "sound_tags" | "hotkeys"
+            ) {
+                table.insert(
+                    key.into(),
+                    toml::Value::Array(
+                        legacy_list(value)
+                            .into_iter()
+                            .map(toml::Value::String)
+                            .collect(),
+                    ),
+                );
+            } else if matches!(key, "input_device" | "output_device" | "monitor_device") {
+                table.insert(
+                    key.into(),
+                    toml::Value::String(value.trim().trim_matches(['\"', '\'']).to_owned()),
+                );
             }
         }
+        let mut c = Self::from_table(table);
+        c.unknown_lines = unknown;
+        c
+    }
+
+    fn from_table(mut t: toml::Table) -> Self {
+        let mut c = Self {
+            input_device: take_string(&mut t, "input_device"),
+            output_device: take_string(&mut t, "output_device"),
+            monitor_device: take_string(&mut t, "monitor_device"),
+            buffer_ms: t
+                .remove("buffer_ms")
+                .and_then(|v| v.as_integer().and_then(|i| u32::try_from(i).ok())),
+            mic_gain_db: take_number(&mut t, "mic_gain_db"),
+            sfx_gain_db: take_number(&mut t, "sfx_gain_db"),
+            monitor: t
+                .remove("monitor")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            looping: t
+                .remove("looping")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            sound_files: take_list(&mut t, "sound_files")
+                .into_iter()
+                .map(expand)
+                .collect(),
+            sound_dirs: take_list(&mut t, "sound_dirs")
+                .into_iter()
+                .map(expand)
+                .collect(),
+            sound_names: take_list(&mut t, "sound_names"),
+            sound_tags: take_list(&mut t, "sound_tags"),
+            sound_ids: take_list(&mut t, "sound_ids"),
+            hotkeys: take_list(&mut t, "hotkeys"),
+            sound_gains: t
+                .remove("sound_gains")
+                .and_then(|v| {
+                    v.as_array().map(|a| {
+                        a.iter()
+                            .map(number_value)
+                            .map(|v| v.unwrap_or(0.0))
+                            .collect()
+                    })
+                })
+                .unwrap_or_default(),
+            ..Self::default()
+        };
+        if let Some(toml::Value::Array(rows)) = t.remove("sounds") {
+            let entries: Vec<_> = rows
+                .into_iter()
+                .filter_map(|row| {
+                    let mut row = row.as_table()?.clone();
+                    let path = expand(take_string(&mut row, "path")?);
+                    Some(SoundEntry {
+                        id: take_string(&mut row, "id").unwrap_or_default(),
+                        path,
+                        name: take_string(&mut row, "name").unwrap_or_default(),
+                        gain_db: take_number(&mut row, "gain_db").unwrap_or(0.0),
+                        tags: take_list(&mut row, "tags"),
+                        hotkey: take_string(&mut row, "hotkey").unwrap_or_default(),
+                    })
+                })
+                .collect();
+            c.set_sound_entries(&entries);
+        }
+        c.unknown_lines = toml::to_string(&t)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect();
         c
     }
 
     pub fn to_text(&self) -> String {
-        let mut s = String::from("# mixer 配置 —— 由 `mixer config set` 生成\n\n");
-        if let Some(v) = &self.input_device {
-            s += &format!("input_device = \"{v}\"\n");
-        }
-        if let Some(v) = &self.output_device {
-            s += &format!("output_device = \"{v}\"\n");
-        }
-        if let Some(v) = self.buffer_ms {
-            s += &format!("buffer_ms = {v}\n");
-        }
-        if let Some(v) = self.mic_gain_db {
-            s += &format!("mic_gain_db = {v}\n");
-        }
-        if let Some(v) = self.sfx_gain_db {
-            s += &format!("sfx_gain_db = {v}\n");
-        }
-        if !self.sound_dirs.is_empty() {
-            let items: Vec<String> = self
-                .sound_dirs
-                .iter()
-                .map(|p| format!("\"{}\"", p.display()))
-                .collect();
-            s += &format!("sound_dirs = [{}]\n", items.join(", "));
-        }
-        s += &format!("monitor = {}\n", self.monitor);
-        if let Some(d) = &self.monitor_device {
-            s += &format!("monitor_device = \"{d}\"\n");
-        }
-        if !self.sound_files.is_empty() {
-            let items: Vec<String> = self
-                .sound_files
-                .iter()
-                .map(|p| format!("\"{}\"", p.display()))
-                .collect();
-            s += &format!("sound_files = [{}]\n", items.join(", "));
-        }
-        if !self.sound_gains.is_empty() {
-            let items: Vec<String> = self
-                .sound_gains
-                .iter()
-                .map(|g| format!("\"{g}\""))
-                .collect();
-            s += &format!("sound_gains = [{}]\n", items.join(", "));
-        }
-        if !self.sound_names.is_empty() {
-            let items: Vec<String> = self
-                .sound_names
-                .iter()
-                .map(|n| format!("\"{}\"", n.replace('"', "")))
-                .collect();
-            s += &format!("sound_names = [{}]\n", items.join(", "));
-        }
-        if !self.sound_tags.is_empty() {
-            let items: Vec<String> = self
-                .sound_tags
-                .iter()
-                .map(|t| format!("\"{}\"", t.replace('"', "")))
-                .collect();
-            s += &format!("sound_tags = [{}]\n", items.join(", "));
-        }
-        if !self.hotkeys.is_empty() {
-            let items: Vec<String> = self.hotkeys.iter().map(|h| format!("\"{h}\"")).collect();
-            s += &format!("hotkeys = [{}]\n", items.join(", "));
-        }
-
-        // 把不认识的行原样写回去 —— 保证用户手改的内容不会因为我们保存而丢失
-        if !self.unknown_lines.is_empty() {
-            s += "\n# 以下内容本程序不认识，原样保留\n";
-            for l in &self.unknown_lines {
-                s += l;
-                s += "\n";
+        let mut t = toml::Table::new();
+        for (key, value) in [
+            ("input_device", &self.input_device),
+            ("output_device", &self.output_device),
+            ("monitor_device", &self.monitor_device),
+        ] {
+            if let Some(v) = value {
+                t.insert(key.into(), toml::Value::String(v.clone()));
             }
         }
-        s
+        if let Some(v) = self.buffer_ms {
+            t.insert("buffer_ms".into(), toml::Value::Integer(v.into()));
+        }
+        for (key, value) in [
+            ("mic_gain_db", self.mic_gain_db),
+            ("sfx_gain_db", self.sfx_gain_db),
+        ] {
+            if let Some(v) = value {
+                t.insert(key.into(), toml::Value::Float(v.into()));
+            }
+        }
+        t.insert("monitor".into(), toml::Value::Boolean(self.monitor));
+        t.insert("looping".into(), toml::Value::Boolean(self.looping));
+        insert_list(
+            &mut t,
+            "sound_dirs",
+            self.sound_dirs
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned()),
+        );
+        if self.sound_ids.is_empty() {
+            insert_list(
+                &mut t,
+                "sound_files",
+                self.sound_files
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned()),
+            );
+            insert_list(&mut t, "sound_names", self.sound_names.clone());
+            insert_list(&mut t, "sound_tags", self.sound_tags.clone());
+            insert_list(&mut t, "hotkeys", self.hotkeys.clone());
+            if !self.sound_gains.is_empty() {
+                t.insert(
+                    "sound_gains".into(),
+                    toml::Value::Array(
+                        self.sound_gains
+                            .iter()
+                            .map(|g| toml::Value::Float((*g).into()))
+                            .collect(),
+                    ),
+                );
+            }
+        } else {
+            let rows = self
+                .sound_entries()
+                .into_iter()
+                .map(|e| {
+                    let mut row = toml::Table::new();
+                    row.insert("id".into(), toml::Value::String(e.id));
+                    row.insert(
+                        "path".into(),
+                        toml::Value::String(e.path.to_string_lossy().into_owned()),
+                    );
+                    row.insert("name".into(), toml::Value::String(e.name));
+                    row.insert("gain_db".into(), toml::Value::Float(e.gain_db.into()));
+                    row.insert("hotkey".into(), toml::Value::String(e.hotkey));
+                    row.insert(
+                        "tags".into(),
+                        toml::Value::Array(e.tags.into_iter().map(toml::Value::String).collect()),
+                    );
+                    toml::Value::Table(row)
+                })
+                .collect();
+            t.insert("sounds".into(), toml::Value::Array(rows));
+        }
+        // Unknown entries must join the document before serialization. Appending
+        // them after [[sounds]] would attach them to the final sound record.
+        let mut notes = Vec::new();
+        let unknown = self
+            .unknown_lines
+            .iter()
+            .map(|line| {
+                if let Some((key, value)) = line.split_once('=') {
+                    let key = key.trim();
+                    if !key.starts_with(['"', '\''])
+                        && !key
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+                    {
+                        notes.push(format!("# 旧版原文: {line}"));
+                        return format!("{} = {value}", toml::Value::String(key.to_owned()));
+                    }
+                }
+                line.clone()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        match unknown.parse::<toml::Table>() {
+            Ok(unknown) => {
+                for (key, value) in unknown {
+                    if !t.contains_key(&key) {
+                        t.insert(key, value);
+                    }
+                }
+            }
+            Err(_) => notes.extend(
+                self.unknown_lines
+                    .iter()
+                    .map(|line| format!("# 无法解析的旧配置: {line}")),
+            ),
+        }
+        let mut text = String::from("# mixer 配置\n\n");
+        if !notes.is_empty() {
+            text.push_str(&notes.join("\n"));
+            text.push('\n');
+        }
+        text.push_str(&toml::to_string(&t).expect("TOML values are serializable"));
+        text
     }
 
     /// 用 `key value` 设置一项。返回是否成功。
@@ -368,6 +509,7 @@ impl Config {
                     .collect()
             }
             "monitor" => self.monitor = parse_bool(v),
+            "looping" => self.looping = v.parse().context("looping 需要是 true 或 false")?,
             "monitor_device" => self.monitor_device = parse_str(v),
             "sound_names" => {
                 self.sound_names = v.split('\n').map(|x| x.trim().to_string()).collect()
@@ -382,17 +524,19 @@ impl Config {
                     .collect()
             }
             "hotkeys" => {
-                self.hotkeys = v
-                    .split(',')
-                    .map(|x| x.trim())
-                    .filter(|x| !x.is_empty())
-                    .map(|x| x.to_string())
-                    .collect()
+                self.hotkeys = if v.is_empty() {
+                    Vec::new()
+                } else {
+                    v.split(',')
+                        .map(|x| x.trim())
+                        .map(|x| x.to_string())
+                        .collect()
+                }
             }
             other => anyhow::bail!(
                 "未知配置项「{other}」。可用：input_device / output_device / buffer_ms / \
                  mic_gain_db / sfx_gain_db / sound_dirs / sound_files / sound_gains / \
-             monitor / hotkeys"
+             monitor / looping / hotkeys"
             ),
         }
         Ok(())
@@ -431,37 +575,96 @@ impl Config {
                 tags: self
                     .sound_tags
                     .get(i)
-                    .map(|t| {
-                        // 存的时候用 `|` 分隔（见 set_sound_items），但手写配置时
-                        // 用户更可能打逗号 —— 两种都认。
-                        t.split(['|', ',', ';'])
-                            .map(|x| x.trim().to_string())
-                            .filter(|x| !x.is_empty())
-                            .collect()
-                    })
+                    .map(|t| parse_tags(t))
                     .unwrap_or_default(),
             })
             .collect()
     }
 
-    /// 用一组音效条目覆盖配置里的并行数组。
-    pub fn set_sound_items(&mut self, items: &[SoundItem]) {
-        self.sound_files = items.iter().map(|i| i.path.clone()).collect();
-        self.sound_gains = items.iter().map(|i| i.gain_db).collect();
-        self.sound_names = items.iter().map(|i| i.name.clone()).collect();
-        // ⚠️ 必须用 `|` 而不是逗号：配置里的列表本身就是逗号分隔的
-        //    （`parse_list` 按 `,` 切），标签里再放逗号会把**整个并行数组错位** ——
-        //    一个带 2 个标签的音效，第二个标签会被当成下一个音效的标签。
-        self.sound_tags = items
+    /// 将旧配置映射为包含标识和热键的完整条目。
+    pub fn sound_entries(&self) -> Vec<SoundEntry> {
+        self.sound_items()
+            .into_iter()
+            .enumerate()
+            .map(|(i, item)| SoundEntry {
+                id: self
+                    .sound_ids
+                    .get(i)
+                    .filter(|id| !id.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        stable_sound_id(
+                            &item.path,
+                            self.sound_files[..i]
+                                .iter()
+                                .filter(|p| **p == item.path)
+                                .count(),
+                        )
+                    }),
+                path: item.path,
+                name: item.name,
+                gain_db: item.gain_db,
+                tags: item.tags,
+                hotkey: self.hotkeys.get(i).cloned().unwrap_or_default(),
+            })
+            .collect()
+    }
+
+    pub fn set_sound_entries(&mut self, entries: &[SoundEntry]) {
+        self.sound_files = entries.iter().map(|e| e.path.clone()).collect();
+        self.sound_ids = entries
             .iter()
-            .map(|i| {
-                i.tags
-                    .iter()
-                    .map(|t| t.replace(['|', ',', ';'], " "))
-                    .collect::<Vec<_>>()
-                    .join("|")
+            .enumerate()
+            .map(|(i, e)| {
+                if e.id.is_empty() {
+                    stable_sound_id(
+                        &e.path,
+                        entries[..i].iter().filter(|p| p.path == e.path).count(),
+                    )
+                } else {
+                    e.id.clone()
+                }
             })
             .collect();
+        self.sound_names = entries.iter().map(|e| e.name.clone()).collect();
+        self.sound_gains = entries.iter().map(|e| e.gain_db).collect();
+        // TOML in the compatibility array preserves punctuation inside individual tags.
+        self.sound_tags = entries
+            .iter()
+            .map(|e| {
+                toml::Value::Array(e.tags.iter().cloned().map(toml::Value::String).collect())
+                    .to_string()
+            })
+            .collect();
+        self.hotkeys = entries.iter().map(|e| e.hotkey.clone()).collect();
+    }
+
+    /// 用一组音效条目覆盖配置里的并行数组。
+    pub fn set_sound_items(&mut self, items: &[SoundItem]) {
+        let previous = self.sound_entries();
+        let entries: Vec<_> = items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                // Match each duplicate by occurrence; moving or removing other files preserves IDs.
+                let occurrence = items[..i].iter().filter(|e| e.path == item.path).count();
+                let old = previous
+                    .iter()
+                    .filter(|e| e.path == item.path)
+                    .nth(occurrence);
+                SoundEntry {
+                    id: old
+                        .map(|e| e.id.clone())
+                        .unwrap_or_else(|| stable_sound_id(&item.path, occurrence)),
+                    path: item.path.clone(),
+                    name: item.name.clone(),
+                    gain_db: item.gain_db,
+                    tags: item.tags.clone(),
+                    hotkey: old.map(|e| e.hotkey.clone()).unwrap_or_default(),
+                }
+            })
+            .collect();
+        self.set_sound_entries(&entries);
     }
 
     /// 补齐音量表长度（新增音效默认 0 dB）。
@@ -491,14 +694,99 @@ fn parse_bool(v: &str) -> bool {
     )
 }
 
-fn parse_list(v: &str) -> Vec<String> {
-    let inner = v.trim().trim_start_matches('[').trim_end_matches(']');
-    inner
-        .split(',')
-        .map(|x| x.trim().trim_matches('"').trim_matches('\''))
-        .filter(|x| !x.is_empty())
-        .map(|x| x.to_string())
+const KNOWN_KEYS: &[&str] = &[
+    "input_device",
+    "output_device",
+    "monitor_device",
+    "buffer_ms",
+    "mic_gain_db",
+    "sfx_gain_db",
+    "monitor",
+    "looping",
+    "sound_files",
+    "sound_dirs",
+    "sound_names",
+    "sound_tags",
+    "sound_ids",
+    "sound_gains",
+    "hotkeys",
+    "sounds",
+];
+
+fn take_string(t: &mut toml::Table, key: &str) -> Option<String> {
+    t.remove(key)
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .filter(|v| !v.is_empty() && v != "none")
+}
+fn number_value(v: &toml::Value) -> Option<f32> {
+    v.as_float()
+        .map(|n| n as f32)
+        .or_else(|| v.as_integer().map(|n| n as f32))
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+fn take_number(t: &mut toml::Table, key: &str) -> Option<f32> {
+    t.remove(key).as_ref().and_then(number_value)
+}
+fn take_list(t: &mut toml::Table, key: &str) -> Vec<String> {
+    t.remove(key)
+        .and_then(|v| {
+            v.as_array().map(|a| {
+                a.iter()
+                    .map(|v| v.as_str().unwrap_or_default().to_owned())
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
+}
+fn insert_list(t: &mut toml::Table, key: &str, values: impl IntoIterator<Item = String>) {
+    let list: Vec<_> = values.into_iter().map(toml::Value::String).collect();
+    if !list.is_empty() {
+        t.insert(key.into(), toml::Value::Array(list));
+    }
+}
+fn parse_tags(tags: &str) -> Vec<String> {
+    if let Ok(mut t) = format!("tags = {tags}").parse::<toml::Table>() {
+        if t.get("tags").is_some_and(|v| v.is_array()) {
+            return take_list(&mut t, "tags");
+        }
+    }
+    tags.split(['|', ',', ';'])
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
         .collect()
+}
+/// Deterministic FNV identifier for migration; stored IDs survive later file renames.
+pub fn stable_sound_id(path: &Path, occurrence: usize) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in path
+        .to_string_lossy()
+        .bytes()
+        .chain(occurrence.to_le_bytes())
+    {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3);
+    }
+    format!("sound-{hash:016x}")
+}
+fn legacy_list(value: &str) -> Vec<String> {
+    let inner = value.trim().trim_start_matches('[').trim_end_matches(']');
+    let mut quote = None;
+    let mut part = String::new();
+    let mut parts = Vec::new();
+    for ch in inner.chars() {
+        if matches!(ch, '\"' | '\'') && (quote.is_none() || quote == Some(ch)) {
+            quote = if quote.is_some() { None } else { Some(ch) };
+        } else if ch == ',' && quote.is_none() {
+            parts.push(part.trim().to_owned());
+            part.clear();
+        } else {
+            part.push(ch);
+        }
+    }
+    if !part.is_empty() || !parts.is_empty() {
+        parts.push(part.trim().to_owned());
+    }
+    parts
 }
 
 /// 展开开头的 `~`
@@ -633,6 +921,121 @@ mod tests {
     use super::*;
 
     #[test]
+    fn toml_preserves_empty_tags_punctuation_and_windows_paths() {
+        let c = Config {
+            sound_files: vec![
+                PathBuf::from(r"C:\Users\Doe, John\a\sound.wav"),
+                PathBuf::from("/b.wav"),
+            ],
+            sound_names: vec!["嘿,你好吗 \"quoted\"".into(), "B".into()],
+            sound_tags: vec![String::new(), "B-only".into()],
+            ..Default::default()
+        };
+        let text = c.to_text();
+        assert!(Config::try_parse(&text).is_ok());
+        let round = Config::parse(&text);
+        assert_eq!(round, c);
+        assert!(round.sound_items()[0].tags.is_empty());
+        assert_eq!(round.sound_items()[1].tags, ["B-only"]);
+    }
+
+    #[test]
+    fn structured_sound_ids_survive_reordering_and_tag_punctuation() {
+        let mut c = Config::default();
+        c.set_sound_entries(&[
+            SoundEntry {
+                id: "first".into(),
+                path: "a.wav".into(),
+                name: "A".into(),
+                gain_db: -3.0,
+                tags: vec!["one,two".into(), "quoted \"tag\"".into()],
+                hotkey: "F1".into(),
+            },
+            SoundEntry {
+                id: "second".into(),
+                path: "b.wav".into(),
+                name: "B".into(),
+                gain_db: 2.0,
+                tags: vec![],
+                hotkey: "F2".into(),
+            },
+        ]);
+        let expected = c.sound_entries();
+        let round = Config::try_parse(&c.to_text()).unwrap();
+        assert_eq!(round.sound_entries(), expected);
+        let mut items = round.sound_items();
+        items.reverse();
+        c.set_sound_items(&items);
+        assert_eq!(c.sound_entries()[0].id, "second");
+        assert_eq!(c.sound_entries()[0].hotkey, "F2");
+        assert_eq!(c.sound_entries()[1].tags, expected[0].tags);
+    }
+
+    #[test]
+    fn canonical_sounds_do_not_capture_unknown_top_level_keys_or_nested_tables() {
+        let text = r#"
+future_scalar = "keep,me"
+future_array = ["a", "b"]
+[[sounds]]
+id = "stable-id"
+path = 'C:\Users\Doe, John\sound.wav'
+name = "Good"
+gain_db = -9.0
+tags = []
+hotkey = "F2"
+[future.nested]
+flag = true
+[[future.rows]]
+value = "first"
+[[future.rows]]
+value = "second"
+"#;
+        let config = Config::try_parse(text).unwrap();
+        let serialized = config.to_text();
+        let document = serialized.parse::<toml::Table>().unwrap();
+        assert_eq!(document["future_scalar"].as_str(), Some("keep,me"));
+        assert_eq!(document["future_array"].as_array().unwrap().len(), 2);
+        assert_eq!(document["future"]["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(document["future"]["nested"]["flag"].as_bool(), Some(true));
+        let sound = &document["sounds"].as_array().unwrap()[0];
+        assert!(sound.get("future_scalar").is_none());
+        let round = Config::try_parse(&serialized).unwrap();
+        assert_eq!(round.sound_entries(), config.sound_entries());
+        assert_eq!(round.to_text().parse::<toml::Table>().unwrap(), document);
+    }
+
+    #[test]
+    fn legacy_unicode_unknown_keys_become_valid_toml_without_losing_their_value() {
+        let mut config = Config::parse("手写的键 = \"别弄丢我\"\nfuture_scalar = 123\n");
+        config.set_sound_entries(&[SoundEntry {
+            id: "id".into(),
+            path: "x.wav".into(),
+            name: "X".into(),
+            gain_db: 0.0,
+            tags: vec![],
+            hotkey: String::new(),
+        }]);
+        let serialized = config.to_text();
+        let document = serialized.parse::<toml::Table>().unwrap();
+        assert_eq!(document["手写的键"].as_str(), Some("别弄丢我"));
+        assert_eq!(document["future_scalar"].as_integer(), Some(123));
+        assert_eq!(
+            Config::try_parse(&serialized).unwrap().sound_entries(),
+            config.sound_entries()
+        );
+    }
+
+    #[test]
+    fn multiline_toml_lists_and_unknown_tables_survive() {
+        let text = "sound_files = [\n  'a,b.wav',\n  'c.wav',\n]\nsound_tags = ['', 'B-only']\n[future]\nvalue = ['keep,me']\n";
+        let c = Config::try_parse(text).unwrap();
+        assert_eq!(c.sound_files.len(), 2);
+        let round = Config::try_parse(&c.to_text()).unwrap();
+        assert_eq!(round.sound_tags, ["", "B-only"]);
+        assert!(round.to_text().contains("keep,me"));
+    }
+
+    #[test]
     fn 解析基本键值对() {
         let c = Config::parse(
             r#"
@@ -690,10 +1093,12 @@ sfx_gain_db = -9
             sfx_gain_db: Some(-6.0),
             sound_dirs: vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")],
             sound_files: vec![PathBuf::from("/tmp/x.mp3")],
+            sound_ids: Vec::new(),
             sound_gains: vec![0.0, -6.0],
             sound_names: Vec::new(),
             sound_tags: Vec::new(),
             monitor: false,
+            looping: false,
             monitor_device: None,
             hotkeys: vec!["F1".into(), "F2".into()],
             unknown_lines: Vec::new(),
@@ -754,6 +1159,117 @@ sfx_gain_db = -9
         assert!(Config::parse("buffer_ms = 20").monitor);
         let c = Config::parse("monitor = false");
         assert!(!Config::parse(&c.to_text()).monitor, "往返后应保持关闭");
+    }
+
+    #[test]
+    fn looping_is_disabled_for_old_or_missing_configuration() {
+        assert!(!Config::default().looping);
+        for text in [
+            "",
+            "buffer_ms = 20\nsound_files = ['once.wav']",
+            "hotkeys = F1, F2\nsound_files = ['once.wav']",
+        ] {
+            let config = Config::parse(text);
+            assert!(!config.looping, "old config unexpectedly loops: {text}");
+            let serialized = config.to_text();
+            let document = serialized.parse::<toml::Table>().unwrap();
+            assert_eq!(document["looping"].as_bool(), Some(false));
+            assert!(!Config::try_parse(&serialized).unwrap().looping);
+        }
+    }
+
+    #[test]
+    fn looping_true_and_explicit_false_are_serialized_and_round_trip() {
+        for enabled in [true, false] {
+            let config =
+                Config::try_parse(&format!("looping = {enabled}\nmonitor = false")).unwrap();
+            assert_eq!(config.looping, enabled);
+            assert!(config.unknown_lines.is_empty());
+            let serialized = config.to_text();
+            let document = serialized.parse::<toml::Table>().unwrap();
+            assert_eq!(document["looping"].as_bool(), Some(enabled));
+            assert_eq!(Config::try_parse(&serialized).unwrap(), config);
+        }
+    }
+
+    #[test]
+    fn looping_setter_rejects_invalid_values_without_changing_saved_state() {
+        let mut config = Config::default();
+        config.set("looping", " true ").unwrap();
+        assert!(config.looping);
+        for invalid in ["", "yes", "on", "1", "TRUE", "not-a-bool"] {
+            assert!(config.set("looping", invalid).is_err());
+            assert!(config.looping, "invalid value changed the preceding choice");
+        }
+        config.set("looping", "false").unwrap();
+        assert!(!config.looping);
+        let document = config.to_text().parse::<toml::Table>().unwrap();
+        assert_eq!(document["looping"].as_bool(), Some(false));
+        assert!(!Config::try_parse(&config.to_text()).unwrap().looping);
+    }
+
+    #[test]
+    fn looping_updates_preserve_legacy_sounds_and_unknown_configuration() {
+        let mut config = Config::parse(
+            "looping = true\nhotkeys = F1, F2\nsound_files = ['a,b.wav', 'b.wav']\n\
+             sound_gains = [-3, 2]\nsound_names = ['A', 'B']\nfuture_scalar = 'keep,me'\n",
+        );
+        assert!(
+            config.looping,
+            "legacy fallback must recognize the looping key"
+        );
+        assert_eq!(config.hotkeys, ["F1", "F2"]);
+        let entries = config.sound_entries();
+        config.set("looping", "false").unwrap();
+        let text = config.to_text();
+        let document = text.parse::<toml::Table>().unwrap();
+        assert_eq!(document["looping"].as_bool(), Some(false));
+        assert_eq!(document["future_scalar"].as_str(), Some("keep,me"));
+        let round = Config::try_parse(&text).unwrap();
+        assert!(!round.looping);
+        assert_eq!(round.sound_entries(), entries);
+        assert_eq!(round.to_text().parse::<toml::Table>().unwrap(), document);
+    }
+
+    #[test]
+    fn looping_updates_preserve_structured_sound_ids_tags_and_unknown_tables() {
+        let mut config = Config::try_parse(
+            r#"
+looping = false
+future_scalar = "keep,me"
+[[sounds]]
+id = "stable-id"
+path = 'C:\Users\Doe, John\sound.wav'
+name = "Good"
+gain_db = -9.0
+tags = ["literal,tag", "another"]
+hotkey = "F2"
+[future.nested]
+flag = true
+[[future.rows]]
+value = "first"
+[[future.rows]]
+value = "second"
+"#,
+        )
+        .unwrap();
+        let entries = config.sound_entries();
+        for enabled in [true, false] {
+            config
+                .set("looping", if enabled { "true" } else { "false" })
+                .unwrap();
+            let serialized = config.to_text();
+            let document = serialized.parse::<toml::Table>().unwrap();
+            assert_eq!(document["looping"].as_bool(), Some(enabled));
+            assert_eq!(document["future_scalar"].as_str(), Some("keep,me"));
+            assert_eq!(document["future"]["nested"]["flag"].as_bool(), Some(true));
+            assert_eq!(document["future"]["rows"].as_array().unwrap().len(), 2);
+            assert!(document["sounds"][0].get("looping").is_none());
+            let round = Config::try_parse(&serialized).unwrap();
+            assert_eq!(round.looping, enabled);
+            assert_eq!(round.sound_entries(), entries);
+            assert_eq!(round.to_text().parse::<toml::Table>().unwrap(), document);
+        }
     }
 
     #[test]
@@ -917,5 +1433,42 @@ some_future_key = 123
         let got = scan_dirs(&[d.clone(), d.clone(), PathBuf::from("/nonexistent")]).unwrap();
         assert_eq!(got.len(), 1, "重复目录应去重，坏目录应跳过");
         let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod hotkey_identity_regressions {
+    use super::*;
+    #[test]
+    fn setter_and_structured_roundtrip_preserve_empty_hotkey_positions() {
+        let mut config = Config::default();
+        config.set_sound_entries(&[
+            SoundEntry {
+                id: "first".into(),
+                path: PathBuf::from("first.wav"),
+                name: "first".into(),
+                gain_db: 0.0,
+                tags: vec![],
+                hotkey: "".into(),
+            },
+            SoundEntry {
+                id: "second".into(),
+                path: PathBuf::from("second.wav"),
+                name: "second".into(),
+                gain_db: 0.0,
+                tags: vec![],
+                hotkey: "".into(),
+            },
+        ]);
+        config.set("hotkeys", ",F2").unwrap();
+        assert_eq!(config.hotkeys, ["", "F2"]);
+        let round = Config::parse(&config.to_text());
+        assert_eq!(round.sound_entries()[0].hotkey, "");
+        assert_eq!(round.sound_entries()[1].hotkey, "F2");
+        config.set("hotkeys", "").unwrap();
+        assert!(Config::parse(&config.to_text())
+            .sound_entries()
+            .iter()
+            .all(|e| e.hotkey.is_empty()));
     }
 }
