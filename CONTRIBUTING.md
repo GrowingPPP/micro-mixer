@@ -185,6 +185,7 @@ cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
 node --check apps/mixer-gui/dist/main.js
+node --check apps/mixer-gui/dist/theme.js
 node --check crates/remote/src/control-page.js
 node --test tools/test-gui-model.js tools/test-gui-controls.js tools/test-remote-controls.js tools/test-app-packaging.js
 cargo build --locked --release --workspace

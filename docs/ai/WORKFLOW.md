@@ -20,7 +20,7 @@ Node 构建依赖可用 `npm ci` 从 `package-lock.json` 恢复，常规修改�
 | 改动 | 首先验证 | 额外关注 |
 |---|---|---|
 | 纯文档 | 相对链接、实际命令、规则一致性、`git diff --check` | 不为文档启动真实音频 |
-| GUI 模型 / 状态 / 控件 | `test-gui-model.js`、`test-gui-controls.js` | 交付 DOM、稳定 ID、旧回复、失败与取消、默认及最小窗口尺寸 |
+| GUI 模型 / 状态 / 控件 | `test-gui-model.js`、`test-gui-controls.js` | 交付 DOM、稳定 ID、旧回复、失败与取消、模态焦点、默认及最小窗口尺寸 |
 | Host / IPC / 生命周期 | `mixer-gui` Rust 测试及 GUI 控件回归 | 票据、迟到工作、会话所有权、总增益叠加、试听解码取消及真实样本 |
 | 原生窗口隐藏 / 恢复 | `window_lifecycle::tests`；对应平台打包 App | 关闭后保持同一窗口；macOS 实际 Dock 重新打开；双端托盘恢复 |
 | DSP / 播放 / 监听 | `audio-core`、`audio-session` 测试 | PCM 单音效、停止尾音、零分配、双输出接纳与循环 |
@@ -42,6 +42,10 @@ node --test tools/test-remote-controls.js tools/test-app-packaging.js
 
 完整操作组合的测试选择见[播放操作组合回归](../engineering/播放操作组合回归.md)。
 
+GUI 布局变更同时检查默认与最小窗口、明暗主题、长名称和多条音效，音效库与侧栏滚动不能挤走底部停止。
+音效详情、筛选后的播放信息、全局音量双控件同步、点击后的空格停止、保存失败及旧面板回复使用交付 DOM 回归。
+浏览器模拟 IPC 和注入平台信息可验证共用界面的布局与平台文案；实际 Windows WebView2 与原生设备另计验收。
+
 ## 3. 提交门禁：不使用真实音频设备
 
 代码改动执行以下命令。Rust/JS 回归与双端 CI 保持一致；release 构建和完整 schema 校验是本地补充门禁：
@@ -51,6 +55,7 @@ cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
 node --check apps/mixer-gui/dist/main.js
+node --check apps/mixer-gui/dist/theme.js
 node --check crates/remote/src/control-page.js
 node --test tools/test-gui-model.js tools/test-gui-controls.js tools/test-remote-controls.js tools/test-app-packaging.js
 cargo build --locked --release --workspace

@@ -24,6 +24,7 @@ jobs:
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace --all-targets
       - run: node --check apps/mixer-gui/dist/main.js
+      - run: node --check apps/mixer-gui/dist/theme.js
       - run: node --check crates/remote/src/control-page.js
       - run: node --test tools/test-gui-model.js tools/test-gui-controls.js tools/test-remote-controls.js tools/test-app-packaging.js
       - name: Windows smoke harness regression

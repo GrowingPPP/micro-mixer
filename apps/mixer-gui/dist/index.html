@@ -1,145 +1,144 @@
 <!doctype html>
-<html lang="zh">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>麦克风混音助手</title>
+<script src="theme.js"></script>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
-
-<header>
-  <div class="brand">
-    <span id="dot" class="dot off"></span>
-    <div>
-      <h1>麦克风混音助手</h1>
-      <p id="headline">未启动</p>
+<div id="appShell" class="app-shell">
+  <header class="app-header">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+      <div><h1>麦克风混音助手</h1><p class="brand-subtitle">把音频和人声一起传给对方</p></div>
     </div>
-  </div>
-  <div class="actions">
-    <button id="btnAbout" class="ghost" aria-haspopup="dialog">关于</button>
-    <button id="btnSelfTest" class="ghost" title="把测试音送进虚拟设备再从环回录回来，验证整条链路">自检</button>
-    <button id="btnMicHelp" class="ghost" title="对方听不到你？按平台给出排查步骤（权限、默认通信设备等）">麦克风没声音？</button>
-    <button id="btnSetup" class="ghost" title="展开/收起设置">设置</button>
-    <button id="btnToggle" class="primary">启动</button>
-  </div>
-</header>
+    <div class="actions">
+      <span class="engine-status"><span id="dot" class="dot off" aria-hidden="true"></span><span id="headline">未启动</span></span>
+      <button id="btnSetup" class="ghost" aria-haspopup="dialog">连接设置</button>
+      <button id="btnToggle" class="primary">启动</button>
+      <details id="toolsMenu" class="menu">
+        <summary aria-label="更多功能" title="更多功能">•••</summary>
+        <div class="menu-content">
+          <div class="theme-setting"><label for="selTheme">界面主题</label><select id="selTheme" aria-describedby="themeHelp"><option value="system">跟随系统</option><option value="light">浅色</option><option value="dark">深色</option></select><p id="themeHelp" class="hint">立即生效，下次打开会记住。</p></div>
+          <button id="btnLibrarySetup">音效库与热键</button>
+          <button id="btnSelfTest" title="播放测试音并从环回录回，验证音频链路">音频自检</button>
+          <button id="btnCalib" title="测量 5 秒人声并计算麦克风增益">校准麦克风</button>
+          <button id="btnMicHelp">麦克风没声音？</button>
+          <button id="btnAbout" aria-haspopup="dialog">关于软件</button>
+        </div>
+      </details>
+    </div>
+  </header>
 
-<section id="setup" class="panel">
-  <div class="row">
-    <label>真实麦克风
-      <select id="selIn"></select>
-    </label>
-    <label>输出到（虚拟声卡）
-      <select id="selOut"></select>
-    </label>
-    <label class="narrow">缓冲
-      <span class="withunit"><input id="inBuf" type="number" value="20" min="5" max="200"><i>ms</i></span>
-    </label>
-  </div>
-  <div class="row">
-    <label class="grow">音效<span id="count" class="count"></span>
-      <span class="withbtn">
-        <input id="inDir" type="text" placeholder="~/Sounds（文件夹，或直接用右边按钮挑文件）">
-        <button id="btnBrowse" class="ghost">文件夹…</button>
-        <button id="btnScan" class="ghost">载入</button>
-        <button id="btnAdd" class="ghost">添加文件…</button>
-        <button id="btnClear" class="ghost" title="清空列表">清空</button>
-      </span>
-    </label>
-  </div>
-  <p id="folderHelp" class="hint">支持任意有读取权限的文件夹（只扫描当前层）。载入文件夹会替换列表；“添加文件…”可从不同目录追加音频。</p>
-
-  <div class="row controls-row">
-    <label class="grow hotkey-control">热键（逗号分隔，与音效顺序对应）
-      <input id="inKeys" type="text" placeholder="F1,F2,F3">
-    </label>
-    <label class="narrow gain-control">麦克风音量
-      <span class="withunit"><input id="inMicGain" type="number" value="0" step="1" min="-60" max="36" aria-label="麦克风音量" aria-describedby="micGainHelp gainRangeHelp"><i>dB</i></span>
-    </label>
-    <label class="narrow gain-control">音效总音量
-      <span class="withunit"><input id="inSfxGain" type="number" value="-6" step="1" min="-60" max="36" aria-label="音效总音量" aria-describedby="sfxGainHelp gainRangeHelp"><i>dB</i></span>
-    </label>
-    <label class="check" title="循环播放正式音效与监听；取消后当前一遍结束即停止。试听始终只播放一次。">
-      <input id="inLoop" type="checkbox" aria-label="循环播放" aria-describedby="loopHelp"> 循环播放
-    </label>
-    <label class="check" title="触发的音效同时放给你自己听 —— 用于确认音效已触发">
-      <input id="inMonitor" type="checkbox" checked> 监听
-    </label>
-    <label class="check" title="手机浏览器打开遥控地址即可触发音效，也适合全屏操作时使用">
-      <input id="inRemote" type="checkbox" checked> 手机遥控
-    </label>
-  </div>
-
-  <div class="gain-help">
-    <p id="micGainHelp">麦克风音量：调整对方听到的人声大小。</p>
-    <p id="sfxGainHelp">音效总音量：统一调整试听、正式播放和监听，与每张卡片的音效音量叠加。</p>
-    <p id="gainRangeHelp">0 dB 保持原音量，负数调小，正数调大；范围 −60～+36 dB，−60 dB 静音，调整实时生效。</p>
-  </div>
-  <p id="loopHelp" class="hint">循环已关闭：正式播放与监听在当前一遍结束后停止。试听始终只播放一次。</p>
-
-  <div class="calibrow">
-    <button id="btnCalib" class="ghost" title="测 5 秒，自动算出麦克风该补多少增益，省得你来回拖滑杆试">
-      校准麦克风
-    </button>
-    <span id="calibHint" class="calibhint"></span>
-  </div>
-
-  <p class="hint" style="margin-top:2px">
-    <span id="btnRevertMic" class="linky">切回真实麦克风</span>
-    ·
-    <span id="btnRelease" class="linky">彻底释放音频设备</span>
-    —— 只有你要退出、或把目标应用的麦克风改回真实麦克风时才需要。
-    平常「停止」不会断掉麦克风转发。
-  </p>
-  <p id="setupHint" class="hint">选好设备与音效文件夹，然后点右上角「启动」。运行中调整增益会立即生效。</p>
-</section>
-
-  <div id="qrPanel" class="qrpanel hidden"></div>
-  <div id="testPanel" class="testpanel hidden"></div>
-
-<div id="vdevHelp" class="vdevhelp hidden"></div>
-    <div id="micHelp" class="vdevhelp hidden"></div>
-
-<div id="libbar" class="libbar">
-  <input id="inSearch" type="text" placeholder="搜索音效名或标签…">
-  <span id="tagbar" class="tagbar"></span>
-  <button id="btnSort" class="ghost" title="按名称排序（会改变热键对应关系）">按名称排序</button>
-</div>
-
-<main id="grid" class="grid"></main>
-
-<footer>
-  <span id="meter" class="meter" title="送往虚拟麦克风的电平">
-    <i class="zone"></i><i class="bar"></i><i class="peak"></i>
-  </span>
-  <span id="metrics" class="metrics">—</span>
-  <span id="remote" class="remote"></span>
-  <button id="btnQr" class="ghost">二维码</button>
-  <span id="toast" class="toast"></span>
-  <button id="btnStopAll" class="ghost" title="立即停止音效播放和本机试听（长音效不用等它放完）。不影响麦克风转发，也不影响热键。">停止播放 / 试听 <kbd>空格</kbd></button>
-</footer>
-
-<div id="aboutOverlay" class="about-overlay hidden">
-  <section class="about-dialog" role="dialog" aria-modal="true" aria-labelledby="aboutTitle" aria-describedby="aboutSummary">
-    <div class="about-heading">
-      <div>
-        <p class="about-eyebrow">关于软件</p>
-        <h2 id="aboutTitle">麦克风混音助手</h2>
+  <div class="workspace">
+    <main class="library" aria-labelledby="libraryTitle">
+      <div class="library-heading">
+        <div><h2 id="libraryTitle">音效库 <span id="count" class="count"></span></h2><p>点击播放给对方 · 试听仅自己可听</p></div>
+        <button id="btnAdd" class="ghost">＋ 添加音频</button>
       </div>
-      <button id="btnAboutClose" class="ghost" aria-label="关闭关于窗口">关闭</button>
+      <div id="libbar" class="libbar">
+        <div class="search-field"><input id="inSearch" type="search" aria-label="搜索音效名称、标签或热键" placeholder="搜索音效或标签…"><kbd id="searchShortcut">⌘ K</kbd></div>
+        <button id="btnSort" class="quiet" title="按名称排序，热键会随音效一起移动">按名称排序</button>
+      </div>
+      <div id="tagbar" class="tagbar" aria-label="按标签筛选"></div>
+      <p id="notice" class="library-notice hidden" role="status"></p>
+      <div id="grid" class="grid"></div>
+    </main>
+
+    <aside class="mixer" aria-labelledby="mixerTitle">
+      <div class="mixer-heading"><h2 id="mixerTitle">混音控制</h2><span>实时生效</span></div>
+      <div class="gain-control">
+        <div class="gain-heading"><label for="inMicGain">麦克风音量</label><span class="withunit"><input id="inMicGain" type="number" value="0" step="1" min="-60" max="36" aria-label="麦克风音量" aria-describedby="micGainHelp gainRangeHelp"><i>dB</i></span></div>
+        <input id="micGainSlider" type="range" min="-60" max="36" step="1" value="0" aria-label="麦克风音量滑杆" aria-describedby="micGainHelp gainRangeHelp">
+        <p id="micGainHelp" class="hint">调整对方听到的人声大小。</p>
+      </div>
+      <div class="gain-control">
+        <div class="gain-heading"><label for="inSfxGain">音效总音量</label><span class="withunit"><input id="inSfxGain" type="number" value="-6" step="1" min="-60" max="36" aria-label="音效总音量" aria-describedby="sfxGainHelp gainRangeHelp"><i>dB</i></span></div>
+        <input id="sfxGainSlider" type="range" min="-60" max="36" step="1" value="-6" aria-label="音效总音量滑杆" aria-describedby="sfxGainHelp gainRangeHelp">
+        <p id="sfxGainHelp" class="hint">统一控制试听、正式播放和监听，与卡片音效音量叠加。</p>
+      </div>
+      <p id="gainRangeHelp" class="hint range-help">0 dB 保持原音量，负数调小，正数调大；范围 −60～+36 dB，−60 dB 静音。</p>
+      <div class="mixer-options">
+        <label class="switch-row"><span><strong>本机监听</strong><small id="monitorHelp">自己同步听到正式音效</small></span><input id="inMonitor" type="checkbox" checked aria-describedby="monitorHelp" aria-label="本机监听"></label>
+        <label class="switch-row" title="正式播放与监听循环；取消后当前一遍结束即停止。试听始终只播放一次。"><span><strong>循环播放</strong><small>仅正式播放与监听</small></span><input id="inLoop" type="checkbox" aria-label="循环播放" aria-describedby="loopHelp"></label>
+        <p id="loopHelp" class="hint">循环已关闭：正式播放与监听在当前一遍结束后停止。试听始终只播放一次。</p>
+      </div>
+      <div class="route">
+        <h3>音频连接</h3><span class="route-label">真实麦克风</span><p id="inputRoute" title="">系统默认麦克风</p>
+        <span class="route-arrow" aria-hidden="true">↓</span><span class="route-label">输出至虚拟设备</span><p id="outputRoute" title="">自动探测虚拟声卡</p>
+        <p id="routeHelp" class="hint">目标应用需选择对应的虚拟麦克风。</p>
+        <button id="btnDriverHelp" class="quiet hidden">安装虚拟音频设备</button>
+      </div>
+    </aside>
+  </div>
+
+  <footer class="transport" aria-label="当前播放和音频状态">
+    <div id="player" class="player">
+      <div class="player-symbol" aria-hidden="true"><span class="play-symbol"></span></div>
+      <div class="player-copy"><strong id="playerName">准备好下一条音效</strong><span id="playerMode">点卡片播放，或先试听确认</span></div>
+      <div class="player-progress"><div class="progress-track"><i id="playerProgress"></i></div><span id="playerTime">— / —</span></div>
+      <button id="btnStopAll" class="stop-button" title="立即停止音效播放和本机试听，不影响麦克风转发与热键。"><span class="stop-symbol" aria-hidden="true"></span>停止播放 / 试听 <kbd>空格</kbd></button>
     </div>
-    <p id="aboutSummary" class="about-summary">将本地音频与麦克风人声混合，通过虚拟音频设备传给语音、会议、直播或游戏中的对方。</p>
-    <dl class="about-usage">
-      <div><dt>播放</dt><dd>点击音频卡片或按热键，向对方播放音频。每次只播放一个音频。</dd></div>
-      <div><dt>试听</dt><dd>仅自己可听，用于确认内容和音量。</dd></div>
-      <div><dt>连接</dt><dd>在目标应用中选择对应的虚拟麦克风。VB-CABLE：本软件输出选 CABLE Input，目标应用麦克风选 CABLE Output；macOS 两边选择同一虚拟设备。</dd></div>
-      <div><dt>音频来源</dt><dd>支持任意有读取权限的文件夹，也可从不同目录添加文件。macOS 首次访问下载、桌面或文稿时，请允许读取。</dd></div>
-    </dl>
-    <p id="aboutVersion" class="about-version hidden"></p>
+    <div class="statusbar">
+      <span id="meter" class="meter off" title="送往虚拟麦克风的混合信号电平"><i class="zone"></i><i class="bar"></i><i class="peak"></i></span>
+      <span id="signalLabel">音频设备未启动</span>
+      <details id="healthDetails" class="health-details"><summary id="healthSummary">音频状态</summary><div id="metrics" class="metrics">设备未启动</div></details>
+      <span class="status-spacer"></span><button id="remote" class="remote quiet"></button><button id="btnQr" class="quiet" aria-haspopup="dialog">手机遥控</button>
+    </div>
+  </footer>
+</div>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<div id="setup" class="modal-overlay hidden">
+  <section class="dialog setup-dialog" role="dialog" aria-modal="true" aria-labelledby="setupTitle">
+    <div class="dialog-heading"><div><p class="eyebrow">设备与偏好</p><h2 id="setupTitle">连接设置</h2></div><button id="btnSetupClose" class="quiet" aria-label="关闭连接设置">关闭</button></div>
+    <p id="setupHint" class="hint">选好真实麦克风和虚拟输出，再点主界面「启动」。</p>
+    <section class="settings-section"><h3>音频设备</h3>
+      <div class="row"><label>真实麦克风<select id="selIn"></select></label><label>输出到（虚拟声卡）<select id="selOut"></select></label></div>
+      <div class="row"><label>监听输出<select id="selMonitor"><option value="">系统默认输出</option></select></label><label class="narrow">音频缓冲<span class="withunit"><input id="inBuf" type="number" value="20" min="5" max="200"><i>ms</i></span></label></div>
+      <p class="hint">设备、缓冲与监听设置在下一次启动时生效；运行中更换设备前，请先彻底释放音频设备。</p>
+    </section>
+    <section id="librarySettings" class="settings-section" tabindex="-1"><h3>音效来源与热键</h3>
+      <label for="inDir">音频文件夹</label><div class="withbtn"><input id="inDir" type="text" placeholder="~/Sounds 或任意有读取权限的目录"><button id="btnBrowse" class="ghost">选择文件夹</button><button id="btnScan" class="ghost">载入</button></div>
+      <p id="folderHelp" class="hint">支持任意有读取权限的文件夹（只扫描当前层）。载入文件夹会替换列表；主界面“添加音频”可从不同目录追加音频。</p>
+      <label>全局热键（逗号分隔，与音效顺序对应）<input id="inKeys" type="text" placeholder="F1,F2,F3"></label>
+      <div class="setting-actions"><button id="btnClear" class="quiet danger">清空音效库</button><span class="hint">只移除列表，不删除原文件</span></div>
+    </section>
+    <section class="settings-section"><h3>手机遥控</h3><label class="switch-row"><span><strong>启用局域网遥控</strong><small>启动后，用同一网络中的手机扫码触发音效</small></span><input id="inRemote" type="checkbox" checked></label></section>
+    <section class="settings-section"><h3>结束转发</h3><p class="hint">平常「停止播放」只停止音效；「关闭音效」仍转发人声。释放设备后，目标应用需要改回真实麦克风。</p><div class="setting-actions"><button id="btnRevertMic" class="ghost">切回真实麦克风</button><button id="btnRelease" class="ghost danger">彻底释放音频设备</button></div></section>
+    <div class="dialog-footer"><button id="btnSetupSave" class="primary">保存设置并关闭</button></div>
   </section>
 </div>
 
+<div id="soundOverlay" class="modal-overlay hidden">
+  <section class="dialog sound-dialog" role="dialog" aria-modal="true" aria-labelledby="soundTitle">
+    <div class="dialog-heading"><div><p class="eyebrow">单条音效</p><h2 id="soundTitle">音效详情</h2></div><button id="btnSoundClose" class="quiet" aria-label="关闭音效详情">关闭</button></div>
+    <p id="soundFile" class="sound-file"></p>
+    <div class="volume-control"><div class="volume-heading"><label class="volume-label" for="soundGain">音效音量</label><output id="soundGainValue" class="volume-value" for="soundGain">0 dB</output></div><input id="soundGain" class="vol" type="range" min="-40" max="12" step="1" value="0" aria-describedby="soundGainHelp"><p id="soundGainHelp" class="volume-help hint">只调整这条音效，与音效总音量叠加；试听、正式播放和监听实时生效。−40 dB 是很轻的声音。</p></div>
+    <div class="sound-fields"><label>音效名称<input id="soundName" type="text" maxlength="200"></label><label>标签（用逗号分隔）<input id="soundTags" type="text"></label><label>全局热键<input id="soundHotkey" type="text" placeholder="例如 F1 或 Ctrl+1"></label></div>
+    <p id="soundEditHelp" class="hint">名称、标签和热键在关闭音效后可修改；音量随时可调。</p>
+    <div class="sound-tools"><button id="btnSoundLeft" class="ghost">前移</button><button id="btnSoundRight" class="ghost">后移</button><button id="btnSoundRemove" class="quiet danger">从库中移除</button></div>
+    <div class="dialog-footer"><button id="btnSoundSave" class="primary">保存并关闭</button></div>
+  </section>
+</div>
+
+<div id="utilityOverlay" class="modal-overlay hidden">
+  <section class="dialog" role="dialog" aria-modal="true" aria-labelledby="utilityTitle">
+    <div class="dialog-heading"><h2 id="utilityTitle">音频帮助</h2><button id="btnUtilityClose" class="quiet" aria-label="关闭面板">关闭</button></div>
+    <div id="qrPanel" class="qrpanel hidden"></div><div id="testPanel" class="testpanel hidden"></div><div id="vdevHelp" class="vdevhelp hidden"></div><div id="micHelp" class="vdevhelp hidden"></div><div id="calibPanel" class="hidden"><p>正在测量麦克风人声。请保持正常说话。</p><p id="calibHint" class="calibhint"></p></div>
+  </section>
+</div>
+
+<div id="aboutOverlay" class="modal-overlay about-overlay hidden">
+  <section class="dialog about-dialog" role="dialog" aria-modal="true" aria-labelledby="aboutTitle" aria-describedby="aboutSummary">
+    <div class="dialog-heading"><div><p class="eyebrow">关于软件</p><h2 id="aboutTitle">麦克风混音助手</h2></div><button id="btnAboutClose" class="quiet" aria-label="关闭关于窗口">关闭</button></div>
+    <p id="aboutSummary" class="about-summary">将本地音频与麦克风人声混合，通过虚拟音频设备传给语音、会议、直播或游戏中的对方。</p>
+    <dl class="about-usage"><div><dt>播放</dt><dd>点击音频卡片或按热键，向对方播放音频。每次只播放一个音频。</dd></div><div><dt>试听</dt><dd>仅自己可听，用于确认内容和音量。</dd></div><div><dt>连接</dt><dd>在目标应用中选择对应的虚拟麦克风。VB-CABLE：本软件输出选 CABLE Input，目标应用麦克风选 CABLE Output；macOS 两边选择同一虚拟设备。</dd></div><div><dt>音频来源</dt><dd>支持任意有读取权限的文件夹，也可从不同目录添加文件。macOS 首次访问下载、桌面或文稿时，请允许读取。</dd></div></dl>
+    <p id="aboutVersion" class="about-version hidden"></p>
+  </section>
+</div>
 <script src="library-model.js"></script>
 <script src="main.js"></script>
 </body>

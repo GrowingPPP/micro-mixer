@@ -53,6 +53,7 @@ class Element {
   get options() { return this.children.filter(child => child.tagName === 'OPTION'); }
   get selectedOptions() { return this.options.filter(option => option.value === this.value); }
   set innerHTML(html) {
+    for (const child of this.children) child.parentElement = null;
     this.children = [];
     this.textContent = '';
     const stack = [this];
@@ -74,11 +75,17 @@ class Element {
     }
   }
   matches(selector) {
+    if (selector === '*') return true;
     if (selector.startsWith('.')) return this.classList.contains(selector.slice(1));
     if (selector.startsWith('#')) return this.id === selector.slice(1);
+    if (selector.startsWith('[')) return this.getAttribute(selector.slice(1, -1)) !== null;
     return this.tagName.toLowerCase() === selector.toLowerCase();
   }
   querySelectorAll(selector) {
+    if (selector.includes(',')) {
+      const selected = new Set(selector.split(',').flatMap(part => this.querySelectorAll(part.trim())));
+      return this.querySelectorAll('*').filter(node => selected.has(node));
+    }
     const parts = selector.split(/\s+/);
     const result = [];
     const visit = element => {
@@ -109,6 +116,9 @@ class Element {
     await Promise.all((this.listeners.get(type) || []).map(listener => listener(event)));
   }
   focus() { this.document.activeElement = this; }
+  contains(node) { for (let parent = node; parent; parent = parent.parentElement) if (parent === this) return true; return false; }
+  closest(selector) { for (let parent = this; parent; parent = parent.parentElement) if (parent.matches(selector)) return parent; return null; }
+  click() { if (!this.disabled) return this.emit('click'); }
   select() {}
   blur() { return this.emit('blur'); }
 }
@@ -128,20 +138,29 @@ const playbackStatus = (patch = {}) => ({
   ...patch,
 });
 
-async function boot({ running = false, initialLoop, onInvoke } = {}) {
+async function boot({ running = false, initialLoop, onInvoke, now, dark = false, storedTheme, storageFailure } = {}) {
   const document = new Element('document', null);
   document.document = document;
   document.createElement = tag => new Element(tag, document);
   document.getElementById = id => document.querySelector('#' + id);
   document.innerHTML = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
+  document.documentElement = document.querySelector('html');
   if (initialLoop !== undefined) document.getElementById('inLoop').checked = initialLoop;
   const calls = [];
   const timers = new Map();
   const intervals = new Map();
   let nextTimer = 1;
   let nextOperation = 1;
+  const themeStorage = new Map(storedTheme === undefined ? [] : [['mixer.ui.theme', storedTheme]]);
+  const mediaListeners = [];
+  const themeMedia = { matches: dark, addEventListener(type, listener) { if (type === 'change') mediaListeners.push(listener); } };
   const window = {
     addEventListener() {}, innerWidth: 920, innerHeight: 660,
+    matchMedia() { return themeMedia; },
+    localStorage: {
+      getItem(key) { if (storageFailure === 'read') throw new Error('storage unavailable'); return themeStorage.get(key) ?? null; },
+      setItem(key, value) { if (storageFailure === 'write') throw new Error('storage unavailable'); themeStorage.set(key, value); },
+    },
     __TAURI__: { core: { invoke(command, args) {
       calls.push({ command, args: args == null ? args : JSON.parse(JSON.stringify(args)) });
       if (onInvoke) {
@@ -167,11 +186,13 @@ async function boot({ running = false, initialLoop, onInvoke } = {}) {
     } } },
   };
   const context = vm.createContext({ window, document, console,
+    Date: now ? class extends Date { static now() { return now(); } } : Date,
     navigator: { clipboard: { writeText: async () => {} } },
     setTimeout(callback, delay) { const id = nextTimer++; timers.set(id, { callback, delay }); return id; },
     clearTimeout(id) { timers.delete(id); },
     setInterval(callback, delay) { const id = nextTimer++; intervals.set(id, { callback, delay }); return id; },
   });
+  if (fs.existsSync(path.join(root, 'theme.js'))) vm.runInContext(fs.readFileSync(path.join(root, 'theme.js'), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(root, 'library-model.js'), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(root, 'main.js'), 'utf8'), context);
   await flush();
@@ -179,8 +200,16 @@ async function boot({ running = false, initialLoop, onInvoke } = {}) {
     'the shipped script must initialize and render the loaded library');
   assert.deepEqual(calls.filter(call => call.command === 'js_error'), [], 'frontend must boot without errors');
   return {
-    document, calls,
+    document, calls, themeStorage,
+    systemTheme(dark) {
+      themeMedia.matches = dark;
+      for (const listener of mediaListeners) listener({ matches: dark });
+    },
     card(index) { return document.querySelectorAll('.card')[index]; },
+    volume(index) {
+      document.querySelectorAll('.card')[index].querySelector('.sound-settings').click();
+      return document.getElementById('soundGain');
+    },
     async pollStatus() {
       for (const timer of intervals.values()) timer.callback();
       await flush();
@@ -250,9 +279,9 @@ test('旧配置卡片增益恢复到滑杆范围并统一试听启动与保存',
     if (command === 'load_config') return { items: items.map((item, index) =>
       ({ ...item, gain: index ? -120 : 760 })), dir: '' };
   } });
-  assert.equal(app.card(0).querySelector('.vol').value, '12');
-  assert.equal(app.card(0).querySelector('.volume-value').textContent, '+12 dB');
-  assert.equal(app.card(1).querySelector('.vol').value, '-40');
+  assert.equal(app.volume(0).value, '12');
+  assert.equal(app.document.getElementById('soundGainValue').textContent, '+12 dB');
+  assert.equal(app.volume(1).value, '-40');
   await app.card(0).querySelector('.prev').emit('click');
   assert.equal(app.calls.filter(c => c.command === 'preview').at(-1).args.gainDb, 12);
   await app.document.getElementById('btnToggle').emit('click');
@@ -403,7 +432,7 @@ test('About explains playback, preview and arbitrary audio folders with the pack
   assert.equal(overlay.classList.contains('hidden'), false, 'selecting the description must not dismiss About');
   await app.document.getElementById('btnAboutClose').emit('click');
   assert.equal(overlay.classList.contains('hidden'), true);
-  assert.equal(app.document.activeElement, button, 'closing must restore the keyboard focus');
+  assert.equal(app.document.activeElement, app.document.getElementById('toolsMenu').querySelector('summary'), 'closing must restore the keyboard focus');
 });
 
 for (const running of [false, true]) {
@@ -425,7 +454,7 @@ for (const running of [false, true]) {
     await app.document.emit('keydown', { key: 'Escape', target: close });
     assert.equal(overlay.classList.contains('hidden'), true);
     assert.equal(qrPanel.classList.contains('hidden'), false, 'Escape closes only the active modal');
-    assert.equal(app.document.activeElement, button);
+    assert.equal(app.document.activeElement, app.document.getElementById('toolsMenu').querySelector('summary'));
     assert.deepEqual(controls(), []);
     await app.document.emit('keydown', { key: ' ', target: app.document });
     await flush();
@@ -497,7 +526,7 @@ for (const looping of [false, true]) {
     } });
     assert.equal(app.document.getElementById('inLoop').checked, looping,
       'both false and true must be applied as stored settings');
-    await app.card(0).querySelector('.vol').emit('change');
+    await app.volume(0).emit('change');
     assert.equal(app.calls.filter(call => call.command === 'save_config').at(-1)?.args.looping, looping,
       'saving another control must not discard the loop preference');
   });
@@ -703,7 +732,7 @@ test('startup rebuilds cards from loaded stable slots after an earlier bad file 
   assert.equal(app.document.querySelectorAll('.card').length, 1,
     'startup must replace the idle source-index cards with the actual loaded slot list');
   assert.equal(app.card(0).querySelector('.name').textContent, 'Beta');
-  assert.equal(app.card(0).querySelector('.dur').textContent, '2.0s');
+  assert.equal(app.card(0).querySelector('.dur').textContent, '0:02');
   assert.equal(app.card(0).querySelector('.key').textContent, 'F2');
   await app.card(0).emit('click');
   assert.equal(app.calls.filter(call=>call.command==='play').at(-1).args.slot, 0);
@@ -1120,7 +1149,7 @@ for (const command of ['stop','release']) for (const preview of [false,true]) {
 test('volume dragging changes the active preview even when the engine has not started', async () => {
   const app = await boot();
   await app.card(0).querySelector('.prev').emit('click');
-  const slider = app.card(0).querySelector('.vol');
+  const slider = app.volume(0);
   slider.value = '-18';
   await slider.emit('input');
   await flush();
@@ -1217,7 +1246,7 @@ test('main and preview transitions use one highlighted card and preview completi
   assert.equal(app.card(1).classList.contains('playing'), false);
   assert.equal(app.card(1).querySelector('.prev').classList.contains('playing'), false);
   assert.equal(app.card(0).classList.contains('previewing'), false);
-  assert.match(app.card(0).querySelector('.playback-state').textContent, /播放中.*对方/);
+  assert.match(app.card(0).querySelector('.playback-state').textContent, /播放中.*虚拟设备/);
   assert.match(app.document.getElementById('toast').textContent, /已切换播放/);
   await app.card(1).querySelector('.prev').emit('click');
   status = playbackStatus();
@@ -1282,10 +1311,10 @@ test('a delayed older status cannot restore A after the play command already sel
 
 test('rapid adjustments on different sound cards both reach audio while dragging', async () => {
   const app = await boot({ running: true });
-  const first = app.card(0).querySelector('.vol');
-  const second = app.card(1).querySelector('.vol');
-  first.value = '-12'; second.value = '-24';
-  await Promise.all([first.emit('input'), second.emit('input')]);
+  const first = app.volume(0);
+  first.value = '-12'; await first.emit('input');
+  const second = app.volume(1);
+  second.value = '-24'; await second.emit('input');
   await flush();
   assert.deepEqual(app.calls.filter(call => call.command === 'set_sound_gain'), [
     { command: 'set_sound_gain', args: { soundId: 'sound-A', db: -12 } },
@@ -1302,17 +1331,18 @@ test('the stop playback button sends the combined stop command and confirms prev
   assert.match(app.document.getElementById('btnStopAll').title, /试听/);
 });
 
-test('each volume slider explains its purpose, displays live dB and saves the edited gain', async () => {
+test('音效详情显示音量用途与实时dB并按稳定ID保存', async () => {
   const app = await boot();
   const card = app.card(0);
-  const slider = card.querySelector('.vol');
-  assert.match(card.querySelector('.volume-label')?.textContent || '', /音效音量/);
+  const slider = app.volume(0);
+  const detail = app.document.getElementById('soundOverlay');
+  assert.match(detail.querySelector('.volume-label')?.textContent || '', /音效音量/);
   assert.match(slider.getAttribute('aria-label') || '', /Alpha.*音效音量/);
-  assert.match(card.querySelector('.volume-help')?.textContent || '', /试听.*播放.*生效/);
-  assert.equal(card.querySelector('.volume-value')?.textContent, '0 dB');
+  assert.match(detail.querySelector('.volume-help')?.textContent || '', /试听.*播放.*生效/);
+  assert.equal(detail.querySelector('.volume-value')?.textContent, '0 dB');
   slider.value = '-40';
   await slider.emit('input');
-  assert.equal(card.querySelector('.volume-value')?.textContent, '-40 dB');
+  assert.equal(detail.querySelector('.volume-value')?.textContent, '-40 dB');
   assert.match(slider.getAttribute('aria-valuetext') || '', /-40 dB/);
   assert.equal(slider.classList.contains('muted'), false, '-40dB is quiet, not silence');
   await slider.emit('change');
@@ -1323,7 +1353,7 @@ test('each volume slider explains its purpose, displays live dB and saves the ed
   assert.equal(saved.args.hotkeys, ',F2');
   // Rendering and the next preview must keep the local edited value.
   await app.document.getElementById('inSearch').emit('input');
-  assert.equal(app.card(0).querySelector('.vol').value, '-40');
+  assert.equal(app.volume(0).value, '-40');
   await app.card(0).querySelector('.prev').emit('click');
   assert.equal(app.calls.filter(call => call.command === 'preview').at(-1).args.gainDb, -40);
 });
@@ -1337,9 +1367,9 @@ test('a slow native gain update coalesces the same sound while other sounds rema
       return new Promise(resolve => { finishFirst = resolve; });
     }
   } });
-  const a = app.card(0).querySelector('.vol');
-  const b = app.card(1).querySelector('.vol');
+  const a = app.volume(0);
   for (const db of [-3, -6, -9, -12]) { a.value = String(db); await a.emit('input'); }
+  const b = app.volume(1);
   b.value = '-18'; await b.emit('input');
   await flush();
   assert.deepEqual(app.calls.filter(call => call.command === 'set_sound_gain'), [
@@ -1361,7 +1391,7 @@ test('rapid completed volume edits save in order so an older write cannot replac
       return new Promise(resolve => { finishSave = resolve; });
     }
   } });
-  const slider = app.card(0).querySelector('.vol');
+  const slider = app.volume(0);
   slider.value = '-3'; await slider.emit('input');
   const firstChange = slider.emit('change');
   await flush();
@@ -1374,4 +1404,326 @@ test('rapid completed volume edits save in order so an older write cannot replac
   await Promise.all([firstChange, secondChange]);
   assert.deepEqual(app.calls.filter(call => call.command === 'save_config')
     .map(call => call.args.items[0].gain), [-3, -18]);
+});
+
+const audioCommands = app => app.calls.filter(call =>
+  ['start', 'play', 'preview', 'stop_all', 'stop', 'release', 'begin_playback_operation'].includes(call.command));
+
+test('简洁卡片提供独立语义按钮并将音量放入详情', async () => {
+  const app = await boot();
+  const card = app.card(0);
+  assert.equal(card.tagName, 'ARTICLE');
+  assert.equal(card.querySelector('.play-trigger').tagName, 'BUTTON');
+  assert.equal(card.querySelector('.prev').tagName, 'BUTTON');
+  assert.equal(card.querySelector('.vol'), null, '卡片不常驻滑杆');
+  assert.equal(card.querySelector('.sound-settings').getAttribute('aria-haspopup'), 'dialog');
+  const trigger = card.querySelector('.sound-settings');
+  trigger.focus();
+  await trigger.emit('click');
+  assert.equal(app.document.getElementById('soundOverlay').classList.contains('hidden'), false);
+  assert.equal(app.document.getElementById('soundTitle').textContent, 'Alpha');
+  assert.equal(app.document.getElementById('soundFile').textContent, '/sounds/A.wav');
+  assert.deepEqual(audioCommands(app), [], '打开详情不能触发播放');
+  await app.document.getElementById('btnSoundClose').emit('click');
+  assert.equal(app.document.activeElement, trigger);
+});
+
+test('侧栏滑杆与数字框同步并保存最新全局音量', async () => {
+  const app = await boot();
+  const slider = app.document.getElementById('sfxGainSlider');
+  const number = app.document.getElementById('inSfxGain');
+  slider.value = '0';
+  await slider.emit('input');
+  assert.equal(number.value, '0');
+  assert.equal(slider.getAttribute('aria-valuetext'), '0 dB');
+  await app.advanceTimers(120);
+  assert.deepEqual(app.calls.filter(c => c.command === 'set_gains').at(-1).args, { micDb: 0, sfxDb: 0 });
+  number.value = '-18';
+  await number.emit('input');
+  assert.equal(slider.value, '-18');
+  await app.card(0).querySelector('.prev').emit('click');
+  assert.equal(app.calls.filter(c => c.command === 'set_gains').at(-1).args.sfxDb, -18);
+  assert.equal(app.calls.filter(c => c.command === 'save_config').at(-1).args.sfxGainDb, -18);
+});
+
+test('恢复配置同时恢复侧栏两种音量输入并保留显式false', async () => {
+  const app = await boot({ onInvoke(command) {
+    if (command === 'load_config') return { items, mic_gain_db: -7, sfx_gain_db: 0, monitor: false, looping: false };
+  } });
+  assert.equal(app.document.getElementById('micGainSlider').value, '-7');
+  assert.equal(app.document.getElementById('sfxGainSlider').value, '0');
+  assert.equal(app.document.getElementById('inMonitor').checked, false);
+  assert.equal(app.document.getElementById('inLoop').checked, false);
+});
+
+test('底部播放器在筛选隐藏当前卡片后仍显示原生音效和进度', async () => {
+  let status = playbackStatus({ playing: true, active_slot: 0, playhead_secs: 1 });
+  const app = await boot({ onInvoke(command) { if (command === 'status') return status; } });
+  const search = app.document.getElementById('inSearch');
+  search.value = 'Beta'; await search.emit('input');
+  assert.equal(app.document.querySelectorAll('.card').length, 1);
+  assert.equal(app.document.getElementById('playerName').textContent, 'Alpha');
+  assert.equal(app.document.getElementById('player').dataset.kind, 'main');
+  assert.equal(app.document.getElementById('playerProgress').style.width, '50%');
+  assert.equal(app.document.getElementById('playerTime').textContent, '0:01 / 0:02');
+  status = playbackStatus({ preview_playing: true, preview_sound_id: 'sound-B', preview_playhead_secs: .5, preview_duration_secs: 2 });
+  await app.pollStatus();
+  assert.equal(app.document.getElementById('playerName').textContent, 'Beta');
+  assert.equal(app.document.getElementById('player').dataset.kind, 'preview');
+  assert.match(app.document.getElementById('playerMode').textContent, /仅自己可听.*只播一次/);
+  assert.equal(app.document.getElementById('playerProgress').style.width, '25%');
+  status = playbackStatus(); await app.pollStatus();
+  assert.equal(app.document.getElementById('player').dataset.kind, 'idle');
+  assert.equal(app.document.getElementById('playerProgress').style.width, '0%');
+});
+
+test('停止确认后状态读取失败也立即清除底部与卡片反馈', async () => {
+  let failed = false;
+  const app = await boot({ onInvoke(command) {
+    if (command === 'status') return failed ? Promise.reject(new Error('status unavailable'))
+      : playbackStatus({ playing: true, active_slot: 0, playhead_secs: 1 });
+    if (command === 'stop_all') { failed = true; return true; }
+  } });
+  assert.equal(app.document.getElementById('player').dataset.kind, 'main');
+  await app.document.getElementById('btnStopAll').emit('click');
+  assert.equal(app.document.getElementById('player').dataset.kind, 'idle');
+  assert.equal(app.card(0).classList.contains('playing'), false);
+});
+
+test('运行中的监听明确只读且待机继续显示真实混合电平', async () => {
+  let status = playbackStatus();
+  const app = await boot({ onInvoke(command) { if (command === 'status') return status; } });
+  assert.equal(app.document.getElementById('inMonitor').disabled, true);
+  assert.match(app.document.getElementById('monitorHelp').textContent, /已开启.*释放设备/);
+  status = playbackStatus({ running: false, passthrough: true, slots: [] }); await app.pollStatus();
+  assert.equal(app.document.getElementById('meter').classList.contains('off'), false);
+  assert.equal(app.document.getElementById('signalLabel').textContent, '混合信号输出中');
+  assert.match(app.document.getElementById('playerMode').textContent, /麦克风仍在转发/);
+  status = playbackStatus({ running: false, passthrough: false, slots: [] }); await app.pollStatus();
+  assert.equal(app.document.getElementById('inMonitor').disabled, false);
+  assert.equal(app.document.getElementById('meter').classList.contains('off'), true);
+});
+
+test('详情保存名称标签和空热键时保持条目身份及原始标点标签', async () => {
+  const app = await boot();
+  app.volume(0);
+  app.document.getElementById('soundName').value = '新的名称';
+  app.document.getElementById('soundHotkey').value = '';
+  await app.document.getElementById('btnSoundSave').emit('click');
+  const saved = app.calls.filter(c => c.command === 'save_config').at(-1).args;
+  assert.equal(saved.items[0].id, 'sound-A');
+  assert.equal(saved.items[0].name, '新的名称');
+  assert.deepEqual(saved.items[0].tags, ['a,b']);
+  assert.equal(saved.hotkeys, ',F2');
+  assert.equal(app.card(0).querySelector('.name').textContent, '新的名称');
+});
+
+test('筛选后的详情增益使用稳定ID而非可见顺序', async () => {
+  const app = await boot({ running: true });
+  const search = app.document.getElementById('inSearch');
+  search.value = 'Beta'; await search.emit('input');
+  const gain = app.volume(0); gain.value = '-18'; await gain.emit('input'); await gain.emit('change');
+  assert.deepEqual(app.calls.filter(c => c.command === 'set_sound_gain').at(-1).args, { soundId: 'sound-B', db: -18 });
+  const saved = app.calls.filter(c => c.command === 'save_config').at(-1).args;
+  assert.equal(saved.items[0].gain, 0);
+  assert.equal(saved.items[1].gain, -18);
+  assert.equal(app.document.getElementById('soundName').disabled, true);
+});
+
+test('详情前移按条目移动热键并恢复重建后的详情按钮焦点', async () => {
+  const app = await boot();
+  app.card(1).querySelector('.sound-settings').focus();
+  app.volume(1);
+  await app.document.getElementById('btnSoundLeft').emit('click');
+  assert.equal(app.card(0).querySelector('.name').textContent, 'Beta');
+  assert.equal(app.document.getElementById('soundHotkey').value, 'F2');
+  await app.document.getElementById('btnSoundClose').emit('click');
+  assert.equal(app.document.activeElement, app.card(0).querySelector('.sound-settings'));
+  const saved = app.calls.filter(c => c.command === 'save_config').at(-1).args;
+  assert.deepEqual(saved.items.map(item => item.id), ['sound-B', 'sound-A']);
+  assert.equal(saved.hotkeys, 'F2,');
+});
+
+for (const panel of ['setup', 'soundOverlay']) {
+  test(`${panel}约束焦点并阻止数字与空格播放快捷键`, async () => {
+    const app = await boot({ running: true });
+    if (panel === 'setup') await app.document.getElementById('btnSetup').emit('click');
+    else app.volume(0);
+    const first = app.document.getElementById(panel === 'setup' ? 'btnSetupClose' : 'btnSoundClose');
+    const last = app.document.getElementById(panel === 'setup' ? 'btnSetupSave' : 'btnSoundSave');
+    assert.equal(app.document.getElementById('appShell').inert, true);
+    first.focus(); await app.document.emit('keydown', { key: 'Tab', shiftKey: true, target: first });
+    assert.equal(app.document.activeElement, last);
+    await app.document.emit('keydown', { key: 'Tab', target: last });
+    assert.equal(app.document.activeElement, first);
+    for (const key of ['1', '2', ' ']) await app.document.emit('keydown', { key, target: first });
+    assert.deepEqual(audioCommands(app), []);
+    await app.document.emit('keydown', { key: 'Escape', target: first });
+    assert.equal(app.document.getElementById(panel).classList.contains('hidden'), true);
+    assert.equal(app.document.getElementById('appShell').inert, false);
+  });
+}
+
+test('旧详情保存回复不能关闭新打开的面板', async () => {
+  let finish;
+  const app = await boot({ onInvoke(command) {
+    if (command === 'save_config') return new Promise(resolve => { finish = resolve; });
+  } });
+  app.volume(0);
+  const saved = app.document.getElementById('btnSoundSave').emit('click');
+  await flush();
+  await app.document.getElementById('btnSoundClose').emit('click');
+  app.volume(1);
+  finish(true); await saved;
+  assert.equal(app.document.getElementById('soundOverlay').classList.contains('hidden'), false);
+  assert.equal(app.document.getElementById('soundTitle').textContent, 'Beta');
+});
+
+for (const os of ['macos', 'windows']) {
+  test(`${os}使用同一混音控件与平台连接说明及搜索快捷键`, async () => {
+    const app = await boot({ onInvoke(command) { if (command === 'platform_info') return { os }; } });
+    assert.equal(app.document.getElementById('searchShortcut').textContent, os === 'windows' ? 'Ctrl K' : '⌘ K');
+    assert.match(app.document.getElementById('routeHelp').textContent, os === 'windows' ? /CABLE Input.*CABLE Output/ : /BlackHole.*同一设备/);
+    const key = { key: 'k', target: app.document, ...(os === 'windows' ? { ctrlKey: true } : { metaKey: true }) };
+    await app.document.emit('keydown', key);
+    assert.equal(app.document.activeElement, app.document.getElementById('inSearch'));
+    assert.deepEqual(audioCommands(app), []);
+  });
+}
+
+test('非播放按钮空格保持原生激活且组合键和长按不会重复触发音效', async () => {
+  const app = await boot({ running: true });
+  await app.document.emit('keydown', { key: ' ', target: app.document.getElementById('btnAdd') });
+  await app.document.emit('keydown', { key: '1', ctrlKey: true, target: app.document });
+  await app.document.emit('keydown', { key: '1', repeat: true, target: app.document });
+  assert.deepEqual(audioCommands(app), []);
+});
+
+test('旧自检失败不能将结果插入新打开的遥控面板', async () => {
+  let reject;
+  const app = await boot({ onInvoke(command) {
+    if (command === 'self_test') return new Promise((_, fail) => { reject = fail; });
+  } });
+  const selftest = app.document.getElementById('btnSelfTest').emit('click');
+  await flush();
+  await app.document.getElementById('btnUtilityClose').emit('click');
+  await app.document.getElementById('btnQr').emit('click');
+  reject(new Error('older failed')); await selftest;
+  assert.equal(app.document.getElementById('utilityTitle').textContent, '手机遥控');
+  assert.equal(app.document.getElementById('qrPanel').classList.contains('hidden'), false);
+  assert.equal(app.document.getElementById('testPanel').classList.contains('hidden'), true);
+});
+
+test('连接保存失败保留面板并说明未保存而不虚报成功', async () => {
+  const app = await boot({ onInvoke(command) {
+    if (command === 'save_config') return Promise.reject(new Error('permission denied'));
+  } });
+  await app.document.getElementById('btnSetup').emit('click');
+  await app.document.getElementById('btnSetupSave').emit('click');
+  assert.equal(app.document.getElementById('setup').classList.contains('hidden'), false);
+  assert.match(app.document.getElementById('toast').textContent, /保存失败/);
+  assert.doesNotMatch(app.document.getElementById('toast').textContent, /已保存/);
+});
+
+for (const target of ['.play-trigger', '.prev']) {
+  test(`${target}点击后空格仍停止而不是原生再次激活`, async () => {
+    const app = await boot({ running: true });
+    const button = app.card(0).querySelector(target);
+    button.focus();
+    let prevented = false;
+    await app.document.emit('keydown', { key: ' ', target: button, preventDefault() { prevented = true; } });
+    await flush();
+    assert.equal(prevented, true, '阻止按钮原生空格激活');
+    assert.deepEqual(audioCommands(app).filter(c => c.command !== 'begin_playback_operation').map(c => c.command), ['stop_all']);
+  });
+}
+
+
+test('校准应用成功但配置保存失败时明确说明未保存', async () => {
+  let now = 0;
+  const app = await boot({ running: true, now: () => now, onInvoke(command) {
+    if (command === 'save_config') return Promise.reject(new Error('permission denied'));
+  } });
+  const calibration = app.document.getElementById('btnCalib').emit('click');
+  await flush();
+  await app.advanceTimers(400);
+  for (let i = 0; i < 27; i++) { now += 200; await app.advanceTimers(200); }
+  await calibration;
+  assert.match(app.document.getElementById('calibHint').textContent, /已生效.*未保存/);
+  assert.doesNotMatch(app.document.getElementById('calibHint').textContent, /设置已保存/);
+  assert.match(app.document.getElementById('toast').textContent, /保存失败/);
+});
+
+test('播放按钮长按空格仅停止一次并阻止重复原生激活', async () => {
+  const app = await boot({ running: true });
+  const button = app.card(0).querySelector('.play-trigger');
+  let prevented = 0;
+  for (const repeat of [false, true, true]) {
+    await app.document.emit('keydown', { key: ' ', target: button, repeat, preventDefault() { prevented++; } });
+  }
+  await flush();
+  assert.equal(prevented, 3);
+  assert.equal(app.calls.filter(call => call.command === 'stop_all').length, 1);
+});
+
+for (const dark of [false, true]) {
+  test(`未选择主题时跟随系统${dark ? '深色' : '浅色'}并响应系统变化`, async () => {
+    const app = await boot({ dark });
+    const select = app.document.getElementById('selTheme');
+    assert.ok(select, '更多功能中应有明确主题入口');
+    assert.equal(select.value, 'system');
+    assert.equal(app.document.documentElement.dataset.theme, dark ? 'dark' : 'light');
+    app.systemTheme(!dark);
+    assert.equal(app.document.documentElement.dataset.theme, dark ? 'light' : 'dark');
+    assert.equal(app.themeStorage.size, 0, '系统变化不改写用户偏好');
+  });
+}
+
+for (const theme of ['light', 'dark']) {
+  test(`手动${theme}立即生效并恢复保存偏好且系统改变不覆盖`, async () => {
+    const app = await boot({ running: true, dark: theme === 'light' });
+    const select = app.document.getElementById('selTheme');
+    assert.ok(select);
+    app.calls.length = 0;
+    select.value = theme;
+    await select.emit('change');
+    assert.equal(app.document.documentElement.dataset.theme, theme);
+    assert.equal(app.themeStorage.get('mixer.ui.theme'), theme);
+    app.systemTheme(theme === 'light');
+    assert.equal(app.document.documentElement.dataset.theme, theme);
+    assert.deepEqual(app.calls, [], '主题切换不发送音频或配置 IPC');
+    const reopened = await boot({ storedTheme: app.themeStorage.get('mixer.ui.theme'), dark: theme === 'light' });
+    assert.equal(reopened.document.getElementById('selTheme').value, theme);
+    assert.equal(reopened.document.documentElement.dataset.theme, theme);
+  });
+}
+
+test('手动主题切回跟随系统后使用当前系统外观并持续同步', async () => {
+  const app = await boot({ storedTheme: 'light', dark: true });
+  const select = app.document.getElementById('selTheme');
+  assert.ok(select);
+  select.value = 'system'; await select.emit('change');
+  assert.equal(app.document.documentElement.dataset.theme, 'dark');
+  app.systemTheme(false);
+  assert.equal(app.document.documentElement.dataset.theme, 'light');
+  assert.equal(app.themeStorage.get('mixer.ui.theme'), 'system');
+});
+
+for (const options of [{storedTheme: 'invalid'}, {storageFailure: 'read'}]) {
+  test(`主题${options.storedTheme ? '存储值无效' : '存储不可读取'}时安全回退系统且界面正常加载`, async () => {
+    const app = await boot({ ...options, dark: true });
+    assert.equal(app.document.documentElement.dataset.theme, 'dark');
+    assert.equal(app.document.getElementById('selTheme')?.value, 'system');
+  });
+}
+
+test('主题存储写入失败仍即时切换并明确提示未保存', async () => {
+  const app = await boot({ dark: true, storageFailure: 'write' });
+  const select = app.document.getElementById('selTheme');
+  assert.ok(select);
+  select.value = 'light'; await select.emit('change');
+  assert.equal(app.document.documentElement.dataset.theme, 'light');
+  assert.equal(select.value, 'light');
+  assert.match(app.document.getElementById('themeHelp').textContent, /未能保存/);
+  assert.match(app.document.getElementById('toast').textContent, /未能保存/);
 });
