@@ -11,6 +11,7 @@ mod host;
 #[cfg(target_os = "macos")]
 mod macos_audio;
 mod smoke;
+mod window_lifecycle;
 
 use std::path::PathBuf;
 
@@ -19,6 +20,7 @@ use host::{AudioHost, DeviceDto, StartConfig, StatusDto};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, State};
+use window_lifecycle::MainWindowEvent;
 
 type Res<T> = Result<T, String>;
 
@@ -799,11 +801,12 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 }
 
 fn show_window(app: &tauri::AppHandle) {
-    if let Some(w) = app.get_webview_window("main") {
-        let _ = w.show();
-        let _ = w.unminimize();
-        let _ = w.set_focus();
-    }
+    handle_main_window_event(app, MainWindowEvent::ShowRequested);
+}
+
+fn handle_main_window_event(app: &tauri::AppHandle, event: MainWindowEvent) {
+    let window = app.get_webview_window("main");
+    window_lifecycle::handle_main_window_event(event, window.as_ref());
 }
 
 // ─────────────────────────────────────────── 入口
@@ -1086,9 +1089,15 @@ fn main() {
         // 游戏时窗口会挡视线，但引擎必须继续跑 —— 一旦退出，对方就听不到你了。
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() != "main" {
+                    return;
+                }
                 api.prevent_close();
-                let _ = window.hide();
-                println!("[窗口已隐藏] 引擎继续运行；点菜单栏图标可重新打开");
+                handle_main_window_event(window.app_handle(), MainWindowEvent::CloseRequested);
+                #[cfg(target_os = "macos")]
+                println!("[窗口已隐藏] 引擎继续运行；点 Dock 或菜单栏图标可重新打开");
+                #[cfg(not(target_os = "macos"))]
+                println!("[窗口已隐藏] 引擎继续运行；点系统托盘图标可重新打开");
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1126,10 +1135,19 @@ fn main() {
         ])
         .build(tauri::generate_context!())
         .expect("构建界面失败")
-        .run(|app, event| {
-            if let tauri::RunEvent::ExitRequested { api, .. } = event {
-                if !app.state::<AudioHost>().shutdown_done() { api.prevent_exit(); request_exit(app); }
+        .run(|app, event| match event {
+            // Dock 点击会请求恢复，即使另一个窗口可见也要聚焦现有主窗口。
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen { .. } => {
+                handle_main_window_event(app, MainWindowEvent::Reopen);
             }
+            tauri::RunEvent::ExitRequested { api, .. }
+                if !app.state::<AudioHost>().shutdown_done() =>
+            {
+                api.prevent_exit();
+                request_exit(app);
+            }
+            _ => {}
         });
 }
 

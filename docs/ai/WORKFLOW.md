@@ -21,7 +21,8 @@ Node 构建依赖可用 `npm ci` 从 `package-lock.json` 恢复，常规修改�
 |---|---|---|
 | 纯文档 | 相对链接、实际命令、规则一致性、`git diff --check` | 不为文档启动真实音频 |
 | GUI 模型 / 状态 / 控件 | `test-gui-model.js`、`test-gui-controls.js` | 交付 DOM、稳定 ID、旧回复、失败与取消、默认及最小窗口尺寸 |
-| Host / IPC / 生命周期 | `mixer-gui` Rust 测试及 GUI 控件回归 | 票据、迟到工作、会话所有权、试听解码取消及真实样本 |
+| Host / IPC / 生命周期 | `mixer-gui` Rust 测试及 GUI 控件回归 | 票据、迟到工作、会话所有权、总增益叠加、试听解码取消及真实样本 |
+| 原生窗口隐藏 / 恢复 | `window_lifecycle::tests`；对应平台打包 App | 关闭后保持同一窗口；macOS 实际 Dock 重新打开；双端托盘恢复 |
 | DSP / 播放 / 监听 | `audio-core`、`audio-session` 测试 | PCM 单音效、停止尾音、零分配、双输出接纳与循环 |
 | 配置 / 路径 | `app-config` 测试 | 旧格式、未知键、布尔 false、Unicode/标点、Windows 平台注入 |
 | 手机控制 | `remote` Rust 测试、`test-remote-controls.js` | localhost 路由、实际交付页、请求顺序、退休会话和端口回收 |

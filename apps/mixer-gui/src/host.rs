@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use audio_core::decode::decode_file;
 use audio_core::device::{AudioBackend, DeviceId, StreamFormat};
 use audio_core::engine::{AtomicF32, EngineStats};
+use audio_core::limiter::Limiter;
 use backend_cpal::CpalBackend;
 use hotkeys::Hotkeys;
 
@@ -372,6 +373,8 @@ pub struct AudioHost {
     lifecycle: Mutex<()>,
     app: Mutex<Option<tauri::AppHandle>>,
     running: Mutex<Option<Running>>,
+    /// 会话之外也保存音量，试听与启动中的用户调整共用这一份状态。
+    gains: Mutex<HostGains>,
     next_generation: AtomicU64,
     last_error: Mutex<Option<String>>,
     /// 试听代号：每次试听自增，旧的那次看到代号变了就自行停止。
@@ -403,9 +406,17 @@ struct AudioRequestState {
     gate: Mutex<()>,
     current: AtomicU64,
     generation: AtomicU64,
+    gain_revision: AtomicU64,
 }
 
 impl AudioRequestState {
+    fn reserve_with_gains(&self, gains: &Mutex<HostGains>) -> u64 {
+        let _publication = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        let gains = gains.lock().unwrap_or_else(|e| e.into_inner());
+        self.gain_revision.store(gains.revision, Ordering::Release);
+        self.current.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
     fn reserve(&self) -> u64 {
         let _publication = self.gate.lock().unwrap_or_else(|e| e.into_inner());
         self.current.fetch_add(1, Ordering::AcqRel) + 1
@@ -425,6 +436,24 @@ impl AudioRequestState {
     }
 }
 
+struct HostGains {
+    revision: u64,
+    mic_db: f32,
+    sfx_db: f32,
+    sfx_linear: Arc<AtomicF32>,
+}
+
+impl Default for HostGains {
+    fn default() -> Self {
+        Self {
+            revision: 0,
+            mic_db: 0.0,
+            sfx_db: -6.0,
+            sfx_linear: Arc::new(AtomicF32::new(10.0f32.powf(-6.0 / 20.0))),
+        }
+    }
+}
+
 struct PreviewControl {
     token: u64,
     sound_id: String,
@@ -434,15 +463,20 @@ struct PreviewControl {
 
 struct PreviewAudioState {
     gain: AtomicF32,
+    total_gain: Arc<AtomicF32>,
+    drained_frames: AtomicU64,
     rendered_frames: AtomicU64,
     total_frames: AtomicU64,
     sample_rate: AtomicU32,
     finished: AtomicBool,
     previous_playback: Option<Arc<Playback>>,
+    #[cfg(test)]
+    owner_observed_source_end: Mutex<Option<mpsc::Sender<()>>>,
 }
 
 fn sound_gain(db: f32) -> Result<f32> {
     anyhow::ensure!(db.is_finite(), "音量必须是有限数值");
+    anyhow::ensure!(db <= 36.0, "音量不能超过 +36 dB");
     let gain = if db <= -60.0 {
         0.0
     } else {
@@ -454,7 +488,7 @@ fn sound_gain(db: f32) -> Result<f32> {
 
 impl AudioHost {
     pub fn reserve_audio_request(&self) -> u64 {
-        self.audio_requests.reserve()
+        self.audio_requests.reserve_with_gains(&self.gains)
     }
 
     pub fn audio_request_is_current(&self, ticket: u64) -> bool {
@@ -654,11 +688,14 @@ impl AudioHost {
 
     fn start_inner_requested(
         &self,
-        cfg: StartConfig,
+        mut cfg: StartConfig,
         app: Option<&tauri::AppHandle>,
         ticket: Option<u64>,
     ) -> Result<()> {
         anyhow::ensure!(!self.quitting.load(Ordering::Acquire), "程序正在退出");
+        if !self.prepare_start_gains(&mut cfg, ticket)? {
+            return Ok(());
+        }
         // 设备与音效列表都没变（典型情况：从「待机」点「开启音效」）→
         // **不重开音频流**，只把音效重新打开。瞬间生效，用户来回切毫无卡顿。
         if let Some(k) = self.running_cfg_key() {
@@ -967,7 +1004,7 @@ impl AudioHost {
 
     /// Commit ownership and its routable generation together. No reservation can
     /// pass between the last ticket check and handing the new session to the host.
-    fn publish_running(&self, running: Running, ticket: Option<u64>) -> Option<Running> {
+    fn publish_running(&self, mut running: Running, ticket: Option<u64>) -> Option<Running> {
         let _publication = self
             .audio_requests
             .gate
@@ -976,6 +1013,12 @@ impl AudioHost {
         if ticket.is_some_and(|t| !self.audio_request_is_current(t)) {
             return Some(running);
         }
+        // 开流期间的音量调整不能被启动参数的旧副本覆盖。
+        let gains = self.gains.lock().unwrap_or_else(|e| e.into_inner());
+        running.playback.set_gains(gains.mic_db, gains.sfx_db);
+        running.cfg.mic_gain_db = gains.mic_db;
+        running.cfg.sfx_gain_db = gains.sfx_db;
+        running.cfg_key = cfg_fingerprint(&running.cfg);
         let generation = running.generation;
         *self.running.lock().unwrap_or_else(|e| e.into_inner()) = Some(running);
         self.audio_requests
@@ -1696,10 +1739,48 @@ impl AudioHost {
         Ok(updated)
     }
 
+    /// 启动票据之后更新的音量优先于后台命令携带的旧配置。
+    fn prepare_start_gains(&self, cfg: &mut StartConfig, ticket: Option<u64>) -> Result<bool> {
+        sound_gain(cfg.mic_gain_db)?;
+        let sfx = sound_gain(cfg.sfx_gain_db)?;
+        for db in &cfg.gains {
+            sound_gain(*db)?;
+        }
+        let _publication = self
+            .audio_requests
+            .gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if ticket.is_some_and(|t| !self.audio_request_is_current(t)) {
+            return Ok(false);
+        }
+        let mut gains = self.gains.lock().unwrap_or_else(|e| e.into_inner());
+        let unchanged_since_request = ticket.is_some()
+            && gains.revision == self.audio_requests.gain_revision.load(Ordering::Acquire);
+        if unchanged_since_request {
+            gains.revision = gains.revision.wrapping_add(1);
+            gains.mic_db = cfg.mic_gain_db;
+            gains.sfx_db = cfg.sfx_gain_db;
+            gains.sfx_linear.set(sfx);
+        } else {
+            cfg.mic_gain_db = gains.mic_db;
+            cfg.sfx_gain_db = gains.sfx_db;
+        }
+        Ok(true)
+    }
+
     pub fn set_gains(&self, mic_db: f32, sfx_db: f32) {
-        if !mic_db.is_finite() || !sfx_db.is_finite() {
+        if sound_gain(mic_db).is_err() {
             return;
         }
+        let Ok(sfx) = sound_gain(sfx_db) else {
+            return;
+        };
+        let mut gains = self.gains.lock().unwrap_or_else(|e| e.into_inner());
+        gains.revision = gains.revision.wrapping_add(1);
+        gains.mic_db = mic_db;
+        gains.sfx_db = sfx_db;
+        gains.sfx_linear.set(sfx);
         let mut guard = self.running.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(r) = guard.as_mut() {
             r.playback.set_gains(mic_db, sfx_db);
@@ -1823,11 +1904,20 @@ impl AudioHost {
                 .map_or((0, None), |r| (r.generation, Some(r.playback.clone())));
             let audio = Arc::new(PreviewAudioState {
                 gain: AtomicF32::new(gain),
+                total_gain: self
+                    .gains
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .sfx_linear
+                    .clone(),
+                drained_frames: AtomicU64::new(0),
                 rendered_frames: AtomicU64::new(0),
                 total_frames: AtomicU64::new(0),
                 sample_rate: AtomicU32::new(0),
                 finished: AtomicBool::new(false),
                 previous_playback: playback,
+                #[cfg(test)]
+                owner_observed_source_end: Mutex::new(None),
             });
             let mut control = self
                 .preview_control
@@ -2062,7 +2152,12 @@ fn bind_hotkeys_on_main_thread(
 
 // ─────────────────────────────────────────── 试听
 
-struct PreviewCursor(Arc<Mutex<Option<audio_session::SampleCursor>>>);
+struct PreviewRender {
+    cursor: audio_session::SampleCursor,
+    limiter: Limiter,
+}
+
+struct PreviewCursor(Arc<Mutex<Option<PreviewRender>>>);
 impl Drop for PreviewCursor {
     fn drop(&mut self) {
         *self.0.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -2089,9 +2184,12 @@ fn play_samples(
     audio
         .total_frames
         .store(total_frames as u64, Ordering::Release);
-    let cursor = PreviewCursor(Arc::new(Mutex::new(Some(
-        audio_session::SampleCursor::new(samples_owned, 0.0),
-    ))));
+    let limiter = Limiter::with_channels(fmt.sample_rate, 2);
+    let latency_frames = limiter.latency_frames() as u64;
+    let cursor = PreviewCursor(Arc::new(Mutex::new(Some(PreviewRender {
+        cursor: audio_session::SampleCursor::new(samples_owned, 0.0),
+        limiter,
+    }))));
     let callback_cursor = cursor.0.clone();
     let callback_gen = gen.clone();
     let callback_audio = audio.clone();
@@ -2113,14 +2211,24 @@ fn play_samples(
                 return;
             }
             if let Ok(mut guard) = callback_cursor.try_lock() {
-                if let Some(cursor) = guard.as_mut() {
-                    cursor.render(out, fmt.ch());
-                    let gain = callback_audio.gain.get();
+                if let Some(render) = guard.as_mut() {
+                    let gain = callback_audio.gain.get() * callback_audio.total_gain.get();
                     let remaining = total_frames as u64
                         - callback_audio.rendered_frames.load(Ordering::Relaxed);
                     let rendered = remaining.min((out.len() / fmt.ch()) as u64);
-                    for sample in out.iter_mut() {
-                        *sample *= gain;
+                    // 与正式输出一样：先在立体声域限幅，再映射设备声道。
+                    // 固定帧缓冲不依赖设备回调大小，不在回调中分配。
+                    for frame in out.chunks_exact_mut(fmt.ch()) {
+                        let mut stereo = [0.0; 2];
+                        render.cursor.render(&mut stereo, 2);
+                        stereo[0] *= gain;
+                        stereo[1] *= gain;
+                        render.limiter.process_in_place(&mut stereo);
+                        let mono = (stereo[0] + stereo[1]) * 0.5;
+                        frame.fill(mono);
+                        if frame.len() > 1 {
+                            frame[..2].copy_from_slice(&stereo);
+                        }
                     }
                     if callback_gen.load(Ordering::Acquire) != my_gen {
                         out.fill(0.0);
@@ -2129,6 +2237,9 @@ fn play_samples(
                     callback_audio
                         .rendered_frames
                         .fetch_add(rendered, Ordering::Release);
+                    callback_audio
+                        .drained_frames
+                        .fetch_add((out.len() / fmt.ch()) as u64 - rendered, Ordering::Release);
                 }
             }
         }),
@@ -2139,8 +2250,16 @@ fn play_samples(
     let mut first_pcm_at = None;
     while gen.load(Ordering::Acquire) == my_gen {
         let rendered = audio.rendered_frames.load(Ordering::Acquire);
-        if rendered >= total_frames as u64 {
+        if rendered >= total_frames as u64
+            && audio.drained_frames.load(Ordering::Acquire) >= latency_frames
+        {
             break;
+        }
+        #[cfg(test)]
+        if rendered >= total_frames as u64 {
+            if let Some(observed) = audio.owner_observed_source_end.lock().unwrap().as_ref() {
+                let _ = observed.send(());
+            }
         }
         if rendered > 0 {
             let first = first_pcm_at.get_or_insert_with(std::time::Instant::now);

@@ -47,6 +47,8 @@ class Element {
     if (name.startsWith('data-')) this.dataset[name.slice(5)] = value;
   }
   getAttribute(name) { return this.attributes[name] ?? null; }
+  set value(value) { this._value = String(value ?? ''); }
+  get value() { return this._value; }
   appendChild(child) { child.parentElement = this; this.children.push(child); return child; }
   get options() { return this.children.filter(child => child.tagName === 'OPTION'); }
   get selectedOptions() { return this.options.filter(option => option.value === this.value); }
@@ -192,6 +194,192 @@ async function boot({ running = false, initialLoop, onInvoke } = {}) {
     },
   };
 }
+
+test('全局音量控件说明人声与音效用途并关联可访问说明', async () => {
+  const app = await boot();
+  const mic = app.document.getElementById('inMicGain');
+  const sfx = app.document.getElementById('inSfxGain');
+  assert.match(mic.parentElement.parentElement.textContent, /麦克风音量/);
+  assert.match(sfx.parentElement.parentElement.textContent, /音效总音量/);
+  assert.equal(mic.getAttribute('aria-label'), '麦克风音量');
+  assert.equal(sfx.getAttribute('aria-label'), '音效总音量');
+  const micHelp = app.document.getElementById(mic.getAttribute('aria-describedby').split(' ')[0]);
+  const sfxHelp = app.document.getElementById(sfx.getAttribute('aria-describedby').split(' ')[0]);
+  assert.match(micHelp?.textContent ?? '', /对方.*人声/);
+  assert.match(sfxHelp?.textContent ?? '', /试听、正式播放和监听/);
+  assert.match(sfxHelp?.textContent ?? '', /卡片.*叠加/);
+});
+
+test('保存的总音量零值在首次试听前同步到后端', async () => {
+  const app = await boot({ onInvoke(command) {
+    if (command === 'load_config') return { items, dir: '', mic_gain_db: -3, sfx_gain_db: 0 };
+  } });
+  assert.deepEqual(app.calls.filter(c => c.command === 'set_gains'), [
+    { command: 'set_gains', args: { micDb: -3, sfxDb: 0 } },
+  ]);
+  await app.card(0).querySelector('.prev').emit('click');
+  assert.equal(app.calls.findIndex(c => c.command === 'set_gains') <
+    app.calls.findIndex(c => c.command === 'preview'), true);
+  assert.equal(app.calls.some(c => c.command === 'save_config'), false, 'restoring must not rewrite config');
+});
+
+test('全局音量输入和旧配置限制在有限范围内且保存显示值一致', async () => {
+  const app = await boot({ onInvoke(command) {
+    if (command === 'load_config') return { items, dir: '', mic_gain_db: -120, sfx_gain_db: 760 };
+  } });
+  const mic = app.document.getElementById('inMicGain');
+  const total = app.document.getElementById('inSfxGain');
+  assert.equal(mic.value, '-60');
+  assert.equal(total.value, '36');
+  for (const control of [mic, total]) {
+    assert.equal(control.getAttribute('min'), '-60');
+    assert.equal(control.getAttribute('max'), '36');
+  }
+  assert.deepEqual(app.calls.filter(c => c.command === 'set_gains').at(-1).args,
+    { micDb: -60, sfxDb: 36 });
+  total.value = '760';
+  await total.emit('input');
+  assert.equal(total.value, '36');
+  await app.advanceTimers(120);
+  assert.equal(app.calls.filter(c => c.command === 'save_config').at(-1).args.sfxGainDb, 36);
+  assert.equal(app.calls.some(c => c.command === 'set_gains' && c.args.sfxDb > 36), false);
+});
+
+test('旧配置卡片增益恢复到滑杆范围并统一试听启动与保存', async () => {
+  const app = await boot({ onInvoke(command) {
+    if (command === 'load_config') return { items: items.map((item, index) =>
+      ({ ...item, gain: index ? -120 : 760 })), dir: '' };
+  } });
+  assert.equal(app.card(0).querySelector('.vol').value, '12');
+  assert.equal(app.card(0).querySelector('.volume-value').textContent, '+12 dB');
+  assert.equal(app.card(1).querySelector('.vol').value, '-40');
+  await app.card(0).querySelector('.prev').emit('click');
+  assert.equal(app.calls.filter(c => c.command === 'preview').at(-1).args.gainDb, 12);
+  await app.document.getElementById('btnToggle').emit('click');
+  assert.deepEqual(app.calls.filter(c => c.command === 'start').at(-1).args.cfg.gains, [12, -40]);
+  assert.deepEqual(app.calls.filter(c => c.command === 'save_config').at(-1).args.items.map(item => item.gain), [12, -40]);
+});
+
+test('未启动时调节总音量保存零值并立即控制下一次试听', async () => {
+  const app = await boot();
+  const total = app.document.getElementById('inSfxGain');
+  const mic = app.document.getElementById('inMicGain');
+  total.value = '0';
+  mic.value = '-3';
+  await total.emit('input');
+  await app.advanceTimers(120);
+  assert.deepEqual(app.calls.filter(c => c.command === 'set_gains').at(-1)?.args,
+    { micDb: -3, sfxDb: 0 });
+  assert.equal(app.calls.filter(c => c.command === 'save_config').at(-1)?.args.sfxGainDb, 0);
+  await app.card(1).querySelector('.prev').emit('click');
+  assert.equal(app.calls.filter(c => c.command === 'preview').at(-1).args.gainDb, -6,
+    'the preview command keeps the card gain; the Host applies the shared total gain');
+  assert.equal(app.calls.some(c => ['start', 'play', 'activate'].includes(c.command)), false);
+});
+
+test('输入总音量后立即试听会先提交尚未到期的音量调整', async () => {
+  let totalAtPreview;
+  let nativeTotal;
+  const app = await boot({ onInvoke(command, args) {
+    if (command === 'set_gains') { nativeTotal = args.sfxDb; return true; }
+    if (command === 'preview') { totalAtPreview = nativeTotal; return true; }
+  } });
+  const total = app.document.getElementById('inSfxGain');
+  total.value = '-12';
+  await total.emit('input');
+  await app.card(0).querySelector('.prev').emit('click');
+  assert.equal(totalAtPreview, -12, 'preview must not start with the previous total gain');
+  assert.equal(app.calls.filter(c => c.command === 'save_config').at(-1)?.args.sfxGainDb, -12);
+  await app.advanceTimers(120);
+  assert.equal(app.calls.filter(c => c.command === 'set_gains' && c.args.sfxDb === -12).length, 1,
+    'flushing must cancel the pending timer instead of sending a duplicate update');
+});
+
+test('输入总音量后立即正式播放也使用最新设置并同步监听', async () => {
+  let nativeTotal;
+  let totalAtPlay;
+  const app = await boot({ running: true, onInvoke(command, args) {
+    if (command === 'set_gains') { nativeTotal = args.sfxDb; return true; }
+    if (command === 'play') { totalAtPlay = nativeTotal; return true; }
+  } });
+  const total = app.document.getElementById('inSfxGain');
+  total.value = '-12';
+  await total.emit('input');
+  await app.card(0).emit('click');
+  assert.equal(totalAtPlay, -12, 'formal playback must flush the same total gain as preview');
+  assert.equal(app.calls.filter(c => c.command === 'save_config').at(-1)?.args.sfxGainDb, -12);
+});
+
+for (const action of ['preview', 'play']) {
+  test(`等待总音量请求期间停止不会让迟到的${action}重新出声`, async () => {
+    let finishGain;
+    const app = await boot({ running: true, onInvoke(command, args) {
+      if (command === 'set_gains' && args.sfxDb === -12) {
+        return new Promise(resolve => { finishGain = resolve; });
+      }
+    } });
+    const total = app.document.getElementById('inSfxGain');
+    total.value = '-12';
+    await total.emit('input');
+    const card = app.card(0);
+    const choosing = (action === 'preview' ? card.querySelector('.prev') : card).emit('click');
+    await flush();
+    assert.equal(typeof finishGain, 'function');
+    await app.document.getElementById('btnStopAll').emit('click');
+    finishGain(true);
+    await choosing;
+    assert.equal(app.calls.filter(c => c.command === action).length, 0,
+      'a stopped choice cannot dispatch after gain synchronization finishes');
+    assert.equal(app.calls.filter(c => c.command === 'stop_all').length, 1);
+  });
+}
+
+test('慢音量请求按输入顺序完成并保存最后一次设置', async () => {
+  let finishFirst;
+  const app = await boot({ running: true, onInvoke(command, args) {
+    if (command === 'set_gains' && args.sfxDb === -12) {
+      return new Promise(resolve => { finishFirst = resolve; });
+    }
+  } });
+  const total = app.document.getElementById('inSfxGain');
+  total.value = '-12';
+  await total.emit('input');
+  await app.advanceTimers(120);
+  total.value = '6';
+  await total.emit('input');
+  await app.advanceTimers(120);
+  assert.equal(app.calls.some(c => c.command === 'set_gains' && c.args.sfxDb === 6), false);
+  finishFirst(true);
+  await flush();
+  assert.deepEqual(app.calls.filter(c => c.command === 'set_gains').map(c => c.args.sfxDb), [-6, -12, 6]);
+  assert.deepEqual(app.calls.filter(c => c.command === 'save_config').map(c => c.args.sfxGainDb), [-12, 6]);
+  assert.equal(total.value, '6');
+});
+
+test('启动期间修改总音量后最终会话使用界面的最新音量', async () => {
+  let finishStart;
+  let nativeTotal = -6;
+  let running = false;
+  const app = await boot({ onInvoke(command, args) {
+    if (command === 'set_gains') { nativeTotal = args.sfxDb; return true; }
+    if (command === 'status') return playbackStatus({ running, passthrough: running });
+    if (command === 'start') return new Promise(resolve => {
+      finishStart = () => { nativeTotal = args.cfg.sfx_gain_db; running = true; resolve(true); };
+    });
+  } });
+  const starting = app.document.getElementById('btnToggle').emit('click');
+  await flush();
+  assert.equal(typeof finishStart, 'function');
+  const total = app.document.getElementById('inSfxGain');
+  total.value = '4';
+  await total.emit('input');
+  await app.advanceTimers(120);
+  finishStart();
+  await starting;
+  assert.equal(nativeTotal, 4, 'the completed start must not restore its older gain snapshot');
+  assert.equal(app.calls.filter(c => c.command === 'save_config').at(-1).args.sfxGainDb, 4);
+  assert.equal(app.calls.filter(c => c.command === 'start').length, 1, 'gain edits do not restart streams');
+});
 
 test('About explains playback, preview and arbitrary audio folders with the packaged name and version', async () => {
   const app = await boot({ onInvoke(command) {

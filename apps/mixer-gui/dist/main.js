@@ -92,7 +92,7 @@ const makeItem = (file, name, gain, tags, id) => ({
   id: id || (globalThis.crypto?.randomUUID?.() ?? `sound-${Date.now()}-${Math.random().toString(16).slice(2)}`),
   file,
   name: (name || '').trim() || basename(file),
-  gain: Number.isFinite(+gain) ? +gain : 0,
+  gain: Number.isFinite(+gain) ? Math.max(VOL_MIN, Math.min(VOL_MAX, +gain)) : 0,
   tags: MixerLibrary.tags(tags),
 });
 const itemTags = (it) => MixerLibrary.tags(it?.tags);
@@ -131,8 +131,8 @@ async function loadSavedConfig() {
       state.items = c.items.map(o => makeItem(o.file, o.name, o.gain, o.tags, o.id));
     }
     if (c.buffer_ms) el.inBuf.value = c.buffer_ms;
-    if (c.mic_gain_db !== null) el.inMicGain.value = c.mic_gain_db;
-    if (c.sfx_gain_db !== null) el.inSfxGain.value = c.sfx_gain_db;
+    if (Number.isFinite(c.mic_gain_db)) el.inMicGain.value = boundedGain(c.mic_gain_db);
+    if (Number.isFinite(c.sfx_gain_db)) el.inSfxGain.value = boundedGain(c.sfx_gain_db);
     if (typeof c.hotkeys === 'string') el.inKeys.value = c.hotkeys;
     if (typeof c.monitor === 'boolean') el.inMonitor.checked = c.monitor;
     if (typeof c.looping === 'boolean') el.inLoop.checked = c.looping;
@@ -161,6 +161,7 @@ async function loadSavedConfig() {
 let configSaveTail = Promise.resolve();
 async function saveCurrentConfig(before) {
   try {
+    const gains = currentGains();
     const snapshot = {
       items: state.items.map(it => ({
         id: it.id, file: it.file, name: it.name, gain: it.gain, tags: it.tags,
@@ -172,8 +173,8 @@ async function saveCurrentConfig(before) {
       inputDevice: el.selIn.value || null,
       outputDevice: el.selOut.value || null,
       bufferMs: parseInt(el.inBuf.value || '20', 10),
-      micGainDb: parseFloat(el.inMicGain.value || '0'),
-      sfxGainDb: parseFloat(el.inSfxGain.value || '-6'),
+      micGainDb: gains.micDb,
+      sfxGainDb: gains.sfxDb,
       hotkeys: el.inKeys.value.trim(),
     };
     // Preserve completion order when consecutive slider gestures save snapshots.
@@ -275,7 +276,9 @@ async function start() {
   try {
     // Finish changes sent to the previous session before opening a new one.
     await loopUpdateTail.catch(() => {});
+    await flushGainUpdates();
     if (choice !== audioChoice) return;
+    const startingGains = currentGains();
     const cfg = {
         input_device: el.selIn.value || null,
         output_device: el.selOut.value || null,
@@ -286,8 +289,8 @@ async function start() {
         names: state.items.map(it => it.name),
         hotkeys: hotkeyList(),
         buffer_ms: parseInt(el.inBuf.value || '20', 10),
-        mic_gain_db: parseFloat(el.inMicGain.value || '0'),
-        sfx_gain_db: parseFloat(el.inSfxGain.value || '-6'),
+        mic_gain_db: startingGains.micDb,
+        sfx_gain_db: startingGains.sfxDb,
         looping: el.inLoop.checked,
         monitor: el.inMonitor.checked,
         // ⚠️ StartConfig 走 serde 反序列化，字段名必须**蛇形**。
@@ -304,6 +307,11 @@ async function start() {
     // an idle preference; reconcile it with the newly opened session now.
     if (cfg.looping !== !!el.inLoop.checked) {
       await queueLoopUpdate(!!el.inLoop.checked);
+      if (choice !== audioChoice) return;
+    }
+    const gains = currentGains();
+    if (cfg.mic_gain_db !== gains.micDb || cfg.sfx_gain_db !== gains.sfxDb) {
+      await flushGainUpdates(true);
       if (choice !== audioChoice) return;
     }
     await poll(choice);
@@ -327,7 +335,7 @@ async function start() {
     await poll(choice);
     if (choice !== audioChoice) return;
     render();
-    hint((opened ? '循环设置更新失败，请重新切换循环开关：' : '启动失败：') + e, 'error');
+    hint((opened ? '音量或循环设置同步失败，请重新调整对应设置：' : '启动失败：') + e, 'error');
   } finally {
     if (choice === audioChoice) {
       el.btnToggle.disabled = false;
@@ -376,14 +384,41 @@ function setSetupOpen(open) {
 }
 
 let gainTimer = null;
+let gainUpdateTail = Promise.resolve();
+function currentGains() {
+  return {
+    micDb: boundedGain(parseFloat(el.inMicGain.value || '0')),
+    sfxDb: boundedGain(parseFloat(el.inSfxGain.value || '-6')),
+  };
+}
+function boundedGain(db) { return Math.max(-60, Math.min(36, db)); }
+function queueGainUpdate(gains = currentGains()) {
+  gainUpdateTail = gainUpdateTail.catch(() => {}).then(() => invoke('set_gains', gains));
+  return gainUpdateTail;
+}
+function flushGainUpdates(force = false) {
+  const pending = gainTimer !== null;
+  if (pending || force) {
+    clearTimeout(gainTimer);
+    gainTimer = null;
+    const update = queueGainUpdate();
+    if (pending) saveCurrentConfig(update);
+  }
+  return gainUpdateTail;
+}
 function pushGains() {
-  if (!state.running) return;
+  // Number inputs allow typed values beyond min/max. Keep the display, IPC and
+  // saved setting equal without rewriting an unfinished empty edit.
+  for (const input of [el.inMicGain, el.inSfxGain]) {
+    const value = parseFloat(input.value);
+    if (Number.isFinite(value)) input.value = boundedGain(value);
+  }
   clearTimeout(gainTimer);
   gainTimer = setTimeout(() => {
-    invoke('set_gains', {
-      micDb: parseFloat(el.inMicGain.value || '0'),
-      sfxDb: parseFloat(el.inSfxGain.value || '-6'),
-    }).then(() => toast('增益已更新')).catch(() => {});
+    gainTimer = null;
+    const update = queueGainUpdate();
+    saveCurrentConfig(update);
+    update.then(() => toast('音量已更新')).catch(e => toast('音量更新失败：' + e, true));
   }, 120);
 }
 
@@ -459,6 +494,8 @@ async function play(slot) {
   if (!MixerLibrary.canPlay(state)) { toast("先开启音效再播放", true); return; }
   const choice = newAudioChoice();
   try {
+    await flushGainUpdates();
+    if (choice !== audioChoice) return;
     const replacing = !!MixerLibrary.currentPlayback(state);
     const ok = await invokeAudio('play', { slot }, choice);
     if (choice !== audioChoice) return;
@@ -634,6 +671,8 @@ function render() {
       try {
         const replacing = !!MixerLibrary.currentPlayback(state);
         toast('加载试听…');
+        await flushGainUpdates();
+        if (choice !== audioChoice) return;
         if (!await confirmedAudio(await invokeAudio('preview', {
           file, gainDb: it?.gain ?? 0, soundId: it?.id ?? s.id,
         }, choice), choice)) return;
@@ -918,7 +957,7 @@ async function poll(choice = audioChoice) {
     } else {
       el.metrics.textContent = st.last_error
       ? '上次错误：' + st.last_error
-      : '关闭窗口不会退出，引擎继续运行 · 菜单栏图标可重新打开';
+      : '关闭窗口不会退出 · 从 Dock（macOS）或托盘图标重新打开';
       if (st.last_error) hint('启动失败：' + st.last_error, 'error');
     }
 
@@ -1457,6 +1496,7 @@ document.addEventListener('keydown', e => {
   const saved = await loadSavedConfig();
   await loadDevices();          // 会重建下拉，所以要在恢复配置之后
   if (saved) await loadSavedConfig();
+  await queueGainUpdate().catch(e => toast('音量设置同步失败：' + e, true));
   setSetupOpen(true);
   syncToggle();
   render();

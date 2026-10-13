@@ -10,8 +10,9 @@ struct FakeBackend {
     outputs: Arc<Mutex<Vec<RenderCallback>>>,
     opened: Arc<Mutex<Option<mpsc::Sender<()>>>>,
     close_barrier: Arc<Mutex<Option<CloseBarrier>>>,
+    closed: Arc<Mutex<Option<mpsc::Sender<()>>>>,
 }
-struct FakeStream(StreamFormat, Option<CloseBarrier>);
+struct FakeStream(StreamFormat, Option<CloseBarrier>, Option<mpsc::Sender<()>>);
 impl Drop for FakeStream {
     fn drop(&mut self) {
         if let Some((entered, release)) = &self.1 {
@@ -21,6 +22,9 @@ impl Drop for FakeStream {
                 .unwrap()
                 .recv_timeout(Duration::from_secs(5))
                 .unwrap();
+        }
+        if let Some(closed) = &self.2 {
+            let _ = closed.send(());
         }
     }
 }
@@ -57,7 +61,7 @@ impl AudioBackend for FakeBackend {
         format: Option<StreamFormat>,
         _: CaptureCallback,
     ) -> Result<Box<dyn AudioStream>> {
-        Ok(Box::new(FakeStream(format.unwrap(), None)))
+        Ok(Box::new(FakeStream(format.unwrap(), None, None)))
     }
     fn open_output(
         &self,
@@ -72,6 +76,7 @@ impl AudioBackend for FakeBackend {
         Ok(Box::new(FakeStream(
             format.unwrap(),
             self.close_barrier.lock().unwrap().clone(),
+            self.closed.lock().unwrap().clone(),
         )))
     }
 }
@@ -95,6 +100,13 @@ fn config() -> StartConfig {
         remote_port: Some(8765),
     }
 }
+// 既有 PCM 场景使用单位增益，产品默认增益在专门的回归中验证。
+fn preview_test_host() -> AudioHost {
+    let host = AudioHost::new();
+    host.set_gains(0.0, 0.0);
+    host
+}
+
 fn fixture() -> (AudioHost, FakeBackend) {
     let cfg = config();
     let backend = FakeBackend::default();
@@ -126,7 +138,7 @@ fn fixture() -> (AudioHost, FakeBackend) {
     )
     .unwrap();
     let playback = session.playback.clone();
-    let host = AudioHost::default();
+    let host = preview_test_host();
     host.next_generation.store(1, Ordering::Relaxed);
     host.audio_requests.register_session(1);
     let shared = Arc::new(remote::Shared::default());
@@ -328,7 +340,7 @@ fn looping_updates_current_primary_and_monitor_then_stops_at_the_current_pass_en
 
 #[test]
 fn standby_looping_edit_applies_to_next_remote_trigger_and_idle_edit_is_safe() {
-    assert!(!AudioHost::default().set_looping(true));
+    assert!(!preview_test_host().set_looping(true));
     let (host, backend) = fixture();
     host.stop();
     assert!(host.set_looping(true));
@@ -389,7 +401,7 @@ fn only_primary_session_errors_drive_main_device_recovery() {
 
 #[test]
 fn suspension_holds_lifecycle_lock_until_test_finishes() {
-    let host = Arc::new(AudioHost::default());
+    let host = Arc::new(preview_test_host());
     let (entered_tx, entered_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let testing = host.clone();
@@ -570,7 +582,7 @@ fn hotplug_matches_native_identity_even_for_same_named_endpoints() {
 #[test]
 fn cancelling_during_preview_decode_cannot_open_a_late_stream() {
     for cancel in ["stop", "stop-all", "standby", "release", "selftest", "quit"] {
-        let host = Arc::new(AudioHost::default());
+        let host = Arc::new(preview_test_host());
         let (preparing_tx, preparing_rx) = mpsc::channel();
         let (finish_tx, finish_rx) = mpsc::channel();
         let played = Arc::new(AtomicUsize::new(0));
@@ -616,7 +628,7 @@ fn cancelling_during_preview_decode_cannot_open_a_late_stream() {
 
 #[test]
 fn selftest_waits_for_preview_close_and_detaches_retained_callback_pcm() {
-    let host = AudioHost::default();
+    let host = preview_test_host();
     let backend = FakeBackend::default();
     let (opened_tx, opened_rx) = mpsc::channel();
     *backend.opened.lock().unwrap() = Some(opened_tx);
@@ -688,14 +700,14 @@ fn drain_primary(backend: &FakeBackend) {
 
 #[test]
 fn stop_all_silences_preview_without_a_main_session_and_releases_pcm() {
-    let host = AudioHost::default();
+    let host = preview_test_host();
     let backend = FakeBackend::default();
     let samples = Arc::new(vec![0.2; 88_200]);
     let weak = Arc::downgrade(&samples);
     launch_fake_preview(&host, &backend, samples);
-    let mut output = [0.0; 24];
+    let mut output = [0.0; 600];
     backend.outputs.lock().unwrap()[0](&mut output);
-    assert_eq!(output[0], 0.2);
+    assert_eq!(output[594], 0.2);
     host.stop_all().unwrap();
     backend.outputs.lock().unwrap()[0](&mut output);
     assert!(
@@ -715,20 +727,20 @@ fn live_gain_changes_preview_pcm_without_restarting_the_cursor() {
     let preview_backend = FakeBackend::default();
     let samples = Arc::new(
         (0..44_100)
-            .flat_map(|frame| [(frame + 1) as f32 * 0.001; 2])
+            .flat_map(|frame| [if frame < 100 { 0.2 } else { 0.4 }; 2])
             .collect(),
     );
     launch_fake_preview(&host, &preview_backend, samples);
     drain_primary(&main_backend);
-    let mut output = [0.0; 24];
+    let mut output = [0.0; 600];
     preview_backend.outputs.lock().unwrap()[0](&mut output);
-    assert!((output[0] - 0.001).abs() < 1e-6);
+    assert!((output[594] - 0.2).abs() < 1e-6);
     assert!(host.set_slot_gain(0, -20.0).unwrap());
     preview_backend.outputs.lock().unwrap()[0](&mut output);
     assert!(
-        (output[0] - 0.0005).abs() < 1e-6,
+        (output[594] - 0.04).abs() < 1e-6,
         "dragging gain must update the next preview PCM frame without rewinding, got {}",
-        output[0]
+        output[594]
     );
     assert_eq!(
         preview_backend.outputs.lock().unwrap().len(),
@@ -750,22 +762,22 @@ fn live_gain_changes_preview_pcm_without_restarting_the_cursor() {
 
 #[test]
 fn preview_gain_works_without_main_session_and_cannot_change_another_sound() {
-    let host = AudioHost::default();
+    let host = preview_test_host();
     let backend = FakeBackend::default();
     launch_fake_preview(&host, &backend, Arc::new(vec![0.2; 88_200]));
     assert!(!host.set_sound_gain("another-sound-id", -20.0).unwrap());
-    let mut output = [0.0; 24];
+    let mut output = [0.0; 600];
     backend.outputs.lock().unwrap()[0](&mut output);
-    assert_eq!(output[0], 0.2, "another card must not alter this preview");
+    assert_eq!(output[594], 0.2, "another card must not alter this preview");
     assert!(host.set_sound_gain("good-id", -20.0).unwrap());
     backend.outputs.lock().unwrap()[0](&mut output);
-    assert!((output[0] - 0.02).abs() < 1e-6);
+    assert!((output[594] - 0.02).abs() < 1e-6);
     for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX] {
         assert!(host.set_sound_gain("good-id", invalid).is_err());
     }
     backend.outputs.lock().unwrap()[0](&mut output);
     assert!(
-        (output[0] - 0.02).abs() < 1e-6,
+        (output[594] - 0.02).abs() < 1e-6,
         "invalid gains must preserve the valid PCM gain"
     );
     host.stop_all().unwrap();
@@ -774,7 +786,7 @@ fn preview_gain_works_without_main_session_and_cannot_change_another_sound() {
 
 #[test]
 fn gain_adjusted_during_decode_is_applied_to_the_first_preview_frame() {
-    let host = Arc::new(AudioHost::default());
+    let host = Arc::new(preview_test_host());
     let backend = FakeBackend::default();
     let (prepared_tx, prepared_rx) = mpsc::channel();
     let (continue_tx, continue_rx) = mpsc::channel();
@@ -809,9 +821,9 @@ fn gain_adjusted_during_decode_is_applied_to_the_first_preview_frame() {
     continue_tx.send(()).unwrap();
     thread.join().unwrap().unwrap();
     opened_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-    let mut output = [0.0; 24];
+    let mut output = [0.0; 600];
     backend.outputs.lock().unwrap()[0](&mut output);
-    assert!((output[0] - 0.02).abs() < 1e-6);
+    assert!((output[594] - 0.02).abs() < 1e-6);
     host.stop_all().unwrap();
 }
 
@@ -832,9 +844,9 @@ fn standby_stops_preview_primary_and_monitor_but_keeps_passthrough_session() {
     assert!(!host.status().running);
     assert!(host.status().passthrough);
     assert!(weak.upgrade().is_none());
-    let mut output = [1.0; 24];
+    let mut output = [1.0; 600];
     preview_backend.outputs.lock().unwrap()[0](&mut output);
-    assert_eq!(output, [0.0; 24]);
+    assert_eq!(output, [0.0; 600]);
     for callback in main_backend.outputs.lock().unwrap().iter_mut() {
         let mut output = vec![0.0; 4_096];
         callback(&mut output);
@@ -860,16 +872,16 @@ fn stale_remote_stop_cannot_cancel_new_session_preview() {
     launch_fake_preview(&host, &backend, Arc::new(vec![0.2; 88_200]));
     drain_primary(&main_backend);
     stale_stop();
-    let mut output = [0.0; 24];
+    let mut output = [0.0; 600];
     backend.outputs.lock().unwrap()[0](&mut output);
     assert_eq!(
-        output[0], 0.2,
+        output[594], 0.2,
         "old remote handler must not silence a new session's preview"
     );
     host.remote_stop_handler(playback, 2)();
     backend.outputs.lock().unwrap()[0](&mut output);
     assert_eq!(
-        output, [0.0; 24],
+        output, [0.0; 600],
         "current remote stop cancels preview PCM immediately"
     );
     host.stop_all().unwrap();
@@ -881,13 +893,13 @@ fn primary_play_interrupts_an_independent_preview_pcm() {
     let backend = FakeBackend::default();
     launch_fake_preview(&host, &backend, Arc::new(vec![0.3; 88_200]));
     drain_primary(&main_backend);
-    let mut output = [0.0; 24];
+    let mut output = [0.0; 600];
     backend.outputs.lock().unwrap()[0](&mut output);
-    assert_eq!(output[0], 0.3);
+    assert_eq!(output[594], 0.3);
     assert!(host.play(0).unwrap());
     backend.outputs.lock().unwrap()[0](&mut output);
     assert_eq!(
-        output, [0.0; 24],
+        output, [0.0; 600],
         "a new main trigger must stop local preview too"
     );
     host.stop_all().unwrap();
@@ -904,10 +916,10 @@ fn independent_preview_interrupts_primary_and_monitor_pcm() {
     }
     let preview = FakeBackend::default();
     launch_fake_preview(&host, &preview, Arc::new(vec![0.3; 88_200]));
-    let mut preview_pcm = [1.0; 24];
+    let mut preview_pcm = [1.0; 600];
     preview.outputs.lock().unwrap()[0](&mut preview_pcm);
     assert_eq!(
-        preview_pcm, [0.0; 24],
+        preview_pcm, [0.0; 600],
         "preview waits for preceding PCM to retire"
     );
     assert_eq!(host.status().preview_playhead_secs, 0.0);
@@ -921,9 +933,9 @@ fn independent_preview_interrupts_primary_and_monitor_pcm() {
         );
         preview.outputs.lock().unwrap()[0](&mut preview_pcm);
         if index == 0 {
-            assert_eq!(preview_pcm, [0.0; 24], "monitor must confirm stop too");
+            assert_eq!(preview_pcm, [0.0; 600], "monitor must confirm stop too");
         } else {
-            assert_eq!(preview_pcm[0], 0.3);
+            assert_eq!(preview_pcm[594], 0.3);
         }
     }
     drop(callbacks);
@@ -937,7 +949,7 @@ fn every_main_trigger_cancels_preview_but_invalid_and_stale_triggers_preserve_it
         let backend = FakeBackend::default();
         launch_fake_preview(&host, &backend, Arc::new(vec![0.3; 88_200]));
         drain_primary(&main_backend);
-        let mut pcm = [0.0; 24];
+        let mut pcm = [0.0; 600];
         let playback = host
             .running
             .lock()
@@ -949,7 +961,7 @@ fn every_main_trigger_cancels_preview_but_invalid_and_stale_triggers_preserve_it
         assert!(!host.play(1).unwrap());
         assert!(!host.play_handler(playback.clone(), 0)(0));
         backend.outputs.lock().unwrap()[0](&mut pcm);
-        assert_eq!(pcm[0], 0.3, "invalid requests must preserve preview");
+        assert_eq!(pcm[594], 0.3, "invalid requests must preserve preview");
         let accepted = match trigger {
             "card" => host.play(0).unwrap(),
             "hotkey" => host.play_handler(playback, 1)(0),
@@ -958,7 +970,7 @@ fn every_main_trigger_cancels_preview_but_invalid_and_stale_triggers_preserve_it
         };
         assert!(accepted, "{trigger}");
         backend.outputs.lock().unwrap()[0](&mut pcm);
-        assert_eq!(pcm, [0.0; 24], "{trigger} must cancel preview");
+        assert_eq!(pcm, [0.0; 600], "{trigger} must cancel preview");
         assert!(host.status().preview_sound_id.is_none());
         host.stop_all().unwrap();
     }
@@ -966,7 +978,7 @@ fn every_main_trigger_cancels_preview_but_invalid_and_stale_triggers_preserve_it
 
 #[test]
 fn preview_status_tracks_consumed_pcm_and_replacement_without_a_main_session() {
-    let host = AudioHost::default();
+    let host = preview_test_host();
     let backend = FakeBackend::default();
     launch_fake_preview(&host, &backend, Arc::new(vec![0.2; 88_200]));
     let status = host.status();
@@ -978,14 +990,14 @@ fn preview_status_tracks_consumed_pcm_and_replacement_without_a_main_session() {
     assert!(status.preview_playing);
     assert!((status.preview_playhead_secs - 0.1).abs() < 1e-6);
     launch_fake_preview(&host, &backend, Arc::new(vec![0.4; 88_200]));
-    let mut pcm = [1.0; 24];
+    let mut pcm = [1.0; 600];
     backend.outputs.lock().unwrap()[0](&mut pcm);
     assert_eq!(
-        pcm, [0.0; 24],
+        pcm, [0.0; 600],
         "replacement silences the old preview callback"
     );
     backend.outputs.lock().unwrap()[1](&mut pcm);
-    assert_eq!(pcm[0], 0.4);
+    assert_eq!(pcm[594], 0.4);
     backend.outputs.lock().unwrap()[1](&mut vec![0.0; 264_600]);
     assert!(
         !host.status().preview_playing,
@@ -1004,7 +1016,7 @@ fn looping_preference_does_not_make_preview_repeat() {
     drain_primary(&primary);
     let mut pcm = [0.0; 2_646];
     backend.outputs.lock().unwrap()[0](&mut pcm);
-    assert_eq!(pcm[0], 0.3);
+    assert_eq!(pcm[594], 0.3);
     assert!(host.set_looping(false));
     assert!(host.set_looping(true));
     let mut tail = vec![0.0; 52_920];
@@ -1022,15 +1034,15 @@ fn delayed_stop_ack_does_not_advance_or_expire_preview_audio() {
     let (host, primary) = fixture();
     let backend = FakeBackend::default();
     launch_fake_preview(&host, &backend, Arc::new(vec![0.3; 8_820]));
-    let mut pcm = [1.0; 24];
+    let mut pcm = [1.0; 600];
     backend.outputs.lock().unwrap()[0](&mut pcm);
-    assert_eq!(pcm, [0.0; 24]);
+    assert_eq!(pcm, [0.0; 600]);
     std::thread::sleep(Duration::from_millis(250));
     assert_eq!(host.status().preview_playhead_secs, 0.0);
     drain_primary(&primary);
     backend.outputs.lock().unwrap()[0](&mut pcm);
     assert_eq!(
-        pcm[0], 0.3,
+        pcm[594], 0.3,
         "waiting longer than sample duration must not truncate PCM"
     );
     backend.outputs.lock().unwrap()[0](&mut vec![0.0; 26_436]);
@@ -1094,14 +1106,17 @@ fn rejected_main_play_preserves_the_current_preview() {
     }
     assert!(filled, "exercise a genuinely full producer queue");
     assert!(!host.play(0).unwrap());
-    let mut pcm = [0.0; 24];
+    let mut pcm = [0.0; 600];
     backend.outputs.lock().unwrap()[0](&mut pcm);
-    assert_eq!(pcm[0], 0.3, "rejected B must not cancel a valid preview A");
+    assert_eq!(
+        pcm[594], 0.3,
+        "rejected B must not cancel a valid preview A"
+    );
     assert!(host.status().preview_playing);
     drain_primary(&primary);
     assert!(host.play(0).unwrap());
     backend.outputs.lock().unwrap()[0](&mut pcm);
-    assert_eq!(pcm, [0.0; 24]);
+    assert_eq!(pcm, [0.0; 600]);
     host.stop_all().unwrap();
 }
 
@@ -1115,9 +1130,9 @@ fn main_pcm_waits_until_the_previous_preview_stream_has_closed() {
     *backend.close_barrier.lock().unwrap() = Some((close_tx, Arc::new(Mutex::new(release_rx))));
     launch_fake_preview(&host, &backend, Arc::new(vec![0.3; 88_200]));
     drain_primary(&primary);
-    let mut preview_pcm = [0.0; 24];
+    let mut preview_pcm = [0.0; 600];
     backend.outputs.lock().unwrap()[0](&mut preview_pcm);
-    assert_eq!(preview_pcm[0], 0.3);
+    assert_eq!(preview_pcm[594], 0.3);
     let switching = host.clone();
     let worker = std::thread::spawn(move || switching.play(0));
     close_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -1140,7 +1155,7 @@ fn main_pcm_waits_until_the_previous_preview_stream_has_closed() {
     }
     backend.outputs.lock().unwrap()[0](&mut preview_pcm);
     assert_eq!(
-        preview_pcm, [0.0; 24],
+        preview_pcm, [0.0; 600],
         "retained old preview callback is detached"
     );
     host.stop_all().unwrap();
@@ -1157,7 +1172,7 @@ fn a_lifecycle_caller_closing_preview_cannot_be_bypassed_by_main_play() {
         *backend.close_barrier.lock().unwrap() = Some((close_tx, Arc::new(Mutex::new(release_rx))));
         launch_fake_preview(&host, &backend, Arc::new(vec![0.3; 88_200]));
         drain_primary(&primary);
-        backend.outputs.lock().unwrap()[0](&mut [0.0; 24]);
+        backend.outputs.lock().unwrap()[0](&mut [0.0; 600]);
         let closing = host.clone();
         let closer = std::thread::spawn(move || {
             if action == "stop" {
@@ -1279,7 +1294,7 @@ fn combo_stop_supersedes_an_older_preview_request_waiting_for_dispatch() {
     drain_primary(&primary);
     let mut leaked = false;
     for callback in backend.outputs.lock().unwrap().iter_mut() {
-        let mut pcm = [0.0; 24];
+        let mut pcm = [0.0; 600];
         callback(&mut pcm);
         leaked |= pcm.iter().any(|&sample| sample.abs() > 0.05);
     }
@@ -1361,9 +1376,9 @@ fn combo_newer_card_hotkey_phone_preview_or_shutdown_retires_queued_audio() {
                     "{action}, loop={looping}: late work must preserve the newer main / monitor PCM");
             }
             if action == "preview" {
-                let mut pcm = [0.0; 24];
+                let mut pcm = [0.0; 600];
                 preview.outputs.lock().unwrap()[0](&mut pcm);
-                assert_eq!(pcm[0], 0.3, "new preview survives late old requests");
+                assert_eq!(pcm[594], 0.3, "new preview survives late old requests");
                 assert_eq!(host.status().preview_sound_id.as_deref(), Some("good-id"));
             }
             host.stop_all().unwrap();
@@ -1383,9 +1398,9 @@ fn combo_stop_reserved_during_preview_close_prevents_late_main_pcm() {
     let weak = Arc::downgrade(&samples);
     launch_fake_preview(&host, &preview, samples);
     drain_primary(&main);
-    let mut preview_pcm = [0.0; 24];
+    let mut preview_pcm = [0.0; 600];
     preview.outputs.lock().unwrap()[0](&mut preview_pcm);
-    assert_eq!(preview_pcm[0], 0.3);
+    assert_eq!(preview_pcm[594], 0.3);
     let old = host.reserve_audio_request();
     let switching = host.clone();
     let worker = std::thread::spawn(move || switching.play_requested(0, old));
@@ -1404,7 +1419,7 @@ fn combo_stop_reserved_during_preview_close_prevents_late_main_pcm() {
         );
     }
     preview.outputs.lock().unwrap()[0](&mut preview_pcm);
-    assert_eq!(preview_pcm, [0.0; 24]);
+    assert_eq!(preview_pcm, [0.0; 600]);
     assert!(
         weak.upgrade().is_none(),
         "closing preview relinquishes PCM before returning"
@@ -1455,14 +1470,14 @@ fn combo_standby_preview_loop_edit_and_reactivation_keep_one_audible_owner() {
     drain_primary(&main);
     assert!(!host.play(0).unwrap());
     assert!(!host.remote.lock().unwrap().as_ref().unwrap().play(0));
-    let mut pcm = [0.0; 24];
+    let mut pcm = [0.0; 600];
     preview.outputs.lock().unwrap()[0](&mut pcm);
-    assert_eq!(pcm[0], 0.3, "rejected standby requests preserve preview");
+    assert_eq!(pcm[594], 0.3, "rejected standby requests preserve preview");
     assert!(host.set_looping(false));
     host.activate(None).unwrap();
     assert!(host.remote.lock().unwrap().as_ref().unwrap().play(0));
     preview.outputs.lock().unwrap()[0](&mut pcm);
-    assert_eq!(pcm, [0.0; 24]);
+    assert_eq!(pcm, [0.0; 600]);
     assert!(
         weak.upgrade().is_none(),
         "main resumes only after preview gives up PCM"
@@ -1554,9 +1569,9 @@ fn combo_rejected_main_request_preserves_a_preview_still_decoding() {
         drain_primary(&main);
         let mut audible = false;
         for callback in preview.outputs.lock().unwrap().iter_mut() {
-            let mut pcm = [0.0; 24];
+            let mut pcm = [0.0; 600];
             callback(&mut pcm);
-            audible |= pcm[0] == 0.3;
+            audible |= pcm[594] == 0.3;
         }
         host.stop_all().unwrap();
         assert!(
@@ -1803,9 +1818,347 @@ fn combo_retired_hotkey_and_phone_callbacks_do_not_cancel_new_session_decode() {
     worker.join().unwrap().unwrap();
     opened_rx.recv_timeout(Duration::from_secs(2)).unwrap();
     drain_primary(&main);
-    let mut pcm = [0.0; 24];
+    let mut pcm = [0.0; 600];
     preview.outputs.lock().unwrap()[0](&mut pcm);
-    assert_eq!(pcm[0], 0.3);
+    assert_eq!(pcm[594], 0.3);
     assert_eq!(host.status().preview_sound_id.as_deref(), Some("new-id"));
     host.stop_all().unwrap();
+}
+
+#[test]
+fn 未启动试听采用默认音效总音量并实时叠加卡片增益() {
+    let host = AudioHost::new();
+    let backend = FakeBackend::default();
+    launch_fake_preview(&host, &backend, Arc::new(vec![0.2; 88_200]));
+    let mut pcm = vec![0.0; 6 * 500];
+    backend.outputs.lock().unwrap()[0](&mut pcm);
+    let tail = pcm.len() - 6;
+    assert!((pcm[tail] - 0.2 * 10.0f32.powf(-6.0 / 20.0)).abs() < 1e-6);
+    let before = host.status().preview_playhead_secs;
+    host.set_gains(-20.0, -12.0);
+    assert!(host.set_sound_gain("good-id", -8.0).unwrap());
+    backend.outputs.lock().unwrap()[0](&mut pcm);
+    assert!((pcm[tail] - 0.02).abs() < 1e-6);
+    assert!(host.status().preview_playhead_secs > before);
+    assert_eq!(backend.outputs.lock().unwrap().len(), 1);
+    host.set_gains(12.0, -12.0);
+    backend.outputs.lock().unwrap()[0](&mut pcm);
+    assert!((pcm[tail] - 0.02).abs() < 1e-6, "麦克风音量不影响试听");
+    host.stop_all().unwrap();
+    host.set_gains(0.0, 6.0);
+    backend.outputs.lock().unwrap()[0](&mut pcm);
+    assert!(pcm.iter().all(|sample| *sample == 0.0));
+    launch_fake_preview(&host, &backend, Arc::new(vec![0.2; 88_200]));
+    backend.outputs.lock().unwrap()[1](&mut pcm);
+    assert!((pcm[tail] - 0.2 * 10.0f32.powf(6.0 / 20.0)).abs() < 1e-6);
+    host.stop_all().unwrap();
+}
+
+#[test]
+fn 总音量和卡片音量对试听正式播放及监听产生相同样本增益() {
+    let (host, primary) = fixture();
+    let preview = FakeBackend::default();
+    host.set_gains(-60.0, -12.0);
+    assert!(host.set_sound_gain("good-id", -8.0).unwrap());
+    launch_fake_preview(&host, &preview, Arc::new(vec![0.2; 88_200]));
+    // 当前试听入口参数来自卡片，测试传入相同的卡片值。
+    assert!(host.set_sound_gain("good-id", -8.0).unwrap());
+    drain_primary(&primary);
+    let mut pcm = vec![0.0; 6 * 1_000];
+    preview.outputs.lock().unwrap()[0](&mut pcm);
+    assert!((pcm[pcm.len() - 6] - 0.02).abs() < 1e-6);
+    assert!(host.play(0).unwrap());
+    for callback in primary.outputs.lock().unwrap().iter_mut() {
+        let mut output = vec![0.0; 8_820];
+        callback(&mut output);
+        assert!(output[output.len() - 1_000..]
+            .iter()
+            .all(|s| (*s - 0.02).abs() < 1e-6));
+    }
+    preview.outputs.lock().unwrap()[0](&mut pcm);
+    assert!(pcm.iter().all(|sample| *sample == 0.0));
+}
+
+#[test]
+fn 解码期间调整音效总音量作用于试听首次出声且不被麦克风增益替代() {
+    let host = Arc::new(preview_test_host());
+    let backend = FakeBackend::default();
+    let (prepared_tx, prepared_rx) = mpsc::channel();
+    let (continue_tx, continue_rx) = mpsc::channel();
+    let (opened_tx, opened_rx) = mpsc::channel();
+    *backend.opened.lock().unwrap() = Some(opened_tx);
+    let preparing = host.clone();
+    let playing = backend.clone();
+    let worker = std::thread::spawn(move || {
+        preparing.launch_preview(
+            "decode-total-gain".into(),
+            -8.0,
+            || {
+                prepared_tx.send(()).unwrap();
+                continue_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                Ok(Arc::new(vec![0.2; 88_200]))
+            },
+            move |samples, token, generation, audio| {
+                play_samples(
+                    playing,
+                    samples,
+                    DeviceId::new("fake preview"),
+                    StreamFormat::stereo(44_100),
+                    audio,
+                    token,
+                    generation,
+                )
+            },
+        )
+    });
+    prepared_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    host.set_gains(24.0, -12.0);
+    continue_tx.send(()).unwrap();
+    worker.join().unwrap().unwrap();
+    opened_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let mut pcm = vec![0.0; 2 * 500];
+    backend.outputs.lock().unwrap()[0](&mut pcm);
+    assert!((pcm[pcm.len() - 2] - 0.02).abs() < 1e-6);
+    host.stop_all().unwrap();
+}
+
+#[test]
+fn 提高试听总音量使用与正式播放相同的限幅并排空短音频尾部() {
+    let host = preview_test_host();
+    host.set_gains(0.0, 20.0);
+    let backend = FakeBackend::default();
+    let (closed_tx, closed_rx) = mpsc::channel();
+    *backend.closed.lock().unwrap() = Some(closed_tx);
+    let samples = Arc::new(vec![0.2; 40]);
+    let weak = Arc::downgrade(&samples);
+    launch_fake_preview(&host, &backend, samples);
+    let (observed_tx, observed_rx) = mpsc::channel();
+    {
+        let control = host.preview_control.lock().unwrap();
+        *control
+            .as_ref()
+            .unwrap()
+            .audio
+            .owner_observed_source_end
+            .lock()
+            .unwrap() = Some(observed_tx);
+    }
+    let mut initial = vec![0.0; 6 * 20];
+    backend.outputs.lock().unwrap()[0](&mut initial);
+    assert!(initial.iter().all(|sample| *sample == 0.0));
+    // 收到信号说明所有者已经复核完毕，仍因限幅尾部未排空而保留流。
+    observed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(matches!(
+        closed_rx.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
+    assert!(weak.upgrade().is_some());
+    let mut pcm = vec![0.0; 6 * 300];
+    backend.outputs.lock().unwrap()[0](&mut pcm);
+    let nonzero = pcm
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .filter(|frame| frame[0] != 0.0)
+        .collect::<Vec<_>>();
+    assert_eq!(nonzero.len(), 20, "短于前视窗口的音频也必须完整出声");
+    let ceiling = 10.0f32.powf(-1.0 / 20.0);
+    assert!(nonzero
+        .iter()
+        .all(|frame| (frame[0] - ceiling).abs() < 1e-5));
+    assert!(pcm.iter().all(|sample| sample.abs() <= ceiling));
+    closed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    // join只等待已经自动关闭的所有者完成，不发出停止或取消请求。
+    host.preview_thread
+        .lock()
+        .unwrap()
+        .take()
+        .unwrap()
+        .join()
+        .unwrap();
+    assert!(weak.upgrade().is_none(), "自动结束必须回收PCM");
+    backend.outputs.lock().unwrap()[0](&mut pcm);
+    assert!(
+        pcm.iter().all(|sample| *sample == 0.0),
+        "保留的回调不再拥有PCM或尾部"
+    );
+}
+
+#[test]
+fn 启动命令排队及开流期间的总音量调整都优先于旧配置() {
+    let (host, backend) = fixture();
+    let ticket = host.reserve_audio_request();
+    host.set_gains(-20.0, -12.0);
+    let mut old_config = config();
+    assert!(host
+        .prepare_start_gains(&mut old_config, Some(ticket))
+        .unwrap());
+    assert_eq!(old_config.mic_gain_db, -20.0);
+    assert_eq!(old_config.sfx_gain_db, -12.0);
+    let running = host.running.lock().unwrap().take().unwrap();
+    host.set_gains(-30.0, -20.0);
+    assert!(host.publish_running(running, Some(ticket)).is_none());
+    {
+        let guard = host.running.lock().unwrap();
+        let running = guard.as_ref().unwrap();
+        assert_eq!(running.cfg.mic_gain_db, -30.0);
+        assert_eq!(running.cfg.sfx_gain_db, -20.0);
+        assert_eq!(running.cfg_key, cfg_fingerprint(&running.cfg));
+    }
+    assert!(host.play(0).unwrap());
+    for callback in backend.outputs.lock().unwrap().iter_mut() {
+        let mut pcm = vec![0.0; 8_820];
+        callback(&mut pcm);
+        assert!(pcm[pcm.len() - 1_000..]
+            .iter()
+            .all(|s| (*s - 0.02).abs() < 1e-6));
+    }
+}
+
+#[test]
+fn 过期启动和无效总音量不会覆盖当前试听音量() {
+    let host = preview_test_host();
+    let old_ticket = host.reserve_audio_request();
+    host.set_gains(0.0, -20.0);
+    let backend = FakeBackend::default();
+    launch_fake_preview(&host, &backend, Arc::new(vec![0.2; 88_200]));
+    assert!(!host
+        .prepare_start_gains(&mut config(), Some(old_ticket))
+        .unwrap());
+    for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX] {
+        host.set_gains(0.0, invalid);
+        host.set_gains(invalid, 0.0);
+    }
+    let mut pcm = vec![0.0; 6 * 500];
+    backend.outputs.lock().unwrap()[0](&mut pcm);
+    assert!((pcm[pcm.len() - 6] - 0.02).abs() < 1e-6);
+    host.stop_all().unwrap();
+}
+
+#[test]
+fn 音效总音量过载时试听正式播放和监听共享同一限幅上限() {
+    let (host, main) = fixture();
+    host.set_gains(-60.0, 20.0);
+    let preview = FakeBackend::default();
+    launch_fake_preview(&host, &preview, Arc::new(vec![0.2; 88_200]));
+    drain_primary(&main);
+    let mut preview_pcm = vec![0.0; 6 * 1_000];
+    preview.outputs.lock().unwrap()[0](&mut preview_pcm);
+    let preview_level = preview_pcm[preview_pcm.len() - 6];
+    let ceiling = 10.0f32.powf(-1.0 / 20.0);
+    assert!((preview_level - ceiling).abs() < 1e-5);
+    assert!(host.play(0).unwrap());
+    for callback in main.outputs.lock().unwrap().iter_mut() {
+        let mut pcm = vec![0.0; 8_820];
+        callback(&mut pcm);
+        assert!(pcm[pcm.len() - 1_000..]
+            .iter()
+            .all(|s| (*s - preview_level).abs() < 1e-5));
+        assert!(pcm.iter().all(|sample| sample.abs() <= ceiling));
+    }
+}
+
+#[test]
+fn 试听先立体声限幅再按正式输出规则映射单声道和多声道() {
+    let ceiling = 10.0f32.powf(-1.0 / 20.0);
+    for channels in [1, 2, 6] {
+        let host = preview_test_host();
+        host.set_gains(0.0, 20.0);
+        let backend = FakeBackend::default();
+        let (opened_tx, opened_rx) = mpsc::channel();
+        *backend.opened.lock().unwrap() = Some(opened_tx);
+        let playing = backend.clone();
+        let samples = Arc::new((0..44_100).flat_map(|_| [0.6, 0.2]).collect());
+        host.launch_preview(
+            "channel-layout".into(),
+            0.0,
+            || Ok(samples),
+            move |samples, token, generation, audio| {
+                play_samples(
+                    playing,
+                    samples,
+                    DeviceId::new("fake preview"),
+                    StreamFormat::new(44_100, channels),
+                    audio,
+                    token,
+                    generation,
+                )
+            },
+        )
+        .unwrap();
+        opened_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let mut pcm = vec![0.0; channels as usize * 500];
+        backend.outputs.lock().unwrap()[0](&mut pcm);
+        let frame = &pcm[pcm.len() - channels as usize..];
+        let mono = ceiling * (1.0 + 1.0 / 3.0) * 0.5;
+        if channels == 1 {
+            assert!((frame[0] - mono).abs() < 1e-5);
+        } else {
+            assert!((frame[0] - ceiling).abs() < 1e-5);
+            assert!((frame[1] - ceiling / 3.0).abs() < 1e-5);
+            assert!(frame[2..]
+                .iter()
+                .all(|sample| (*sample - mono).abs() < 1e-5));
+        }
+        host.stop_all().unwrap();
+    }
+}
+
+#[test]
+fn 超范围的有限音量被所有入口拒绝且不会污染试听或正式输出() {
+    let (host, primary) = fixture();
+    let preview = FakeBackend::default();
+    host.set_gains(-60.0, 0.0);
+    launch_fake_preview(&host, &preview, Arc::new(vec![0.2; 88_200]));
+    assert!(host.set_sound_gain("good-id", 12.0).unwrap());
+    drain_primary(&primary);
+    for invalid in [36.01, 760.0, f32::MAX] {
+        host.set_gains(0.0, invalid);
+        host.set_gains(invalid, 0.0);
+        assert!(host.set_sound_gain("good-id", invalid).is_err());
+        assert!(host.set_slot_gain(0, invalid).is_err());
+        assert!(host
+            .launch_preview("good-id".into(), invalid, || Ok(()), |_, _, _, _| Ok(()))
+            .is_err());
+        let ticket = host.reserve_audio_request();
+        let mut bad_config = config();
+        bad_config.sfx_gain_db = invalid;
+        assert!(host
+            .start_requested(bad_config.clone(), None, ticket)
+            .is_err());
+        bad_config.sfx_gain_db = 0.0;
+        bad_config.mic_gain_db = invalid;
+        assert!(host
+            .start_requested(bad_config.clone(), None, ticket)
+            .is_err());
+        bad_config.mic_gain_db = 0.0;
+        bad_config.gains[1] = invalid;
+        assert!(host
+            .start_requested(bad_config.clone(), None, ticket)
+            .is_err());
+    }
+    let expected = 0.2 * 10.0f32.powf(12.0 / 20.0);
+    let mut pcm = vec![0.0; 6 * 1_000];
+    preview.outputs.lock().unwrap()[0](&mut pcm);
+    assert!(pcm.iter().all(|sample| sample.is_finite()));
+    assert!((pcm[pcm.len() - 6] - expected).abs() < 1e-6);
+    assert!(host.play(0).unwrap());
+    for callback in primary.outputs.lock().unwrap().iter_mut() {
+        let mut pcm = vec![0.0; 8_820];
+        callback(&mut pcm);
+        assert!(pcm.iter().all(|sample| sample.is_finite()));
+        assert!(pcm[pcm.len() - 1_000..]
+            .iter()
+            .all(|sample| (*sample - expected).abs() < 1e-6));
+    }
+    host.set_gains(-60.0, 36.0);
+    assert!(host.set_sound_gain("good-id", 36.0).unwrap());
+    assert!(host.play(0).unwrap());
+    for callback in primary.outputs.lock().unwrap().iter_mut() {
+        let mut pcm = vec![0.0; 8_820];
+        callback(&mut pcm);
+        assert!(pcm
+            .iter()
+            .all(|sample| sample.is_finite() && sample.abs() <= 10.0f32.powf(-1.0 / 20.0)));
+    }
 }
