@@ -25,6 +25,14 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
+# 本脚本会被单独调用（见 docs/ai/WORKFLOW.md），而非登录 shell 的 PATH 里通常没有 cargo。
+# 与 tools/check-all.sh 取同一份环境；少了这行，下面会把"找不到 cargo"误报成"编译失败"。
+[ -f "$HOME/.cargo/env" ] && source "$HOME/.cargo/env"
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "❌ 找不到 cargo —— 先安装 Rust 工具链，或把 cargo 加入 PATH" >&2
+  exit 127
+fi
+
 TARGET="${TARGET:-x86_64-pc-windows-msvc}"
 STUB_DIR="$(mktemp -d)"
 trap 'rm -rf "$STUB_DIR"' EXIT
@@ -70,6 +78,10 @@ if [ $rc -eq 0 ]; then
   echo "$out" | grep -E "^\s+(Checking|Finished)" | tail -3 | sed 's/^/     /'
 else
   echo "  ❌ $WHAT 编译失败："
-  echo "$out" | grep -E "^error" -A 6 | head -40 | sed 's/^/     /'
+  # cargo 的报错不都以 "error" 开头（目标未安装、依赖拉取失败等），
+  # 匹配不到就退回首几行 —— 只说"失败"不说原因等于没报。
+  detail=$(echo "$out" | grep -E "^error" -A 6 | head -40)
+  [ -n "$detail" ] || detail=$(echo "$out" | head -20)
+  echo "$detail" | sed 's/^/     /'
 fi
 exit $rc

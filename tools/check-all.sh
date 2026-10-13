@@ -137,7 +137,8 @@ if WIN_OUT=$(./tools/win-cross-check.sh 2>&1); then
   pass "Windows 交叉编译"
 else
   fail "Windows 交叉编译"
-  echo "$WIN_OUT" | grep -E "^error" -A 3 | head -8 | sed 's/^/       /'
+  # 子脚本已缩进过自己的报错，这里直接转述它，别再按 ^error 过滤（那会一条都匹配不到）
+  echo "$WIN_OUT" | tail -12 | sed 's/^/       /'
 fi
 
 # ── 结论 ──
