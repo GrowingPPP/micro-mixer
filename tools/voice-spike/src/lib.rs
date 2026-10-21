@@ -3,6 +3,7 @@
 pub mod adapter;
 pub mod backend;
 pub mod metrics;
+pub mod pitch_shift_backend;
 pub mod signal;
 pub mod signalsmith_backend;
 
