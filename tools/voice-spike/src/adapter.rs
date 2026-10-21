@@ -26,13 +26,15 @@ impl<B: Backend> BlockAdapter<B> {
     }
 
     pub fn process(&mut self, input: &[f32], output: &mut [f32]) -> usize {
-        let mut produced = 0;
         for &sample in input {
             self.input[self.input_len] = sample;
             self.input_len += 1;
             if self.input_len == self.block_frames {
-                self.backend.process(&self.input, &mut self.wet);
-                for &sample in &self.wet {
+                let backend_produced = self
+                    .backend
+                    .process(&self.input, &mut self.wet)
+                    .min(self.wet.len());
+                for &sample in &self.wet[..backend_produced] {
                     if self.output.len() == self.output.capacity() {
                         self.output.pop_front();
                         self.overflow += 1;
@@ -41,13 +43,15 @@ impl<B: Backend> BlockAdapter<B> {
                 }
                 self.input_len = 0;
             }
-            while produced < output.len() {
-                let Some(sample) = self.output.pop_front() else {
-                    break;
-                };
-                output[produced] = sample;
-                produced += 1;
-            }
+        }
+
+        let mut produced = 0;
+        while produced < output.len() {
+            let Some(sample) = self.output.pop_front() else {
+                break;
+            };
+            output[produced] = sample;
+            produced += 1;
         }
         produced
     }
@@ -108,5 +112,48 @@ mod tests {
         }
         assert_eq!(total_out, total_in);
         assert_eq!(adapter.overflow_count(), 0);
+    }
+
+    #[test]
+    fn 跨调用半块累积不丢样本() {
+        let mut adapter = BlockAdapter::new(PassthroughBackend, 128);
+        let mut output = vec![0.0f32; 256];
+        let mut total = 0usize;
+
+        for frames in [1usize, 127, 100, 3] {
+            let input = vec![0.1f32; frames];
+            total += adapter.process(&input, &mut output);
+        }
+        assert_eq!(total, 128);
+
+        let input = vec![0.1f32; 25];
+        total += adapter.process(&input, &mut output);
+        assert_eq!(total, 256);
+        assert_eq!(adapter.overflow_count(), 0);
+    }
+
+    #[test]
+    fn 输出缓冲不足时丢弃最旧样本计数溢出() {
+        let mut adapter = BlockAdapter::new(PassthroughBackend, 128);
+        let input = vec![0.25f32; 128];
+        let mut output = vec![0.0f32; 1];
+
+        for _ in 0..20 {
+            assert_eq!(adapter.process(&input, &mut output), 1);
+        }
+        assert!(adapter.overflow_count() > 0);
+    }
+
+    #[test]
+    fn 空输入调用也会排空积压输出() {
+        let mut adapter = BlockAdapter::new(PassthroughBackend, 128);
+        let input = vec![0.25f32; 128];
+        let mut first = vec![0.0f32; 1];
+        assert_eq!(adapter.process(&input, &mut first), 1);
+        assert_eq!(adapter.overflow_count(), 0);
+
+        let mut rest = vec![0.0f32; 127];
+        assert_eq!(adapter.process(&[], &mut rest), 127);
+        assert!(rest.iter().all(|s| (*s - 0.25).abs() < 1e-6));
     }
 }
