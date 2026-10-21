@@ -1,0 +1,705 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>变声器界面设计稿 · 麦克风混音助手</title>
+<script src="../../apps/mixer-gui/dist/theme.js"></script>
+<link rel="stylesheet" href="../../apps/mixer-gui/dist/style.css">
+<style>
+  body { overflow: hidden; }
+  .voice-block {
+    margin: 0 0 22px; padding: 13px; border: 1px solid var(--line);
+    border-radius: 10px; background: var(--inset);
+  }
+  .voice-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+  .voice-head h3 { font-size: 12px; }
+  .voice-state { display: block; margin-top: 2px; color: var(--dim); font-size: 11px; }
+  .voice-head .switch-row { margin: 0; }
+  .voice-head .switch-row input { width: 30px; height: 19px; }
+  .voice-head .switch-row input::before { width: 11px; height: 11px; top: 3px; }
+  .voice-head .switch-row input:checked::before { transform: translateX(11px); }
+  .voice-preset-row { display: flex; align-items: center; gap: 6px; }
+  .voice-preset-row select { padding: 6px 8px; font-size: 12px; }
+  .voice-actions { display: flex; gap: 6px; margin-top: 9px; }
+  .voice-actions button { flex: 1; min-height: 30px; padding: 5px 4px; font-size: 12px; }
+  .voice-actions .preview { color: var(--preview); background: var(--preview-fill); border-color: transparent; }
+  .voice-actions .preview:hover { border-color: var(--preview); }
+  .voice-actions .preview.recording { color: var(--danger); background: var(--danger-fill); }
+  .voice-actions .preview.playing { color: var(--accent2); background: var(--inset); }
+  .voice-hint { margin: 7px 0 0; color: var(--dim); font-size: 10px; line-height: 1.5; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 4px; padding: 1px 6px;
+    border-radius: 999px; font-size: 10px; line-height: 1.7; white-space: nowrap;
+    color: var(--dim); background: var(--panel); border: 1px solid var(--line);
+  }
+  .badge.warn { color: var(--warn); border-color: var(--warn); background: var(--accent-fill); }
+  .badge.dirty { color: var(--accent); border-color: var(--accent); background: var(--accent-fill); }
+  .badge.ok { color: var(--accent2); border-color: var(--accent2); background: var(--inset); }
+  .preview-progress { height: 3px; margin-top: 8px; border-radius: 3px; background: var(--line); overflow: hidden; }
+  .preview-progress i { display: block; width: 0; height: 100%; background: var(--preview); transition: width .12s linear; }
+  .preview-progress.recording i { background: var(--danger); }
+  .preview-progress.playing i { background: var(--accent2); }
+
+  .voice-dialog { max-width: 640px; }
+  .voice-dialog .dialog-footer {
+    position: sticky; bottom: 0; z-index: 1;
+    background: var(--panel); padding-bottom: 2px;
+  }
+  .voice-toolbar { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
+  .voice-toolbar .switch-row { flex: 0 0 auto; margin: 0 0 1px; }
+  .voice-toolbar .preset-field { flex: 1 1 190px; }
+  .voice-toolbar .preview { flex: 0 0 auto; color: var(--preview); background: var(--preview-fill); border-color: transparent; }
+  .voice-toolbar .preview:hover { border-color: var(--preview); }
+  .voice-toolbar .preview.recording { color: var(--danger); background: var(--danger-fill); }
+  .voice-toolbar .preview.playing { color: var(--accent2); background: var(--inset); }
+  .preview-status {
+    display: flex; align-items: center; gap: 8px; margin-top: 12px; padding: 8px 10px;
+    border-radius: 7px; background: var(--preview-fill); color: var(--preview);
+    font-size: 12px;
+  }
+  .preview-status.recording { background: var(--danger-fill); color: var(--danger); }
+  .preview-status.playing { background: var(--inset); color: var(--accent2); }
+  .preview-status .preview-progress { flex: 1; margin: 0; background: color-mix(in srgb, currentColor 22%, transparent); }
+  .preview-status .preview-progress i { background: currentColor; }
+  .param-list { display: grid; gap: 14px; }
+  .param-row { display: grid; grid-template-columns: 74px minmax(0, 1fr) 74px; gap: 12px; align-items: center; }
+  .param-row > label { color: var(--fg); font-size: 12px; }
+  .param-row output { justify-self: end; font: 12px "SFMono-Regular", Consolas, monospace; color: var(--fg); }
+  .param-row .unit { color: var(--dim); font: 11px "SFMono-Regular", Consolas, monospace; margin-left: 3px; }
+  .effect-list { display: grid; gap: 9px; }
+  .effect-row { display: grid; grid-template-columns: 112px minmax(0, 1fr) 64px; gap: 10px; align-items: center; }
+  .effect-row .effect-toggle { display: flex; flex-direction: row; align-items: center; gap: 7px; color: var(--fg); font-size: 12px; }
+  .effect-row .effect-toggle input { accent-color: var(--accent); }
+  .effect-row output { justify-self: end; font: 11px "SFMono-Regular", Consolas, monospace; color: var(--dim); }
+  .effect-row input[type=range]:disabled { opacity: .35; }
+  .preset-note { color: var(--dim); font-size: 12px; line-height: 1.7; margin: 0 0 10px; }
+  .preset-actions { display: flex; gap: 7px; flex-wrap: wrap; }
+  .preset-actions button { font-size: 12px; }
+  .inline-save { display: flex; gap: 7px; align-items: center; margin-top: 11px; }
+  .inline-save input { flex: 1; min-width: 0; }
+  .inline-save button { flex: 0 0 auto; }
+  .voice-footer-note { margin-top: 13px; font-size: 11px; color: var(--dim); }
+
+  .phone-overlay .dialog { max-width: 390px; background: transparent; border: 0; box-shadow: none; padding: 0; overflow: visible; }
+  .phone-frame {
+    width: 320px; margin: 0 auto; padding: 12px; border-radius: 38px;
+    background: #1d2220; box-shadow: 0 24px 70px rgba(0,0,0,.45), inset 0 0 0 1px rgba(255,255,255,.08);
+  }
+  .phone-screen { border-radius: 28px; overflow: hidden; background: var(--bg); color: var(--fg); max-height: 580px; overflow-y: auto; }
+  .phone-notch { width: 92px; height: 20px; margin: 0 auto -9px; border-radius: 0 0 14px 14px; background: #1d2220; position: relative; z-index: 2; }
+  .remote-app { padding: 20px 15px 17px; }
+  .remote-app h2 { font-size: 17px; letter-spacing: -.02em; }
+  .remote-sub { color: var(--dim); font-size: 11px; margin-top: 3px; }
+  .remote-card { margin-top: 16px; padding: 13px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel); }
+  .remote-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  .remote-card h3 { font-size: 12px; }
+  .remote-current { margin: 8px 0 10px; color: var(--dim); font-size: 12px; }
+  .remote-current b { color: var(--fg); }
+  .remote-presets { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+  .remote-presets button { min-height: 38px; padding: 6px; font-size: 12px; }
+  .remote-presets button.on { border-color: var(--accent); background: var(--accent-fill); color: var(--accent); font-weight: 600; }
+  .remote-presets button[data-preset^="user:"] { grid-column: 1 / -1; }
+  .remote-toggle { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 12px; padding-top: 11px; border-top: 1px solid var(--line); }
+  .remote-toggle span { font-size: 12px; color: var(--fg); }
+  .remote-toggle small { display: block; color: var(--dim); font-size: 10px; margin-top: 2px; }
+  .remote-toggle input { appearance: none; -webkit-appearance: none; position: relative; width: 32px; height: 20px; margin: 0; border: 1px solid var(--dim); border-radius: 20px; background: var(--inset); flex: 0 0 auto; cursor: pointer; }
+  .remote-toggle input::before { content: ""; position: absolute; width: 12px; height: 12px; top: 3px; left: 3px; border-radius: 50%; background: var(--dim); transition: transform .15s; }
+  .remote-toggle input:checked { border-color: var(--accent); background: var(--accent); }
+  .remote-toggle input:checked::before { background: var(--on-accent); transform: translateX(12px); }
+  .phone-close { margin: 14px auto 0; display: flex; }
+
+  @media (max-width: 800px) {
+    .workspace { grid-template-columns: minmax(0, 1fr) 220px; }
+    .voice-block { padding: 11px; }
+  }
+  @media (max-width: 620px) {
+    .workspace { grid-template-columns: minmax(0, 1fr) 196px; }
+    .voice-toolbar .preset-field { flex-basis: 100%; }
+    .param-row { grid-template-columns: 66px minmax(0, 1fr) 66px; gap: 8px; }
+    .effect-row { grid-template-columns: 98px minmax(0, 1fr) 56px; gap: 7px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; }
+  }
+</style>
+</head>
+<body>
+<div class="app-shell">
+  <header class="app-header">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+      <div><h1>麦克风混音助手</h1><p class="brand-subtitle">把音频和人声一起传给对方</p></div>
+    </div>
+    <div class="actions">
+      <span class="engine-status"><span class="dot ok" aria-hidden="true"></span><span>已启动</span></span>
+      <button class="ghost">连接设置</button>
+      <button class="primary">启动</button>
+      <details class="menu">
+        <summary aria-label="更多功能" title="更多功能">•••</summary>
+        <div class="menu-content">
+          <button id="btnTheme">切换到浅色</button>
+          <button id="btnRemotePreview">手机遥控预览</button>
+        </div>
+      </details>
+    </div>
+  </header>
+
+  <div class="workspace">
+    <main class="library" aria-labelledby="libraryTitle">
+      <div class="library-heading">
+        <div><h2 id="libraryTitle">音效库 <span class="count">4</span></h2><p>点击播放给对方 · 试听仅自己可听</p></div>
+        <button class="ghost">＋ 添加音频</button>
+      </div>
+      <div class="libbar">
+        <div class="search-field"><input type="search" aria-label="搜索音效名称、标签或热键" placeholder="搜索音效或标签…"><kbd>⌘ K</kbd></div>
+        <button class="quiet">按名称排序</button>
+      </div>
+      <div class="grid">
+        <article class="card"><button class="play-trigger"><div class="card-top"><span class="idx">01</span><kbd class="key">F1</kbd></div><span class="name">轻快提示音</span><div class="card-info"><span class="tags">提示</span><span class="dur">0:02</span></div></button><div class="meta"><span class="play-label">点击播放</span><div class="card-actions"><button class="prev">试听</button><button class="sound-settings" aria-label="音效详情">⋯</button></div></div></article>
+        <article class="card playing"><button class="play-trigger"><div class="card-top"><span class="idx">02</span><kbd class="key">F2</kbd></div><span class="name">硬币声</span><div class="card-info"><span class="tags">游戏</span><span class="dur">0:01</span></div></button><div class="meta"><span class="play-label">正在播放</span><div class="card-actions"><button class="prev">试听</button><button class="sound-settings" aria-label="音效详情">⋯</button></div></div><i class="bar" style="width:42%"></i></article>
+        <article class="card"><button class="play-trigger"><div class="card-top"><span class="idx">03</span><kbd class="key">F3</kbd></div><span class="name">掌声</span><div class="card-info"><span class="tags">气氛</span><span class="dur">0:04</span></div></button><div class="meta"><span class="play-label">点击播放</span><div class="card-actions"><button class="prev">试听</button><button class="sound-settings" aria-label="音效详情">⋯</button></div></div></article>
+        <article class="card"><button class="play-trigger"><div class="card-top"><span class="idx">04</span><kbd class="key">F4</kbd></div><span class="name">错误提示</span><div class="card-info"><span class="tags">提示</span><span class="dur">0:01</span></div></button><div class="meta"><span class="play-label">点击播放</span><div class="card-actions"><button class="prev">试听</button><button class="sound-settings" aria-label="音效详情">⋯</button></div></div></article>
+      </div>
+    </main>
+
+    <aside class="mixer" aria-labelledby="mixerTitle">
+      <div class="mixer-heading"><h2 id="mixerTitle">混音控制</h2><span>实时生效</span></div>
+
+      <div class="gain-control">
+        <div class="gain-heading"><label for="micGain">麦克风音量</label><span class="withunit"><input id="micGain" type="number" value="0" min="-60" max="36"><i>dB</i></span></div>
+        <input type="range" min="-60" max="36" value="0" aria-label="麦克风音量滑杆">
+        <p class="hint">调整对方听到的人声大小。</p>
+      </div>
+
+      <section class="voice-block" aria-labelledby="voiceBlockTitle">
+        <div class="voice-head">
+          <div><h3 id="voiceBlockTitle">人声效果</h3><span class="voice-state" id="voiceState">女声 · 已启用</span></div>
+          <label class="switch-row"><input id="voiceEnabled" type="checkbox" checked aria-label="启用变声"></label>
+        </div>
+        <div class="voice-preset-row">
+          <select id="voicePreset" aria-label="当前变声预设">
+            <option value="builtin:female" selected>女声</option>
+            <option value="builtin:male">男声</option>
+            <option value="builtin:child">小孩</option>
+            <option value="builtin:deep">低沉</option>
+            <option value="builtin:robot">机器人</option>
+            <option value="builtin:radio">对讲机</option>
+            <option value="user:my-voice">我的女声</option>
+          </select>
+          <span class="badge warn hidden" id="bypassBadge">临时旁路</span>
+        </div>
+        <div class="voice-actions">
+          <button id="voicePreview" class="preview">试听 3 秒</button>
+          <button id="voiceEdit" class="ghost">编辑</button>
+        </div>
+        <p class="voice-hint" id="previewHint">试听只在本机回放，不送给对方。</p>
+        <div class="preview-progress hidden" id="sidebarPreviewProgress"><i></i></div>
+      </section>
+
+      <div class="gain-control">
+        <div class="gain-heading"><label for="sfxGain">音效总音量</label><span class="withunit"><input id="sfxGain" type="number" value="-6" min="-60" max="36"><i>dB</i></span></div>
+        <input type="range" min="-60" max="36" value="-6" aria-label="音效总音量滑杆">
+        <p class="hint">统一控制试听、正式播放和监听。</p>
+      </div>
+
+      <div class="mixer-options">
+        <label class="switch-row"><span><strong>本机监听</strong><small>自己同步听到正式音效</small></span><input type="checkbox" checked aria-label="本机监听"></label>
+        <label class="switch-row"><span><strong>循环播放</strong><small>仅正式播放与监听</small></span><input type="checkbox" aria-label="循环播放"></label>
+      </div>
+
+      <div class="route">
+        <h3>音频连接</h3>
+        <span class="route-label">真实麦克风</span><p>MacBook Pro 麦克风</p>
+        <span class="route-arrow" aria-hidden="true">↓</span>
+        <span class="route-label">输出至虚拟设备</span><p>BlackHole 2ch</p>
+        <p class="hint">目标应用需选择对应的虚拟麦克风。</p>
+      </div>
+    </aside>
+  </div>
+
+  <footer class="transport" aria-label="当前播放和音频状态">
+    <div class="player" data-kind="main">
+      <div class="player-symbol" aria-hidden="true"><span class="play-symbol"></span></div>
+      <div class="player-copy"><strong>硬币声</strong><span id="playerMode">正式播放 · 对方可听</span></div>
+      <div class="player-progress"><div class="progress-track"><i style="width:42%"></i></div><span class="player-time">0:00 / 0:01</span></div>
+      <button class="stop-button" title="停止音效播放和本机试听"><span class="stop-symbol" aria-hidden="true"></span>停止播放 / 试听 <kbd>空格</kbd></button>
+    </div>
+    <div class="statusbar">
+      <span class="meter"><i class="zone"></i><i class="bar" style="width:58%"></i><i class="peak" style="left:60%"></i></span>
+      <span id="voiceStatus">人声效果：女声 · 已启用</span>
+      <span class="status-spacer"></span>
+      <button id="btnRemotePreview2" class="quiet">手机遥控</button>
+    </div>
+  </footer>
+</div>
+
+<div id="voiceOverlay" class="modal-overlay hidden">
+  <section class="dialog voice-dialog" role="dialog" aria-modal="true" aria-labelledby="voiceTitle">
+    <div class="dialog-heading">
+      <div><p class="eyebrow">麦克风人声</p><h2 id="voiceTitle">人声效果</h2></div>
+      <button id="voiceClose" class="quiet" aria-label="关闭人声效果">关闭</button>
+    </div>
+
+    <div class="voice-toolbar">
+      <label class="switch-row"><span><strong>启用</strong><small>旁路为零延迟原声</small></span><input id="modalEnabled" type="checkbox" checked aria-label="启用变声"></label>
+      <label class="preset-field">当前预设
+        <select id="modalPreset" aria-label="当前变声预设">
+          <option value="builtin:female" selected>女声</option>
+          <option value="builtin:male">男声</option>
+          <option value="builtin:child">小孩</option>
+          <option value="builtin:deep">低沉</option>
+          <option value="builtin:robot">机器人</option>
+          <option value="builtin:radio">对讲机</option>
+          <option value="user:my-voice">我的女声</option>
+        </select>
+      </label>
+      <button id="modalPreview" class="preview">试听 3 秒</button>
+      <span class="badge dirty hidden" id="dirtyBadge">● 已修改</span>
+      <span class="badge warn hidden" id="modalBypassBadge">临时旁路</span>
+    </div>
+    <div class="preview-status hidden" id="previewStatus"><span id="previewText">录制中</span><div class="preview-progress"><i></i></div></div>
+
+    <section class="settings-section">
+      <h3>音高与音色</h3>
+      <div class="param-list">
+        <div class="param-row"><label for="pitch">音高</label><input id="pitch" type="range" min="-24" max="24" step="1" value="4"><output id="pitchOut">+4 半音</output></div>
+        <div class="param-row"><label for="formant">共振峰</label><input id="formant" type="range" min="-12" max="12" step="1" value="3"><output id="formantOut">+3 半音</output></div>
+      </div>
+      <div class="preset-actions" style="margin-top:13px"><button id="resetPreset" class="ghost">恢复当前预设值</button></div>
+    </section>
+
+    <section class="settings-section">
+      <h3>效果</h3>
+      <div class="effect-list">
+        <div class="effect-row"><label class="effect-toggle"><input type="checkbox" id="gateOn" checked>噪声门</label><input id="gate" type="range" min="-60" max="0" step="1" value="-45"><output id="gateOut">−45 dB</output></div>
+        <div class="effect-row"><label class="effect-toggle"><input type="checkbox" id="eqLowOn" checked>低频 EQ</label><input id="eqLow" type="range" min="-12" max="12" step="1" value="2"><output id="eqLowOut">+2 dB</output></div>
+        <div class="effect-row"><label class="effect-toggle"><input type="checkbox" id="eqMidOn" checked>中频 EQ</label><input id="eqMid" type="range" min="-12" max="12" step="1" value="0"><output id="eqMidOut">0 dB</output></div>
+        <div class="effect-row"><label class="effect-toggle"><input type="checkbox" id="eqHighOn" checked>高频 EQ</label><input id="eqHigh" type="range" min="-12" max="12" step="1" value="1"><output id="eqHighOut">+1 dB</output></div>
+        <div class="effect-row"><label class="effect-toggle"><input type="checkbox" id="driveOn">软削波</label><input id="drive" type="range" min="0" max="1" step="0.05" value="0" disabled><output id="driveOut">0.00</output></div>
+        <div class="effect-row"><label class="effect-toggle"><input type="checkbox" id="robotOn">环形调制</label><input id="robot" type="range" min="20" max="1000" step="10" value="50" disabled><output id="robotOut">混合 0.00</output></div>
+      </div>
+    </section>
+
+    <section class="settings-section">
+      <h3>预设</h3>
+      <p class="preset-note" id="presetNote">内置预设只读。修改后可另存为用户预设；当前修改只在本次运行有效。</p>
+      <div class="preset-actions">
+        <button id="saveAs" class="primary">另存为用户预设</button>
+        <button id="saveChanges" class="ghost" disabled>保存修改</button>
+        <button id="renamePreset" class="ghost" disabled>重命名</button>
+        <button id="deletePreset" class="quiet danger" disabled>删除</button>
+        <button id="restoreDraft" class="ghost hidden">恢复未保存修改</button>
+      </div>
+      <div class="inline-save hidden" id="inlineSave">
+        <input id="presetName" type="text" maxlength="40" placeholder="预设名称，例如：直播女声" aria-label="新预设名称">
+        <button id="confirmSave" class="primary">保存</button>
+        <button id="cancelSave" class="quiet">取消</button>
+      </div>
+      <p class="voice-footer-note">滑杆与效果参数立即作用于运行期音频。未保存的修改在应用退出后丢失。</p>
+    </section>
+
+    <div class="dialog-footer"><button id="voiceDone" class="primary">完成</button></div>
+  </section>
+</div>
+
+<div id="phoneOverlay" class="modal-overlay phone-overlay hidden">
+  <section class="dialog" role="dialog" aria-modal="true" aria-labelledby="phoneTitle">
+    <div class="phone-frame">
+      <div class="phone-notch"></div>
+      <div class="phone-screen">
+        <div class="remote-app">
+          <h2 id="phoneTitle">麦克风混音助手</h2>
+          <p class="remote-sub">手机遥控 · 同一局域网</p>
+          <section class="remote-card">
+            <div class="remote-card-head"><h3>人声效果</h3><span class="badge ok" id="remoteState">开启</span></div>
+            <p class="remote-current">当前：<b id="remoteCurrent">女声</b></p>
+            <div class="remote-presets" id="remotePresets">
+              <button data-preset="builtin:female" class="on">女声</button>
+              <button data-preset="builtin:male">男声</button>
+              <button data-preset="builtin:child">小孩</button>
+              <button data-preset="builtin:deep">低沉</button>
+              <button data-preset="builtin:robot">机器人</button>
+              <button data-preset="builtin:radio">对讲机</button>
+              <button data-preset="user:my-voice">我的女声</button>
+            </div>
+            <label class="remote-toggle"><span>启用变声<small>关闭后恢复原声</small></span><input id="remoteEnabled" type="checkbox" checked aria-label="启用变声"></label>
+          </section>
+        </div>
+      </div>
+    </div>
+    <button id="phoneClose" class="ghost phone-close">关闭预览</button>
+  </section>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+<script>
+(() => {
+  const presets = {
+    'builtin:female': { name: '女声', pitch: 4, formant: 3, gateEnabled: true, gate: -45, eqLowEnabled: true, eqLow: 2, eqMidEnabled: false, eqMid: 0, eqHighEnabled: true, eqHigh: 1, driveEnabled: false, drive: 0, robotEnabled: false, robot: 50, robotMix: 0 },
+    'builtin:male': { name: '男声', pitch: -4, formant: -3, gateEnabled: true, gate: -45, eqLowEnabled: true, eqLow: 1, eqMidEnabled: false, eqMid: 0, eqHighEnabled: false, eqHigh: 0, driveEnabled: false, drive: 0, robotEnabled: false, robot: 50, robotMix: 0 },
+    'builtin:child': { name: '小孩', pitch: 7, formant: 5, gateEnabled: true, gate: -40, eqLowEnabled: false, eqLow: 0, eqMidEnabled: true, eqMid: 1, eqHighEnabled: true, eqHigh: 2, driveEnabled: false, drive: 0, robotEnabled: false, robot: 50, robotMix: 0 },
+    'builtin:deep': { name: '低沉', pitch: -6, formant: -4, gateEnabled: true, gate: -45, eqLowEnabled: true, eqLow: 2, eqMidEnabled: false, eqMid: 0, eqHighEnabled: true, eqHigh: -1, driveEnabled: false, drive: 0, robotEnabled: false, robot: 50, robotMix: 0 },
+    'builtin:robot': { name: '机器人', pitch: 0, formant: 0, gateEnabled: true, gate: -50, eqLowEnabled: true, eqLow: -2, eqMidEnabled: true, eqMid: 1, eqHighEnabled: true, eqHigh: -2, driveEnabled: true, drive: 0.35, robotEnabled: true, robot: 50, robotMix: 0.8 },
+    'builtin:radio': { name: '对讲机', pitch: 0, formant: 0, gateEnabled: true, gate: -35, eqLowEnabled: true, eqLow: -8, eqMidEnabled: true, eqMid: 4, eqHighEnabled: true, eqHigh: -6, driveEnabled: true, drive: 0.6, robotEnabled: false, robot: 50, robotMix: 0 },
+    'user:my-voice': { name: '我的女声', pitch: 5, formant: 4, gateEnabled: true, gate: -42, eqLowEnabled: true, eqLow: 1, eqMidEnabled: true, eqMid: 1, eqHighEnabled: true, eqHigh: 2, driveEnabled: true, drive: 0.1, robotEnabled: false, robot: 50, robotMix: 0, user: true }
+  };
+  const ui = {
+    state: { enabled: true, bypassed: false, preset: 'builtin:female', dirty: false, draft: null, sessionAlive: true, preview: 'idle', previewTimer: null, previewTick: 0, pendingAction: 'create' },
+    el(id) { return document.getElementById(id); }
+  };
+  const el = ui.el;
+
+  function presetLabel(id) { return presets[id]?.name || '女声'; }
+  function isUserPreset(id) { return !!presets[id]?.user; }
+  function formatSigned(v, unit) { return (v > 0 ? '+' : v < 0 ? '−' : '') + Math.abs(v) + ' ' + unit; }
+  function formatDb(v) { return (v > 0 ? '+' : v < 0 ? '−' : '') + Math.abs(v) + ' dB'; }
+
+  function populatePresetSelects() {
+    const ids = Object.keys(presets);
+    [el('voicePreset'), el('modalPreset')].forEach(select => {
+      select.innerHTML = '';
+      ids.forEach(id => {
+        const option = document.createElement('option');
+        option.value = id;
+        option.textContent = presets[id].name;
+        select.append(option);
+      });
+    });
+    const remote = el('remotePresets');
+    remote.innerHTML = '';
+    ids.filter(id => !presets[id].off).forEach(id => {
+      const button = document.createElement('button');
+      button.dataset.preset = id;
+      button.textContent = presets[id].name;
+      remote.append(button);
+    });
+  }
+
+  function readControls() {
+    return {
+      pitch: Number(el('pitch').value),
+      formant: Number(el('formant').value),
+      gateEnabled: el('gateOn').checked,
+      gate: Number(el('gate').value),
+      eqLowEnabled: el('eqLowOn').checked,
+      eqLow: Number(el('eqLow').value),
+      eqMidEnabled: el('eqMidOn').checked,
+      eqMid: Number(el('eqMid').value),
+      eqHighEnabled: el('eqHighOn').checked,
+      eqHigh: Number(el('eqHigh').value),
+      driveEnabled: el('driveOn').checked,
+      drive: Number(el('drive').value),
+      robotEnabled: el('robotOn').checked,
+      robot: Number(el('robot').value),
+      robotMix: el('robotOn').checked ? 0.8 : 0
+    };
+  }
+
+  function cancelPreview() {
+    if (ui.state.preview !== 'idle') setPreviewState('idle');
+  }
+
+  function applyPreset(id) {
+    const p = presets[id] || presets['builtin:female'];
+    cancelPreview();
+    ui.state.preset = presets[id] ? id : 'builtin:female';
+    ui.state.dirty = false;
+    el('pitch').value = p.pitch;
+    el('formant').value = p.formant;
+    el('gate').value = p.gate;
+    el('eqLow').value = p.eqLow;
+    el('eqMid').value = p.eqMid;
+    el('eqHigh').value = p.eqHigh;
+    el('drive').value = p.drive;
+    el('robot').value = p.robot;
+    el('gateOn').checked = p.gateEnabled;
+    el('eqLowOn').checked = p.eqLowEnabled;
+    el('eqMidOn').checked = p.eqMidEnabled;
+    el('eqHighOn').checked = p.eqHighEnabled;
+    el('driveOn').checked = p.driveEnabled;
+    el('robotOn').checked = p.robotEnabled;
+    syncControls();
+    render();
+  }
+
+  function syncControls() {
+    el('pitchOut').textContent = formatSigned(Number(el('pitch').value), '半音');
+    el('formantOut').textContent = formatSigned(Number(el('formant').value), '半音');
+    el('gateOut').textContent = el('gateOn').checked ? formatDb(Number(el('gate').value)) : '关闭';
+    el('eqLowOut').textContent = el('eqLowOn').checked ? formatDb(Number(el('eqLow').value)) : '关闭';
+    el('eqMidOut').textContent = el('eqMidOn').checked ? formatDb(Number(el('eqMid').value)) : '关闭';
+    el('eqHighOut').textContent = el('eqHighOn').checked ? formatDb(Number(el('eqHigh').value)) : '关闭';
+    el('driveOut').textContent = el('driveOn').checked ? Number(el('drive').value).toFixed(2) : '关闭';
+    el('robotOut').textContent = el('robotOn').checked ? '混合 0.80' : '关闭';
+    [['gateOn', 'gate'], ['eqLowOn', 'eqLow'], ['eqMidOn', 'eqMid'], ['eqHighOn', 'eqHigh'], ['driveOn', 'drive'], ['robotOn', 'robot']].forEach(([toggle, slider]) => {
+      el(slider).disabled = !el(toggle).checked;
+    });
+  }
+
+  function render() {
+    const label = presetLabel(ui.state.preset);
+    const stateText = ui.state.bypassed ? label + ' · 临时旁路' : label + (ui.state.enabled ? ' · 已启用' : ' · 已关闭');
+    el('voiceEnabled').checked = ui.state.enabled;
+    el('modalEnabled').checked = ui.state.enabled;
+    el('voicePreset').value = ui.state.preset;
+    el('modalPreset').value = ui.state.preset;
+    el('voiceState').textContent = stateText;
+    el('voiceStatus').textContent = '人声效果：' + stateText;
+    el('bypassBadge').classList.toggle('hidden', !ui.state.bypassed);
+    el('modalBypassBadge').classList.toggle('hidden', !ui.state.bypassed);
+    el('dirtyBadge').classList.toggle('hidden', !ui.state.dirty);
+    el('saveChanges').disabled = !ui.state.dirty || !isUserPreset(ui.state.preset);
+    el('renamePreset').disabled = !isUserPreset(ui.state.preset);
+    el('deletePreset').disabled = !isUserPreset(ui.state.preset);
+    el('restoreDraft').classList.toggle('hidden', !ui.state.draft);
+    el('restoreDraft').textContent = ui.state.draft ? '恢复「' + presetLabel(ui.state.draft.preset) + '」未保存修改' : '恢复未保存修改';
+    el('saveAs').textContent = ui.state.dirty ? '另存为用户预设' : '复制为我的预设';
+    el('presetNote').textContent = isUserPreset(ui.state.preset)
+      ? '用户预设可直接保存修改；未保存的修改只在本次运行有效。'
+      : '内置预设只读。修改后可另存为用户预设；当前修改只在本次运行有效。';
+    el('voicePreview').classList.toggle('recording', ui.state.preview === 'recording');
+    el('voicePreview').classList.toggle('playing', ui.state.preview === 'playing');
+    el('modalPreview').classList.toggle('recording', ui.state.preview === 'recording');
+    el('modalPreview').classList.toggle('playing', ui.state.preview === 'playing');
+    el('voicePreview').textContent = ui.state.preview === 'recording' ? '● 录制中' : ui.state.preview === 'playing' ? '▶ 回放中' : '试听 3 秒';
+    el('voicePreview').title = ui.state.preview === 'recording' ? '点击取消录制' : ui.state.preview === 'playing' ? '点击停止回放' : '录制 3 秒后本机回放，不送给对方';
+    el('modalPreview').textContent = ui.state.preview === 'recording' ? '● 录制中 · 取消' : ui.state.preview === 'playing' ? '▶ 回放中 · 停止' : '试听 3 秒';
+    el('voicePreview').disabled = !ui.state.sessionAlive;
+    el('modalPreview').disabled = !ui.state.sessionAlive;
+    el('previewHint').textContent = ui.state.sessionAlive
+      ? '试听只在本机回放，不送给对方。'
+      : '音频未启动，先点「启动」再试听。';
+    el('remoteState').textContent = ui.state.bypassed ? '临时旁路' : (ui.state.enabled ? '开启' : '关闭');
+    el('remoteState').classList.toggle('ok', ui.state.enabled && !ui.state.bypassed);
+    el('remoteState').classList.toggle('warn', ui.state.bypassed);
+    el('remoteCurrent').textContent = label;
+    el('remoteEnabled').checked = ui.state.enabled;
+    document.querySelectorAll('#remotePresets button').forEach(button => {
+      button.classList.toggle('on', button.dataset.preset === ui.state.preset);
+    });
+  }
+
+  function toast(text, bad = false) {
+    const node = el('toast');
+    node.textContent = text;
+    node.classList.toggle('error', bad);
+    clearTimeout(toast.timer);
+    toast.timer = setTimeout(() => { node.textContent = ''; }, 2400);
+  }
+
+  function markDirty() {
+    ui.state.dirty = true;
+    ui.state.draft = { preset: ui.state.preset, controls: readControls() };
+    syncControls();
+    render();
+  }
+
+  function restoreDraft() {
+    const draft = ui.state.draft;
+    if (!draft) return;
+    const c = draft.controls;
+    ui.state.preset = draft.preset;
+    ui.state.draft = null;
+    ui.state.dirty = true;
+    el('pitch').value = c.pitch;
+    el('formant').value = c.formant;
+    el('gate').value = c.gate;
+    el('eqLow').value = c.eqLow;
+    el('eqMid').value = c.eqMid;
+    el('eqHigh').value = c.eqHigh;
+    el('drive').value = c.drive;
+    el('robot').value = c.robot;
+    el('gateOn').checked = c.gateEnabled;
+    el('eqLowOn').checked = c.eqLowEnabled;
+    el('eqMidOn').checked = c.eqMidEnabled;
+    el('eqHighOn').checked = c.eqHighEnabled;
+    el('driveOn').checked = c.driveEnabled;
+    el('robotOn').checked = c.robotEnabled;
+    syncControls();
+    render();
+    toast('已恢复「' + presetLabel(draft.preset) + '」的未保存修改');
+  }
+
+  function setPreviewState(state) {
+    ui.state.preview = state;
+    ui.state.previewTick = 0;
+    clearInterval(ui.state.previewTimer);
+    const bars = [el('sidebarPreviewProgress'), document.querySelector('#previewStatus .preview-progress')];
+    el('previewStatus').classList.toggle('hidden', state === 'idle');
+    el('sidebarPreviewProgress').classList.toggle('hidden', state === 'idle');
+    el('previewStatus').className = 'preview-status' + (state === 'recording' ? ' recording' : state === 'playing' ? ' playing' : ' hidden');
+    el('previewStatus').querySelector('span').textContent = state === 'recording' ? '录制中 · 3 秒' : state === 'playing' ? '本机回放中' : '';
+    bars.forEach(bar => {
+      bar.classList.toggle('recording', state === 'recording');
+      bar.classList.toggle('playing', state === 'playing');
+      bar.querySelector('i').style.width = '0%';
+    });
+    render();
+    if (state === 'idle') return;
+    const total = state === 'recording' ? 12 : 8;
+    ui.state.previewTimer = setInterval(() => {
+      ui.state.previewTick += 1;
+      const pct = Math.min(100, (ui.state.previewTick / total) * 100);
+      bars.forEach(bar => { bar.querySelector('i').style.width = pct + '%'; });
+      const left = Math.max(0, 3 - Math.floor(ui.state.previewTick / 4));
+      if (state === 'recording') el('previewStatus').querySelector('span').textContent = '录制中 · ' + left + ' 秒';
+      if (ui.state.previewTick >= total) {
+        clearInterval(ui.state.previewTimer);
+        if (state === 'recording') setPreviewState('playing');
+        else setPreviewState('idle');
+      }
+    }, 250);
+  }
+
+  function togglePreview() {
+    if (!ui.state.sessionAlive) return;
+    setPreviewState(ui.state.preview === 'idle' ? 'recording' : 'idle');
+  }
+
+  function openVoice() {
+    el('voiceOverlay').classList.remove('hidden');
+    el('voiceClose').focus();
+  }
+  function closeVoice() {
+    el('voiceOverlay').classList.add('hidden');
+    el('voiceEdit').focus();
+  }
+  function openPhone() {
+    el('phoneOverlay').classList.remove('hidden');
+    el('phoneClose').focus();
+  }
+  function closePhone() {
+    el('phoneOverlay').classList.add('hidden');
+    el('btnRemotePreview').focus();
+  }
+
+  populatePresetSelects();
+  applyPreset('builtin:female');
+
+  el('voiceEnabled').addEventListener('change', event => {
+    cancelPreview();
+    ui.state.enabled = event.target.checked;
+    ui.state.bypassed = false;
+    render();
+  });
+  el('modalEnabled').addEventListener('change', event => {
+    cancelPreview();
+    ui.state.enabled = event.target.checked;
+    ui.state.bypassed = false;
+    render();
+  });
+  el('remoteEnabled').addEventListener('change', event => {
+    cancelPreview();
+    ui.state.enabled = event.target.checked;
+    if (!event.target.checked) ui.state.bypassed = false;
+    render();
+    toast(event.target.checked ? '已启用变声' : '已关闭变声');
+  });
+  el('voicePreset').addEventListener('change', event => applyPreset(event.target.value));
+  el('modalPreset').addEventListener('change', event => applyPreset(event.target.value));
+
+  ['pitch', 'formant', 'gate', 'eqLow', 'eqMid', 'eqHigh', 'drive', 'robot'].forEach(id => {
+    el(id).addEventListener('input', markDirty);
+  });
+  ['gateOn', 'eqLowOn', 'eqMidOn', 'eqHighOn', 'driveOn', 'robotOn'].forEach(id => {
+    el(id).addEventListener('change', markDirty);
+  });
+
+  el('resetPreset').addEventListener('click', () => {
+    ui.state.draft = null;
+    applyPreset(ui.state.preset);
+    toast('已恢复当前预设值');
+  });
+  el('restoreDraft').addEventListener('click', restoreDraft);
+
+  el('saveAs').addEventListener('click', () => {
+    ui.state.pendingAction = 'create';
+    el('inlineSave').classList.remove('hidden');
+    el('presetName').value = presetLabel(ui.state.preset) + ' 副本';
+    el('presetName').focus();
+    el('presetName').select();
+  });
+  el('cancelSave').addEventListener('click', () => el('inlineSave').classList.add('hidden'));
+  el('confirmSave').addEventListener('click', () => {
+    const name = el('presetName').value.trim();
+    if (!name) { toast('预设名称不能为空', true); return; }
+    if (ui.state.pendingAction === 'rename' && isUserPreset(ui.state.preset)) {
+      presets[ui.state.preset].name = name;
+      populatePresetSelects();
+      applyPreset(ui.state.preset);
+      el('inlineSave').classList.add('hidden');
+      toast('已重命名为「' + name + '」');
+      return;
+    }
+    const id = 'user:' + name.toLowerCase().replace(/[^a-z0-9一-鿿]+/g, '-').replace(/^-|-$/g, '') + '-demo';
+    const controls = readControls();
+    presets[id] = { name, ...controls, user: true };
+    ui.state.draft = null;
+    populatePresetSelects();
+    applyPreset(id);
+    el('inlineSave').classList.add('hidden');
+    toast('已保存为用户预设「' + name + '」');
+  });
+  el('saveChanges').addEventListener('click', () => {
+    if (!isUserPreset(ui.state.preset)) return;
+    presets[ui.state.preset] = { ...presets[ui.state.preset], ...readControls() };
+    ui.state.dirty = false;
+    ui.state.draft = null;
+    render();
+    toast('已保存修改');
+  });
+  el('renamePreset').addEventListener('click', () => {
+    if (!isUserPreset(ui.state.preset)) return;
+    ui.state.pendingAction = 'rename';
+    el('inlineSave').classList.remove('hidden');
+    el('presetName').value = presetLabel(ui.state.preset);
+    el('presetName').focus();
+    el('presetName').select();
+  });
+  el('deletePreset').addEventListener('click', () => {
+    if (!isUserPreset(ui.state.preset)) return;
+    delete presets[ui.state.preset];
+    ui.state.draft = null;
+    populatePresetSelects();
+    applyPreset('builtin:female');
+    ui.state.enabled = false;
+    render();
+    toast('已删除用户预设，回到默认预设并关闭变声');
+  });
+
+  el('voiceEdit').addEventListener('click', openVoice);
+  el('voiceClose').addEventListener('click', closeVoice);
+  el('voiceDone').addEventListener('click', closeVoice);
+  el('voiceOverlay').addEventListener('click', event => { if (event.target === el('voiceOverlay')) closeVoice(); });
+  el('btnRemotePreview').addEventListener('click', openPhone);
+  el('btnRemotePreview2').addEventListener('click', openPhone);
+  el('phoneClose').addEventListener('click', closePhone);
+  el('phoneOverlay').addEventListener('click', event => { if (event.target === el('phoneOverlay')) closePhone(); });
+  el('voicePreview').addEventListener('click', togglePreview);
+  el('modalPreview').addEventListener('click', togglePreview);
+  el('remotePresets').addEventListener('click', event => {
+    const button = event.target.closest('button[data-preset]');
+    if (!button) return;
+    applyPreset(button.dataset.preset);
+    toast('手机已切换到「' + presetLabel(button.dataset.preset) + '」；启用状态未改变');
+  });
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape') {
+      if (!el('phoneOverlay').classList.contains('hidden')) closePhone();
+      else if (!el('voiceOverlay').classList.contains('hidden')) closeVoice();
+    }
+  });
+
+  el('btnTheme').addEventListener('click', () => {
+    const current = document.documentElement.dataset.theme;
+    const next = current === 'dark' ? 'light' : 'dark';
+    window.MixerTheme?.setPreference(next);
+    el('btnTheme').textContent = next === 'dark' ? '切换到浅色' : '切换到深色';
+  });
+  el('btnTheme').textContent = document.documentElement.dataset.theme === 'dark' ? '切换到浅色' : '切换到深色';
+})();
+</script>
+</body>
+</html>
