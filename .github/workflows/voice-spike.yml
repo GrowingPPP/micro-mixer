@@ -1,0 +1,52 @@
+name: voice-spike
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "tools/voice-spike/**"
+      - ".github/workflows/voice-spike.yml"
+
+jobs:
+  benchmark:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macos
+          - os: windows-latest
+            name: windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install LLVM (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm
+          echo "LIBCLANG_PATH=$(brew --prefix llvm)/lib" >> "$GITHUB_ENV"
+      - name: Install LLVM (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install llvm -y --no-progress
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Test
+        working-directory: tools/voice-spike
+        run: cargo test --release -- --test-threads=1
+      - name: Benchmark
+        working-directory: tools/voice-spike
+        shell: bash
+        run: >
+          cargo run --release --
+          --seconds 30
+          --blocks 5,10,20,40
+          --chunks 128,256,512
+          --backend all
+          --json out/${{ matrix.name }}.json
+          --render out/${{ matrix.name }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voice-spike-${{ matrix.name }}
+          path: tools/voice-spike/out/
