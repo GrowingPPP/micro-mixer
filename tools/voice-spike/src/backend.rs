@@ -1,8 +1,16 @@
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackendDiagnostics {
+    pub nan_recoveries: u64,
+}
+
 pub trait Backend {
     fn name(&self) -> &'static str;
     fn process(&mut self, input: &[f32], output: &mut [f32]) -> usize;
     fn latency_frames(&self) -> usize;
     fn reset(&mut self);
+    fn diagnostics(&self) -> BackendDiagnostics {
+        BackendDiagnostics::default()
+    }
 }
 
 pub struct PassthroughBackend;

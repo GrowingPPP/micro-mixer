@@ -1,12 +1,14 @@
 use crate::adapter::BlockAdapter;
-use crate::backend::Backend;
+use crate::backend::{Backend, BackendDiagnostics};
 use crate::metrics::{measure_allocations, timing_stats};
 use crate::pitch_shift_backend::PitchShiftBackend;
 use crate::signal::{harmonic_voice, write_wav};
 use crate::signalsmith_backend::SignalsmithBackend;
 use anyhow::{Context, Result};
 use serde::Serialize;
+use std::cell::Cell;
 use std::path::Path;
+use std::rc::Rc;
 use std::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +45,53 @@ impl Backend for Box<dyn Backend> {
     fn reset(&mut self) {
         (**self).reset()
     }
+
+    fn diagnostics(&self) -> BackendDiagnostics {
+        (**self).diagnostics()
+    }
+}
+
+struct DiagnosticsBackend {
+    inner: Box<dyn Backend>,
+    state: Rc<Cell<BackendDiagnostics>>,
+}
+
+impl DiagnosticsBackend {
+    fn new(inner: Box<dyn Backend>) -> (Self, Rc<Cell<BackendDiagnostics>>) {
+        let state = Rc::new(Cell::new(inner.diagnostics()));
+        (
+            Self {
+                inner,
+                state: Rc::clone(&state),
+            },
+            state,
+        )
+    }
+}
+
+impl Backend for DiagnosticsBackend {
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn process(&mut self, input: &[f32], output: &mut [f32]) -> usize {
+        let produced = self.inner.process(input, output);
+        self.state.set(self.inner.diagnostics());
+        produced
+    }
+
+    fn latency_frames(&self) -> usize {
+        self.inner.latency_frames()
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+        self.state.set(self.inner.diagnostics());
+    }
+
+    fn diagnostics(&self) -> BackendDiagnostics {
+        self.state.get()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -68,18 +117,26 @@ pub struct CaseResult {
     pub latency_backend_frames: usize,
     pub latency_adapter_frames: usize,
     pub latency_measured_frames: Option<usize>,
+    pub latency_first_nonzero_frames: Option<usize>,
     pub p50_ms: f64,
     pub p99_ms: f64,
     pub max_ms: f64,
     pub realtime_factor: f64,
     pub allocations: usize,
     pub underruns: u64,
+    pub adapter_overflows: u64,
+    pub backend_nan_recoveries: u64,
 }
 
 fn backend_block_frames(cfg: &CaseConfig) -> usize {
     match cfg.choice {
         BackendChoice::PitchShift => 128,
-        _ => ((cfg.sample_rate as f32 * cfg.block_ms / 1000.0).round() as usize).max(1),
+        BackendChoice::Signalsmith => {
+            ((cfg.sample_rate as f32 * cfg.block_ms / 1000.0).round() as usize).max(64)
+        }
+        BackendChoice::Passthrough => {
+            ((cfg.sample_rate as f32 * cfg.block_ms / 1000.0).round() as usize).max(1)
+        }
     }
 }
 
@@ -98,35 +155,59 @@ fn make_backend(cfg: &CaseConfig) -> Box<dyn Backend> {
     }
 }
 
-fn measure_impulse_latency(cfg: &CaseConfig) -> Option<usize> {
+struct ImpulseLatency {
+    peak_frames: Option<usize>,
+    first_nonzero_frames: Option<usize>,
+}
+
+fn measure_impulse_latency(
+    cfg: &CaseConfig,
+    make_backend: impl Fn() -> Box<dyn Backend>,
+) -> ImpulseLatency {
     let block = backend_block_frames(cfg);
-    let mut adapter = BlockAdapter::new(make_backend(cfg), block);
+    let mut adapter = BlockAdapter::new(make_backend(), block);
     let mut input = vec![0.0f32; cfg.chunk_frames.max(1)];
     input[0] = 1.0;
     let mut output = vec![0.0f32; cfg.chunk_frames.max(1)];
     let mut consumed = 0usize;
     let mut output_index = 0usize;
+    let mut first_nonzero = None;
+    let mut peak: Option<(usize, f32)> = None;
     let max_frames = cfg.sample_rate as usize * 2;
     while consumed < max_frames {
         output.fill(0.0);
         let produced = adapter.process(&input, &mut output);
-        if let Some(pos) = output[..produced].iter().position(|s| s.abs() > 1e-6) {
-            // 输出流里的位置 + 首次出样本的块缓冲延迟。
-            return Some(output_index + pos + block);
+        for (pos, sample) in output[..produced].iter().enumerate() {
+            let magnitude = sample.abs();
+            if first_nonzero.is_none() && magnitude > 1e-6 {
+                // 保留首次非零判据作为诊断；相位声码器会在此处提前泄漏。
+                first_nonzero = Some(output_index + pos + block);
+            }
+            if peak.map_or(true, |(_, best)| magnitude > best) {
+                peak = Some((output_index + pos, magnitude));
+            }
         }
         output_index += produced;
         consumed += input.len();
         input.fill(0.0);
     }
-    None
+    ImpulseLatency {
+        peak_frames: peak
+            .filter(|(_, magnitude)| *magnitude > 0.0)
+            .map(|(index, _)| index + block),
+        first_nonzero_frames: first_nonzero,
+    }
 }
 
-pub fn run_case(cfg: &CaseConfig) -> Result<CaseResult> {
+fn run_case_with_backend<F>(cfg: &CaseConfig, make_backend: F) -> Result<CaseResult>
+where
+    F: Fn() -> Box<dyn Backend>,
+{
     let signal = harmonic_voice(cfg.sample_rate, cfg.seconds, 220.0);
     let block = backend_block_frames(cfg);
-    let backend = make_backend(cfg);
-    let latency_backend = backend.latency_frames();
-    let mut adapter = BlockAdapter::new(backend, block);
+    let (tracked, backend_diagnostics) = DiagnosticsBackend::new(make_backend());
+    let latency_backend = tracked.latency_frames();
+    let mut adapter = BlockAdapter::new(tracked, block);
     let latency_adapter = adapter.latency_frames();
     let chunk = cfg.chunk_frames.max(1);
     let mut out = vec![0.0f32; chunk];
@@ -145,8 +226,8 @@ pub fn run_case(cfg: &CaseConfig) -> Result<CaseResult> {
             output_frames += produced;
             consumed_frames += input.len();
             // 块长与回调长度不整除时，单次回调短于请求长度属于块适配的
-            // 正常粒度；只有积压超过适配器标称延迟才计为欠载。
-            if index >= warmup_chunks && output_frames + latency_adapter < consumed_frames {
+            // 正常粒度；只有积压超过一个块才计为欠载。
+            if index >= warmup_chunks && consumed_frames.saturating_sub(output_frames) > block {
                 underruns += 1;
             }
         }
@@ -161,7 +242,10 @@ pub fn run_case(cfg: &CaseConfig) -> Result<CaseResult> {
         }
     });
     let elapsed = started.elapsed().as_secs_f64();
+    let adapter_overflows = adapter.overflow_count();
+    let backend_nan_recoveries = backend_diagnostics.get().nan_recoveries;
     let stats = timing_stats(&durations);
+    let latency = measure_impulse_latency(cfg, &make_backend);
     Ok(CaseResult {
         backend: cfg.choice_name().to_string(),
         block_ms: cfg.block_ms,
@@ -172,14 +256,21 @@ pub fn run_case(cfg: &CaseConfig) -> Result<CaseResult> {
         output_frames,
         latency_backend_frames: latency_backend,
         latency_adapter_frames: latency_adapter,
-        latency_measured_frames: measure_impulse_latency(cfg),
+        latency_measured_frames: latency.peak_frames,
+        latency_first_nonzero_frames: latency.first_nonzero_frames,
         p50_ms: stats.p50_ms,
         p99_ms: stats.p99_ms,
         max_ms: stats.max_ms,
         realtime_factor: output_frames as f64 / (elapsed * cfg.sample_rate as f64),
         allocations,
         underruns,
+        adapter_overflows,
+        backend_nan_recoveries,
     })
+}
+
+pub fn run_case(cfg: &CaseConfig) -> Result<CaseResult> {
+    run_case_with_backend(cfg, || make_backend(cfg))
 }
 
 impl CaseConfig {
@@ -208,6 +299,14 @@ pub fn render_ab(dir: &Path, cfg: &CaseConfig) -> Result<()> {
             let produced = adapter.process(chunk, &mut out);
             wet.extend_from_slice(&out[..produced]);
         }
+        loop {
+            out.fill(0.0);
+            let produced = adapter.process(&[], &mut out);
+            if produced == 0 {
+                break;
+            }
+            wet.extend_from_slice(&out[..produced]);
+        }
         let name = match choice {
             BackendChoice::Signalsmith => "wet-signalsmith.wav",
             BackendChoice::PitchShift => "wet-pitch-shift.wav",
@@ -221,6 +320,28 @@ pub fn render_ab(dir: &Path, cfg: &CaseConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ShortBackend {
+        block_frames: usize,
+    }
+
+    impl Backend for ShortBackend {
+        fn name(&self) -> &'static str {
+            "short"
+        }
+
+        fn process(&mut self, input: &[f32], output: &mut [f32]) -> usize {
+            let frames = input.len().min(output.len()).min(self.block_frames / 2);
+            output[..frames].fill(0.25);
+            frames
+        }
+
+        fn latency_frames(&self) -> usize {
+            0
+        }
+
+        fn reset(&mut self) {}
+    }
 
     #[test]
     fn passthrough_case_produces_frames_and_zero_allocations() {
@@ -238,6 +359,43 @@ mod tests {
         assert_eq!(result.output_frames, 24_000);
         assert_eq!(result.allocations, 0);
         assert_eq!(result.underruns, 0);
-        assert!(result.p99_ms >= 0.0);
+        assert!(result.p50_ms <= result.p99_ms);
+        assert!(result.p99_ms <= result.max_ms);
+    }
+
+    #[test]
+    fn passthrough_peak_latency_matches_block() {
+        let cfg = CaseConfig {
+            choice: BackendChoice::Passthrough,
+            block_ms: 128.0 * 1000.0 / 48_000.0,
+            chunk_frames: 128,
+            seconds: 0.16,
+            sample_rate: 48_000,
+            semitones: 0.0,
+            formant_semitones: 0.0,
+        };
+        let result = run_case(&cfg).unwrap();
+        assert_eq!(result.input_frames, 7_680);
+        assert_eq!(result.output_frames, 7_680);
+        assert_eq!(result.latency_measured_frames, Some(128));
+        assert_eq!(result.latency_first_nonzero_frames, Some(128));
+        assert!(result.p50_ms <= result.p99_ms);
+        assert!(result.p99_ms <= result.max_ms);
+    }
+
+    #[test]
+    fn short_backend_is_reported_as_underrun() {
+        let cfg = CaseConfig {
+            choice: BackendChoice::Passthrough,
+            block_ms: 128.0 * 1000.0 / 48_000.0,
+            chunk_frames: 128,
+            seconds: 0.5,
+            sample_rate: 48_000,
+            semitones: 0.0,
+            formant_semitones: 0.0,
+        };
+        let result =
+            run_case_with_backend(&cfg, || Box::new(ShortBackend { block_frames: 128 })).unwrap();
+        assert!(result.underruns > 0, "underruns={}", result.underruns);
     }
 }

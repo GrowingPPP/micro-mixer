@@ -65,19 +65,22 @@ fn main() -> Result<()> {
                 };
                 let result = run_case(&cfg)?;
                 println!(
-                    "{:<12} block={:>5.1}ms chunk={:>4} lib={:>5} adapter={:>5} measured={:?} p50={:>6.3} p99={:>6.3} max={:>6.3} rt={:>6.2}x alloc={} under={}",
+                    "{:<12} block={:>5.1}ms chunk={:>4} lib={:>5} adapter={:>5} measured={:?} first={:?} p50={:>6.3} p99={:>6.3} max={:>6.3} rt={:>6.2}x alloc={} under={} ovf={} nan={}",
                     result.backend,
                     result.block_ms,
                     result.chunk_frames,
                     result.latency_backend_frames,
                     result.latency_adapter_frames,
                     result.latency_measured_frames,
+                    result.latency_first_nonzero_frames,
                     result.p50_ms,
                     result.p99_ms,
                     result.max_ms,
                     result.realtime_factor,
                     result.allocations,
                     result.underruns,
+                    result.adapter_overflows,
+                    result.backend_nan_recoveries,
                 );
                 results.push(result);
             }

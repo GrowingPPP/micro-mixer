@@ -1,4 +1,4 @@
-use crate::backend::Backend;
+use crate::backend::{Backend, BackendDiagnostics};
 use pitch_shift::{RawState, Shifter};
 
 struct OwnedState {
@@ -95,6 +95,12 @@ impl Backend for PitchShiftBackend {
 
     fn reset(&mut self) {
         self.clear_state();
+    }
+
+    fn diagnostics(&self) -> BackendDiagnostics {
+        BackendDiagnostics {
+            nan_recoveries: self.nan_recoveries,
+        }
     }
 }
 
