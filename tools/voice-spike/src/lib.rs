@@ -5,6 +5,7 @@ pub mod backend;
 pub mod bench;
 pub mod metrics;
 pub mod pitch_shift_backend;
+pub mod quality;
 pub mod signal;
 pub mod signalsmith_backend;
 

@@ -96,6 +96,12 @@ fn main() -> Result<()> {
         println!("JSON: {}", path.display());
     }
 
+    let samples = voice_spike::signal::sine_sweep(args.sample_rate, 1.0, 440.0, 440.0);
+    println!(
+        "频率检查：440 Hz -> {:.1} Hz",
+        voice_spike::quality::estimate_frequency(&samples, args.sample_rate)
+    );
+
     if let Some(dir) = args.render {
         let cfg = CaseConfig {
             choice: BackendChoice::Signalsmith,
