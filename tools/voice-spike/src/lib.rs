@@ -2,6 +2,7 @@
 
 pub mod adapter;
 pub mod backend;
+pub mod bench;
 pub mod metrics;
 pub mod pitch_shift_backend;
 pub mod signal;
