@@ -768,7 +768,7 @@ fn config_dto_with_notices(report: app_config::LoadReport) -> serde_json::Value 
     dto
 }
 
-/// 把配置读取问题写入日志；打包后的 App 没有控制台，日志文件是事后排查的唯一线索。
+/// 把配置读取问题写入日志；打包后的 App 没有控制台，日志用于事后排查。
 fn log_config_notices(notices: &[String]) {
     for notice in notices {
         log::warn!("配置: {notice}");

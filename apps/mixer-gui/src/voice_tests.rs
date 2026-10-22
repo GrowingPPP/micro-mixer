@@ -886,7 +886,7 @@ fn 保存发生_panic_时写线程不卡死并报告未保存_之后恢复() {
     let service = VoiceService::new_with_save(&Config::default(), path.clone(), save);
 
     service.set_enabled(true).unwrap();
-    // 修复前这里会永久等待：写线程 panic 退出，`writer_active` 一直为真。
+    // 写线程 panic 后必须释放写入标志，否则后续保存会永久等待。
     let (done_tx, done_rx) = mpsc::channel();
     let waiter = {
         let service = service.clone();
