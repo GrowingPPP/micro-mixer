@@ -272,6 +272,12 @@ impl Server {
             while !worker_shutdown.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((s, _)) => {
+                        // 监听端是非阻塞的，BSD 系系统（含 macOS）上 accept 出来的连接会继承该标志；
+                        // 不改回阻塞，请求稍晚到达就读到「暂时不可用」而被断开，读超时也不会生效。
+                        if let Err(e) = s.set_nonblocking(false) {
+                            log::warn!("遥控连接设为阻塞模式失败: {e}");
+                            continue;
+                        }
                         let shared = shared.clone();
                         // 每个连接一个线程：请求量极小，够用且简单
                         std::thread::spawn(move || {

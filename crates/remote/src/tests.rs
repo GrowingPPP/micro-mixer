@@ -436,6 +436,36 @@ fn 待机时停止请求不依赖播放控制即可到达宿主() {
     assert!(!shared.play(0), "待机停止后不得通过回退控制启动播放");
 }
 
+/// 监听端是非阻塞的；BSD 系系统（含 macOS）上 accept 出来的连接会继承这个标志，
+/// 请求行稍晚到达就读到「暂时不可用」而被直接断开，客户端看到连接被重置。
+/// 手机经 Wi-Fi 发来的请求可能分几个报文到达，必须等待而不是立刻失败。
+#[test]
+fn 请求晚于连接到达时仍能得到完整响应() {
+    let shared = Arc::new(Shared::default());
+    let server = start(shared);
+
+    for delay_ms in [60u64, 150] {
+        let mut socket = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        // 先让服务端接受连接并开始读请求行，再发送请求。
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        // 请求分两段到达：请求行之后的头部更晚。
+        socket.write_all(b"GET /playback HTTP/1.1\r\n").unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        socket
+            .write_all(b"Host: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        socket
+            .read_to_string(&mut response)
+            .unwrap_or_else(|error| panic!("延迟 {delay_ms} ms 的请求被断开: {error}"));
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(json_body(&response), r#"{"available":false}"#);
+    }
+}
+
 #[test]
 fn 待机页轮询播放可用性且活动页不轮询() {
     let parts = engine();
