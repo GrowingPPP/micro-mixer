@@ -378,6 +378,12 @@ fn handle(mut s: TcpStream, shared: &Shared) -> Result<()> {
         _ => {}
     }
 
+    // 播放是否可用；待机页据此轮询，桌面恢复音效后整页刷新出现音效按钮。
+    if path == "/playback" {
+        let body = format!(r#"{{"available":{}}}"#, ctl.is_some());
+        return respond(&mut s, 200, "application/json", &body);
+    }
+
     // 停止不依赖播放路由：待机时播放控制已清除，但停止处理器仍要取消人声试听。
     if path == "/stop" {
         let body = if shared.stop_all() {
@@ -579,6 +585,12 @@ fn control_page(
         ""
     };
     let voice = voice.map(voice_card).unwrap_or_default();
+    // 待机页没有音效按钮；标记让页面脚本轮询 /playback，播放恢复后自动刷新。
+    let standby = if ctl.is_none() {
+        r#" data-standby="1""#
+    } else {
+        ""
+    };
     format!(
         r#"<!doctype html><html lang="zh"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
@@ -624,7 +636,7 @@ input[role=switch]{{width:48px;height:28px;accent-color:#1f6feb}}
   </div>
 </div>
 <h1>音效遥控</h1>
-<div id="s">{status}</div>
+<div id="s"{standby}>{status}</div>
 <div class="grid">{buttons}</div>
 {stop}
 {voice}
@@ -633,6 +645,7 @@ input[role=switch]{{width:48px;height:28px;accent-color:#1f6feb}}
 {script}
 </script></body></html>"#,
         status = status,
+        standby = standby,
         buttons = buttons,
         stop = stop,
         voice = voice,

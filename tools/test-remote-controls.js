@@ -14,7 +14,8 @@ function shippedScript() {
   return fs.readFileSync(path.join(dir, 'control-page.js'), 'utf8');
 }
 
-function harness() {
+function harness({ standby = false } = {}) {
+  const reloads = { count: 0 };
   const messages = { textContent: '' };
   const requests = [];
   const executed = [];
@@ -39,6 +40,8 @@ function harness() {
     venable: { checked: false },
     vpreset: { textContent: '' },
     vbypass: { hidden: true },
+    // 待机页的状态行带 data-standby 标记；活动页没有。
+    ...(standby ? { s: { dataset: { standby: '1' } } } : {}),
   };
   const context = vm.createContext({
     document: {
@@ -47,6 +50,7 @@ function harness() {
       querySelectorAll: selector => selector === '.vp' ? presetButtons : buttons,
       addEventListener: (name, fn) => listeners.set(name, fn),
     },
+    location: { reload: () => { reloads.count++; } },
     setTimeout: () => 0,
     setInterval: (fn, ms) => {
       intervals.push({ fn, ms });
@@ -69,6 +73,7 @@ function harness() {
   });
   return {
     context, buttons, presetButtons, listeners, requests, executed, messages, fields, intervals,
+    reloads,
   };
 }
 
@@ -270,4 +275,38 @@ test('变声命令失败显示原因且不改变开关', async () => {
   await pick;
   assert.equal(h.messages.textContent, '失败：拒绝');
   assert.equal(h.fields.venable.checked, false);
+});
+
+test('待机页轮询播放可用性并在恢复后整页刷新', async () => {
+  const h = harness({ standby: true });
+  const playbackPolls = h.intervals.filter(timer => timer.ms === 2000);
+  assert.equal(playbackPolls.length, 1, '待机页必须每两秒检查一次播放是否恢复');
+
+  const first = h.context.pollPlayback();
+  await flush();
+  assert.deepEqual(h.requests.map(r => r.path), ['/playback']);
+  h.requests[0].finish(true, { available: false });
+  await first;
+  assert.equal(h.reloads.count, 0, '仍在待机时不能刷新');
+
+  const second = h.context.pollPlayback();
+  await flush();
+  h.requests[1].finish(true, { available: true });
+  await second;
+  assert.equal(h.reloads.count, 1, '播放恢复后必须整页刷新出现音效按钮');
+});
+
+test('待机页轮询失败时保持页面等待下一轮', async () => {
+  const h = harness({ standby: true });
+  const poll = h.context.pollPlayback();
+  await flush();
+  h.requests[0].reject(new Error('offline'));
+  await poll;
+  assert.equal(h.reloads.count, 0);
+});
+
+test('活动页不轮询播放可用性', async () => {
+  const h = harness();
+  assert.equal(h.intervals.filter(timer => timer.ms === 2000).length, 0);
+  assert.deepEqual(h.intervals.map(timer => timer.ms), [1000], '活动页只轮询变声状态');
 });

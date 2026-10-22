@@ -98,6 +98,24 @@ async function pollVoice() {
 
 if (typeof setInterval === 'function') setInterval(pollVoice, 1000);
 
+// 待机页没有音效按钮。桌面恢复音效后页面要整体刷新才会出现按钮，所以待机页轮询
+// 播放是否可用；变声状态由上面的轮询单独维护，不受这次刷新影响。
+async function pollPlayback() {
+  try {
+    const response = await fetch('/playback');
+    const result = await response.json();
+    if (result.available) location.reload();
+  } catch (error) {
+    // 保持待机页，下一轮再试。
+  }
+}
+
+const standbyMarker = document.getElementById('s');
+if (typeof setInterval === 'function' && standbyMarker && standbyMarker.dataset
+    && standbyMarker.dataset.standby) {
+  setInterval(pollPlayback, 2000);
+}
+
 document.addEventListener('keydown', event => {
   if (event.key >= '1' && event.key <= '9') {
     const button = document.querySelectorAll('.b')[+event.key - 1];

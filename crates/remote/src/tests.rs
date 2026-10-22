@@ -437,6 +437,67 @@ fn 待机时停止请求不依赖播放控制即可到达宿主() {
 }
 
 #[test]
+fn 待机页轮询播放可用性且活动页不轮询() {
+    let parts = engine();
+    let shared = Arc::new(Shared::default());
+    shared.set_voice_route(test_voice_route(
+        Arc::new(Mutex::new(TestVoiceState::new())),
+        Arc::new(Mutex::new(Vec::new())),
+    ));
+    let server = start(shared.clone());
+
+    // 待机：没有播放控制，页面仍可操作变声，但没有音效按钮，需要自己发现播放恢复。
+    let standby = get(server.port, "/");
+    assert!(standby.contains("data-standby"), "待机页必须带待机标记");
+    assert!(standby.contains("音频待机"), "{standby}");
+    assert!(
+        standby.contains("pollPlayback"),
+        "待机页必须携带轮询播放可用性的脚本"
+    );
+    assert_eq!(
+        json_body(&get(server.port, "/playback")),
+        r#"{"available":false}"#
+    );
+
+    // 桌面恢复音效：同一个路由开始报告可用，待机页据此整页刷新。
+    shared.set(parts.control, vec!["tone".into()]);
+    assert_eq!(
+        json_body(&get(server.port, "/playback")),
+        r#"{"available":true}"#
+    );
+    let active = get(server.port, "/");
+    assert!(
+        !active.contains("data-standby"),
+        "活动页有音效按钮，不应轮询播放可用性"
+    );
+    assert!(active.contains("tone"));
+
+    // 再次待机：路由回到不可用。
+    shared.clear_playback();
+    assert_eq!(
+        json_body(&get(server.port, "/playback")),
+        r#"{"available":false}"#
+    );
+    assert!(get(server.port, "/").contains("data-standby"));
+}
+
+#[test]
+fn 未启动页保持两秒整页刷新() {
+    let shared = Arc::new(Shared::default());
+    let server = start(shared);
+    let page = get(server.port, "/");
+    assert!(page.contains("音频未启动"));
+    assert!(
+        page.contains("location.reload()") && page.contains("2000"),
+        "没有任何路由时仍按原行为每两秒刷新：{page}"
+    );
+    assert_eq!(
+        json_body(&get(server.port, "/playback")),
+        r#"{"available":false}"#
+    );
+}
+
+#[test]
 fn phone_http_page_and_routed_switch_stop_replay_use_actual_single_sound_pcm() {
     let format = StreamFormat::stereo(48_000);
     let mut parts = EngineParts::build(
