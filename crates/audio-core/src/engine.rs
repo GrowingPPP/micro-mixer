@@ -19,7 +19,9 @@ use crate::decode::DecodedAudio;
 use crate::device::StreamFormat;
 use crate::limiter::Limiter;
 use crate::resample::{DriftController, LinearResampler};
-use crate::voice::preview::{PreviewSnapshot, VoicePreviewBuffer, VoicePreviewSource};
+use crate::voice::preview::{
+    PreviewSnapshot, PreviewWrite, VoicePreviewBuffer, VoicePreviewSource,
+};
 use crate::voice::{VoiceChain, VoiceControl, VoicePhase, VoiceRuntime, VoiceSetup};
 
 // ─────────────────────────────────────────── 无锁原子量
@@ -657,11 +659,15 @@ impl VoiceTee {
                     let mut full = false;
                     if let Some(preview) = self.preview.as_ref() {
                         for &sample in &out[skip..wet_frames] {
-                            if !preview.push(preview_generation, sample) {
-                                break;
+                            match preview.push(preview_generation, sample) {
+                                PreviewWrite::Written => {}
+                                PreviewWrite::Full => {
+                                    full = true;
+                                    break;
+                                }
+                                PreviewWrite::Rejected => break,
                             }
                         }
-                        full = preview.is_full();
                     }
                     if full {
                         self.finish_preview(preview_generation);
@@ -1400,12 +1406,18 @@ impl RenderProcessor {
             // 试听在路径限幅之后、混入音效之前取左声道；来源与代次由运行时发布。
             if let (Some(buffer), Some(snapshot)) = (self.preview.as_ref(), preview) {
                 if !snapshot.finished && snapshot.source == VoicePreviewSource::Render {
+                    let mut full = false;
                     for frame in self.path_voice[..used].as_chunks::<2>().0 {
-                        if !buffer.push(snapshot.generation, frame[0]) {
-                            break;
+                        match buffer.push(snapshot.generation, frame[0]) {
+                            PreviewWrite::Written => {}
+                            PreviewWrite::Full => {
+                                full = true;
+                                break;
+                            }
+                            PreviewWrite::Rejected => break,
                         }
                     }
-                    if buffer.is_full() {
+                    if full {
                         if let Some(runtime) = self.voice_runtime.as_ref() {
                             runtime.finish_preview(snapshot.generation);
                         }
@@ -4597,14 +4609,24 @@ mod tests {
         }
     }
 
-    fn 驱动试听(夹具: &mut 试听夹具, 块数: usize) -> Vec<f32> {
+    /// 逐块驱动并收集输出左声道，用于检查录制期间正式转发是否连续。
+    fn 驱动试听采样(夹具: &mut 试听夹具, 块数: usize) -> Vec<f32> {
         let input = vec![0.1f32; 变声块帧];
         let mut out = vec![0.0f32; 变声块帧 * 2];
+        let mut left = Vec::with_capacity(块数 * 变声块帧);
         for _ in 0..块数 {
             夹具.engine.capture.process(&input);
             夹具.engine.render.process(&mut out);
+            for frame in out.as_chunks::<2>().0 {
+                left.push(frame[0]);
+            }
         }
-        out
+        left
+    }
+
+    fn 驱动试听(夹具: &mut 试听夹具, 块数: usize) -> Vec<f32> {
+        let left = 驱动试听采样(夹具, 块数);
+        left[left.len().saturating_sub(变声块帧)..].to_vec()
     }
 
     #[test]
@@ -4614,21 +4636,23 @@ mod tests {
         夹具.engine.control.sfx_gain_db.set(-100.0);
         assert_eq!(夹具.runtime.phase(), VoicePhase::Off);
 
+        // 先让正式转发进入稳态，再逐块检查整个录制区间。
+        驱动试听(&mut 夹具, 20);
         let start = 夹具.preview.start().expect("关闭状态应开始采集试听");
         assert_eq!(start.source, VoicePreviewSource::Capture);
-        let out = 驱动试听(&mut 夹具, 320);
+        let 输出 = 驱动试听采样(&mut 夹具, 320);
 
         assert_eq!(
             夹具.runtime.phase(),
             VoicePhase::Off,
             "试听不得改变变声阶段"
         );
-        let left = 左声道(&out);
+        assert_eq!(输出.len(), 320 * 变声块帧);
         assert!(
-            (left[变声块帧 - 1] - 0.1).abs() < 1e-3,
-            "环形缓冲输出必须保持干声，实际 {}",
-            left[变声块帧 - 1]
+            输出.iter().all(|sample| (*sample - 0.1).abs() < 1e-3),
+            "录制期间环形缓冲输出必须保持干声"
         );
+        assert!(最大相邻步进(&输出) < 1e-3, "录制期间正式输出不得出现突变");
         assert!(夹具.preview.is_finished());
         let clip = 夹具.preview.take().expect("写满三秒后应冻结");
         assert_eq!(clip.samples.len(), 48_000 * 3);
@@ -4667,14 +4691,17 @@ mod tests {
             pitch_semitones: 5.0,
             ..VoiceParams::neutral()
         });
+        驱动试听(&mut 夹具, 20);
         let start = 夹具.preview.start().expect("旁路后应开始采集试听");
         assert_eq!(start.source, VoicePreviewSource::Capture);
-        let out = 驱动试听(&mut 夹具, 320);
-        let left = 左声道(&out);
+        let 输出 = 驱动试听采样(&mut 夹具, 320);
         assert!(
-            (left[变声块帧 - 1] - 0.1).abs() < 1e-3,
-            "旁路期间输出必须保持原声，实际 {}",
-            left[变声块帧 - 1]
+            输出.iter().all(|sample| (*sample - 0.1).abs() < 1e-3),
+            "旁路期间输出必须保持原声"
+        );
+        assert!(
+            最大相邻步进(&输出) < 1e-3,
+            "旁路试听期间正式输出不得出现突变"
         );
         let clip = 夹具.preview.take().expect("写满三秒后应冻结");
         assert!(
@@ -4731,23 +4758,84 @@ mod tests {
         let mut 夹具 = 构造试听夹具(2.0);
         夹具.engine.control.mic_gain_db.set(0.0);
         夹具.engine.control.sfx_gain_db.set(-100.0);
+        驱动试听(&mut 夹具, 20);
+
         let start = 夹具.preview.start().expect("关闭状态应开始采集试听");
         assert_eq!(start.source, VoicePreviewSource::Capture);
-
-        驱动试听(&mut 夹具, 20);
+        let 取消前 = 驱动试听采样(&mut 夹具, 20);
+        assert!(
+            取消前.iter().all(|sample| (*sample - 0.1).abs() < 1e-3),
+            "取消前录制期间正式转发必须保持干声"
+        );
+        assert!(
+            最大相邻步进(&取消前) < 1e-3,
+            "取消前录制期间正式输出不得出现突变"
+        );
         assert!(夹具.buffer.write_pos() > 0, "取消前应已记录部分样本");
         夹具.preview.stop();
         assert_eq!(夹具.buffer.write_pos(), 0, "取消必须清空记录区");
         assert!(!夹具.preview.is_finished());
         assert!(夹具.preview.take().is_none(), "取消后不得返回半段");
 
-        let out = 驱动试听(&mut 夹具, 8);
-        let left = 左声道(&out);
+        let 取消后 = 驱动试听采样(&mut 夹具, 8);
         assert!(
-            left.iter().all(|sample| (*sample - 0.1).abs() < 1e-3),
+            取消后.iter().all(|sample| (*sample - 0.1).abs() < 1e-3),
             "取消试听不得中断正式转发"
         );
+        assert!(最大相邻步进(&取消后) < 1e-3, "取消后正式输出不得出现突变");
         assert_eq!(夹具.runtime.phase(), VoicePhase::Off);
+    }
+
+    #[test]
+    fn 试听新代次未归零时旧满记录不得冻结新记录() {
+        let mut 夹具 = 构造试听夹具(2.0);
+        夹具.engine.control.mic_gain_db.set(0.0);
+        夹具.engine.control.sfx_gain_db.set(-100.0);
+        驱动试听(&mut 夹具, 20);
+
+        let start = 夹具.preview.start().expect("关闭状态应开始采集试听");
+        assert_eq!(start.source, VoicePreviewSource::Capture);
+        for _ in 0..320 {
+            驱动试听(&mut 夹具, 1);
+            if 夹具.preview.is_finished() {
+                break;
+            }
+        }
+        assert!(夹具.preview.is_finished(), "三秒后记录应冻结");
+
+        // 冻结后未取走时切换预设取消旧记录；记录区仍保留旧代次满位。
+        夹具.control.set_params(VoiceParams {
+            pitch_semitones: 4.0,
+            ..VoiceParams::neutral()
+        });
+        assert!(!夹具.preview.is_finished());
+
+        // 控制线程已发布新代次、尚未归零记录区：音频回调不得冻结新记录。
+        let new_generation = 夹具
+            .runtime
+            .start_preview(VoicePreviewSource::Capture)
+            .expect("取消后应能发布新试听代次");
+        // 第一块预热链，第二块才会尝试写入；两次都在记录区归零之前。
+        驱动试听(&mut 夹具, 2);
+        assert!(!夹具.preview.is_finished(), "旧满位不得让新代次提前完成");
+        assert!(夹具.preview.take().is_none(), "新记录尚未开始，不得取回");
+        assert_eq!(
+            夹具.buffer.write_pos(),
+            夹具.buffer.capacity(),
+            "被拒绝的新代次写入不得改变旧记录区"
+        );
+
+        // 控制线程完成归零后，新记录正常写满并可取回。
+        夹具.buffer.begin(new_generation);
+        for _ in 0..320 {
+            驱动试听(&mut 夹具, 1);
+            if 夹具.preview.is_finished() {
+                break;
+            }
+        }
+        assert!(夹具.preview.is_finished(), "新记录应能正常写满");
+        let clip = 夹具.preview.take().expect("新记录应可回放");
+        assert_eq!(clip.samples.len(), 48_000 * 3);
     }
 
     #[test]

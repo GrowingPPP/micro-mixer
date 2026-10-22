@@ -4,7 +4,7 @@
 //! 原子写指针，不分配、不加锁、不做 IO。控制线程通过 [`VoicePreviewControl`]
 //! 启动、取消与取回片段，音频侧与渲染侧分别按代次校验写入。
 
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::{VoiceControl, VoicePhase, VoiceRuntime};
@@ -59,17 +59,30 @@ pub(crate) struct PreviewSnapshot {
     pub finished: bool,
 }
 
+/// 音频回调写入记录区的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreviewWrite {
+    /// 样本已写入，记录区尚未写满。
+    Written,
+    /// 记录区已写满；本次调用可能刚写入最后一个样本，也可能此前已满。
+    Full,
+    /// 代次不匹配或记录区已被控制线程复位，本次写入不得推进写指针。
+    Rejected,
+}
+
 /// 预分配的单声道试听记录区。
 ///
-/// 写入方只能是采集或渲染回调中的一个。样本写入数组后以释放语义推进原子
-/// 写指针；控制线程只在记录冻结后按该指针复制样本。
+/// 写入方只能是采集或渲染回调中的一个。代次与写指针打包在同一个原子量中：
+/// 控制线程用整字存储开始或复位记录，音频回调以比较交换推进位置，失败的
+/// 写入不会污染新记录的写指针。控制线程只在记录冻结后复制样本。
 pub struct VoicePreviewBuffer {
     /// 样本按位存储在预分配的原子槽中；写入方无需可变借用即可推进。
     samples: Vec<AtomicU32>,
     sample_rate: u32,
-    write_pos: AtomicUsize,
-    /// 允许写入的代次；0 表示没有音频侧写入者。
-    generation: AtomicU64,
+    /// 高位为代次，低 `pos_bits` 位为写位置。
+    state: AtomicU64,
+    pos_bits: u32,
+    generation_mask: u64,
 }
 
 impl VoicePreviewBuffer {
@@ -83,12 +96,32 @@ impl VoicePreviewBuffer {
         } else {
             (sample_rate as f64 * seconds as f64).round() as usize
         };
+        // 位置字段要能表示写满后的 position == capacity，因此按容量位宽取字段。
+        let pos_bits = if capacity == 0 {
+            1
+        } else {
+            64 - (capacity as u64).leading_zeros()
+        };
+        assert!(pos_bits < 64, "试听记录区容量超出原子编码上限");
+        let generation_bits = 64 - pos_bits;
+        let generation_mask = (1u64 << generation_bits) - 1;
         Arc::new(Self {
             samples: (0..capacity).map(|_| AtomicU32::new(0)).collect(),
             sample_rate,
-            write_pos: AtomicUsize::new(0),
-            generation: AtomicU64::new(0),
+            state: AtomicU64::new(0),
+            pos_bits,
+            generation_mask,
         })
+    }
+
+    fn encode(&self, generation: u64, position: usize) -> u64 {
+        ((generation & self.generation_mask) << self.pos_bits) | position as u64
+    }
+
+    fn decode(&self, raw: u64) -> (u64, usize) {
+        let position_mask = (1u64 << self.pos_bits) - 1;
+        let generation = (raw >> self.pos_bits) & self.generation_mask;
+        (generation, (raw & position_mask) as usize)
     }
 
     /// 输出采样率。
@@ -103,49 +136,53 @@ impl VoicePreviewBuffer {
 
     /// 已写入的样本数。
     pub(crate) fn write_pos(&self) -> usize {
-        self.write_pos.load(Ordering::Acquire)
+        self.decode(self.state.load(Ordering::Acquire)).1
     }
 
-    /// 记录区是否已经写满。
-    pub(crate) fn is_full(&self) -> bool {
-        self.write_pos() >= self.samples.len()
-    }
-
-    /// 开始一次新代次的写入；写指针归零。
+    /// 开始一次新代次的写入；代次与零位置整字发布。
     ///
-    /// 先归零指针再发布代次，音频侧看到新代次时不会沿用旧位置。
+    /// 单个原子存储消除了“新代次已可见、旧写指针尚未归零”的中间状态。
     pub(crate) fn begin(&self, generation: u64) {
-        self.write_pos.store(0, Ordering::Release);
-        self.generation.store(generation, Ordering::Release);
+        debug_assert!(generation != 0, "试听代次 0 保留给未激活状态");
+        self.state
+            .store(self.encode(generation, 0), Ordering::Release);
     }
 
-    /// 音频回调写入一个样本；代次不匹配或已满时丢弃。
+    /// 音频回调写入一个样本。
     ///
-    /// 单次试听只有一个音频侧写入者，因此写指针无需比较交换。取消发生在
-    /// 两次代次校验之间时，最多丢弃本次样本而不会扩大记录区。
-    pub(crate) fn push(&self, generation: u64, sample: f32) -> bool {
-        if generation == 0 || self.generation.load(Ordering::Acquire) != generation {
-            return false;
+    /// 只有打包状态仍与读取时一致才能推进位置；控制线程的复位或新代次会
+    /// 让比较交换失败，迟到的样本不会抬高新记录的写指针。
+    pub(crate) fn push(&self, generation: u64, sample: f32) -> PreviewWrite {
+        let expected = generation & self.generation_mask;
+        let state = self.state.load(Ordering::Acquire);
+        let (current, position) = self.decode(state);
+        if expected == 0 || current != expected {
+            return PreviewWrite::Rejected;
         }
-        let position = self.write_pos.load(Ordering::Relaxed);
         if position >= self.samples.len() {
-            return false;
+            return PreviewWrite::Full;
         }
-        if self.generation.load(Ordering::Acquire) != generation {
-            return false;
-        }
-        // 数据写入使用宽松序，由随后的释放写指针发布。
+        // 样本先写入，再由成功的比较交换发布位置；交换失败时最多留下一个迟到样本。
         self.samples[position].store(sample.to_bits(), Ordering::Relaxed);
-        self.write_pos.store(position + 1, Ordering::Release);
-        true
+        if self
+            .state
+            .compare_exchange(state, state + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return PreviewWrite::Rejected;
+        }
+        if position + 1 >= self.samples.len() {
+            PreviewWrite::Full
+        } else {
+            PreviewWrite::Written
+        }
     }
 
     /// 停止音频侧写入并丢弃本次内容。
     ///
-    /// 只收回代次与写指针；样本数组保持预分配，供下一次试听复用。
+    /// 只收回打包状态；样本数组保持预分配，供下一次试听复用。
     pub(crate) fn reset(&self) {
-        self.generation.store(0, Ordering::Release);
-        self.write_pos.store(0, Ordering::Release);
+        self.state.store(0, Ordering::Release);
     }
 
     /// 在控制线程复制已冻结的样本。
@@ -275,12 +312,24 @@ mod tests {
 
             buffer.begin(1);
             for index in 0..容量 {
-                assert!(buffer.push(1, index as f32), "写满前应接受样本");
+                let expected = if index + 1 == 容量 {
+                    PreviewWrite::Full
+                } else {
+                    PreviewWrite::Written
+                };
+                assert_eq!(buffer.push(1, index as f32), expected, "写满前应接受样本");
             }
             assert_eq!(buffer.write_pos(), 容量);
-            assert!(buffer.is_full());
-            assert!(!buffer.push(1, 1.0), "写满后不得继续写入");
-            assert!(!buffer.push(1, 2.0), "写满后不得扩大容量");
+            assert_eq!(
+                buffer.push(1, 1.0),
+                PreviewWrite::Full,
+                "写满后不得继续写入"
+            );
+            assert_eq!(
+                buffer.push(1, 2.0),
+                PreviewWrite::Full,
+                "写满后不得扩大容量"
+            );
             assert_eq!(buffer.write_pos(), 容量, "写满后指针不得前进");
             assert_eq!(buffer.capacity(), 容量, "容量固定为三秒");
         }
@@ -298,7 +347,7 @@ mod tests {
             Err(PreviewError::AlreadyActive),
             "同一时间只允许一个记录"
         );
-        assert!(buffer.push(start.generation, 0.5));
+        assert_eq!(buffer.push(start.generation, 0.5), PreviewWrite::Written);
 
         control.request_enable();
         assert_eq!(control.phase(), VoicePhase::Warmup, "启用后进入预热");
@@ -362,15 +411,21 @@ mod tests {
         let start = preview.start().expect("关闭状态应开始采集试听");
         let 容量 = buffer.capacity();
         for index in 0..容量 {
-            assert!(buffer.push(start.generation, index as f32));
+            let expected = if index + 1 == 容量 {
+                PreviewWrite::Full
+            } else {
+                PreviewWrite::Written
+            };
+            assert_eq!(buffer.push(start.generation, index as f32), expected);
         }
         assert!(runtime.finish_preview(start.generation), "写满应冻结记录");
         assert!(preview.is_finished());
 
         let 冻结位置 = buffer.write_pos();
         for _ in 0..16 {
-            assert!(
-                !buffer.push(start.generation, -1.0),
+            assert_eq!(
+                buffer.push(start.generation, -1.0),
+                PreviewWrite::Full,
                 "冻结后音频线程不得再写入"
             );
         }
@@ -401,13 +456,59 @@ mod tests {
     fn 旧代次试听写入被丢弃() {
         let buffer = VoicePreviewBuffer::new(采样率, 3.0);
         buffer.begin(1);
-        assert!(buffer.push(1, 0.25));
+        assert_eq!(buffer.push(1, 0.25), PreviewWrite::Written);
         assert_eq!(buffer.write_pos(), 1);
 
         buffer.begin(2);
-        assert!(!buffer.push(1, 0.75), "旧代次写入必须丢弃");
+        assert_eq!(
+            buffer.push(1, 0.75),
+            PreviewWrite::Rejected,
+            "旧代次写入必须丢弃"
+        );
         assert_eq!(buffer.write_pos(), 0, "旧代次不得推进新记录");
-        assert!(buffer.push(2, 0.5));
+        assert_eq!(buffer.push(2, 0.5), PreviewWrite::Written);
         assert_eq!(buffer.snapshot(1), vec![0.5], "只保留新代次样本");
+    }
+
+    #[test]
+    fn 试听新代次未归零前旧满记录不得接受写入() {
+        let (runtime, control, buffer, preview) = 创建控制();
+        let start = preview.start().expect("关闭状态应开始采集试听");
+        let 容量 = buffer.capacity();
+        for index in 0..容量 {
+            let expected = if index + 1 == 容量 {
+                PreviewWrite::Full
+            } else {
+                PreviewWrite::Written
+            };
+            assert_eq!(buffer.push(start.generation, index as f32), expected);
+        }
+        assert!(runtime.finish_preview(start.generation));
+        assert!(preview.is_finished());
+
+        // 冻结后未取走时切换预设取消旧记录；记录区仍保留旧代次的满位。
+        control.set_params(VoiceParams {
+            pitch_semitones: 4.0,
+            ..VoiceParams::neutral()
+        });
+        assert!(!preview.is_finished());
+
+        // 控制线程已发布新代次、尚未归零记录区：旧满位不得接受或冻结新记录。
+        let new_generation = runtime
+            .start_preview(VoicePreviewSource::Capture)
+            .expect("取消后应能发布新试听代次");
+        assert_eq!(
+            buffer.push(new_generation, 1.0),
+            PreviewWrite::Rejected,
+            "旧满记录区不得接受新代次写入"
+        );
+        assert_eq!(buffer.write_pos(), 容量, "旧代次位置不得被新代次推进");
+        assert!(!preview.is_finished(), "新记录不得因旧满位提前冻结");
+        assert!(preview.take().is_none(), "尚未开始的新记录不可取回");
+
+        // 归零后新记录从零开始。
+        buffer.begin(new_generation);
+        assert_eq!(buffer.push(new_generation, 1.0), PreviewWrite::Written);
+        assert!(!preview.is_finished());
     }
 }
