@@ -132,6 +132,7 @@ fn fixture() -> (AudioHost, FakeBackend) {
                 format,
                 slots: vec![slot],
             }),
+            voice: None,
         },
         backend.clone(),
         backend.clone(),

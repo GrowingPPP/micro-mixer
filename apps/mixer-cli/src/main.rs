@@ -842,6 +842,7 @@ fn run(b: &CpalBackend, options: RunOptions) -> Result<()> {
             mic_gain_db: mic_gain,
             sfx_gain_db: sfx_gain,
             monitor: monitor_options,
+            voice: None,
         },
         dump,
     )?;

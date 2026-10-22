@@ -12,5 +12,10 @@ anyhow.workspace = true
 log.workspace = true
 rtrb.workspace = true
 
+[features]
+default = []
+# C++ 变声后端由 audio-core 提供；关闭时自定义后端仍可接入会话。
+voice = ["audio-core/voice"]
+
 [lints]
 workspace = true

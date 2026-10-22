@@ -3,7 +3,7 @@
 use anyhow::{ensure, Result};
 use signalsmith_stretch::Stretch;
 
-use super::{VoiceBackend, VoiceParams};
+use super::{VoiceBackend, VoiceBackendFactory, VoiceParams};
 
 /// 基于 Signalsmith Stretch 的单声道变声后端。
 pub struct SignalsmithBackend {
@@ -40,6 +40,14 @@ impl SignalsmithBackend {
     pub fn block_frames(&self) -> usize {
         self.block_frames
     }
+}
+
+/// 创建按输出采样率构造 Signalsmith 后端的工厂。
+///
+/// 块时长在工厂创建时固定，采样率在会话构造时传入；工厂可被多次调用，
+/// 每次返回独立的后端实例，供主引擎与重建会话各自持有。
+pub fn backend_factory(block_ms: f32) -> VoiceBackendFactory {
+    Box::new(move |sample_rate| Ok(Box::new(SignalsmithBackend::new(sample_rate, block_ms)?)))
 }
 
 impl VoiceBackend for SignalsmithBackend {
@@ -108,6 +116,13 @@ mod tests {
         assert_eq!(wet.len(), input.len());
         assert!(wet.iter().all(|sample| sample.is_finite()));
         assert!(wet.iter().any(|sample| sample.abs() > 1e-4));
+        assert!(backend.latency_frames() > 0);
+    }
+
+    #[test]
+    fn 工厂按输出采样率创建后端() {
+        let factory = backend_factory(BLOCK_MS);
+        let backend = factory(SAMPLE_RATE).expect("按输出采样率创建后端");
         assert!(backend.latency_frames() > 0);
     }
 

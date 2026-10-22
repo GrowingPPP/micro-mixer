@@ -12,7 +12,18 @@ use anyhow::{Context, Result};
 use audio_core::decode::decode_file;
 use audio_core::device::{AudioBackend, DeviceId, DeviceInfo, Direction, StreamFormat};
 use audio_core::engine::{EngineParts, EngineStats, PlaybackControl, RenderProcessor, SfxSlot};
+use audio_core::voice::{VoiceControl, VoiceParams, VoiceSetup};
 use backend_cpal::{CpalBackend, StreamHealth};
+
+pub use audio_core::voice::{VoiceBackend, VoiceBackendFactory};
+
+/// 创建按输出采样率构造 Signalsmith 后端的工厂。
+///
+/// 只在启用 `voice` 特性时提供；自定义后端不受此限制，可在默认构建中接入。
+#[cfg(feature = "voice")]
+pub fn signalsmith_voice_backend_factory(block_ms: f32) -> VoiceBackendFactory {
+    audio_core::voice::backend_factory(block_ms)
+}
 
 pub fn resolve_device(
     devices: &[DeviceInfo],
@@ -302,6 +313,18 @@ pub struct MonitorOptions {
     pub format: StreamFormat,
     pub slots: Vec<SfxSlot>,
 }
+
+/// 会话启动时的人声配置。
+///
+/// `enabled` 只决定初始阶段；关闭时仍构建人声链，供后续启用与试听复用。
+/// `backend` 在会话构造时按输出采样率调用一次，失败时整个会话不会建立。
+pub struct VoiceOptions {
+    pub enabled: bool,
+    pub params: VoiceParams,
+    pub block_ms: f32,
+    pub backend: VoiceBackendFactory,
+}
+
 pub struct SessionOptions {
     pub input: DeviceId,
     pub output: DeviceId,
@@ -312,6 +335,7 @@ pub struct SessionOptions {
     pub mic_gain_db: f32,
     pub sfx_gain_db: f32,
     pub monitor: Option<MonitorOptions>,
+    pub voice: Option<VoiceOptions>,
 }
 
 /// One owner for the primary streams and the persistent monitor stream.
@@ -322,6 +346,7 @@ pub struct Session {
     pub health: Arc<StreamHealth>,
     pub monitor_health: Arc<StreamHealth>,
     pub dump_dropped_samples: Arc<AtomicU64>,
+    voice_control: Option<VoiceControl>,
     shutdown: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -428,6 +453,14 @@ impl DumpDrain {
 }
 
 impl Session {
+    /// 变声控制句柄；会话没有变声配置时为 `None`。
+    ///
+    /// 句柄可克隆。会话释放后仍能安全读取状态，但旧句柄只影响它自己的
+    /// 运行状态，不会改变之后建立的新会话。
+    pub fn voice_control(&self) -> Option<VoiceControl> {
+        self.voice_control.clone()
+    }
+
     pub fn open(options: SessionOptions) -> Result<Self> {
         Self::open_with_dump(options, None)
     }
@@ -460,7 +493,7 @@ impl Session {
         )
     }
     fn open_backends<B: AudioBackend + 'static>(
-        options: SessionOptions,
+        mut options: SessionOptions,
         backend: B,
         monitor_backend: B,
         health: Arc<StreamHealth>,
@@ -468,11 +501,27 @@ impl Session {
         dump: Option<DumpRequest>,
         startup_timeout: Duration,
     ) -> Result<Self> {
-        let parts = EngineParts::build(
+        // 后端在建立任何流之前创建；失败时直接返回，不留下半套会话。
+        let voice = match options.voice.take() {
+            Some(voice) => {
+                let backend = (voice.backend)(options.output_format.sample_rate)
+                    .context("创建变声后端失败")?;
+                let control = VoiceControl::new(voice.params);
+                if voice.enabled {
+                    control.request_enable();
+                }
+                Some(VoiceSetup::with_control(control, voice.block_ms, backend))
+            }
+            None => None,
+        };
+        let voice_control = voice.as_ref().map(|setup| setup.control.clone());
+        // 人声链只进入主输出；监听仍使用无变声引擎，保持仅音效。
+        let parts = EngineParts::build_with_voice(
             options.input_format,
             options.output_format,
             options.slots,
             options.buffer_ms,
+            voice,
         );
         let stats = parts.stats.clone();
         let monitor_parts = options.monitor.as_ref().map(|m| {
@@ -652,6 +701,7 @@ impl Session {
                 health,
                 monitor_health,
                 dump_dropped_samples,
+                voice_control,
                 shutdown,
                 thread: Some(thread),
             }),

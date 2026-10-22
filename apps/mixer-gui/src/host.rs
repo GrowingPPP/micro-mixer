@@ -882,6 +882,7 @@ impl AudioHost {
             mic_gain_db: cfg.mic_gain_db,
             sfx_gain_db: cfg.sfx_gain_db,
             monitor,
+            voice: None,
         })?;
         let playback = session.playback.clone();
         let control = playback.control.clone();
