@@ -38,6 +38,7 @@ jobs:
       - name: Benchmark
         working-directory: tools/voice-spike
         shell: bash
+        timeout-minutes: 20
         run: >
           cargo run --release --
           --seconds 30
@@ -46,7 +47,19 @@ jobs:
           --backend all
           --json out/${{ matrix.name }}.json
           --render out/${{ matrix.name }}
+      - name: Soak
+        working-directory: tools/voice-spike
+        shell: bash
+        timeout-minutes: 20
+        run: >
+          cargo run --release --
+          --seconds 600
+          --blocks 10
+          --chunks 128,512
+          --backend signalsmith
+          --json out/${{ matrix.name }}-soak.json
       - uses: actions/upload-artifact@v4
         with:
           name: voice-spike-${{ matrix.name }}
           path: tools/voice-spike/out/
+          if-no-files-found: error
