@@ -57,12 +57,15 @@ fn unpack(raw: u64) -> (u64, VoicePhase) {
 #[derive(Debug)]
 pub struct VoiceRuntime {
     state: AtomicU64,
+    /// 渲染侧完成路径限幅影子预热的代次（存 generation + 1，0 表示未就绪）。
+    render_ready: AtomicU64,
 }
 
 impl Default for VoiceRuntime {
     fn default() -> Self {
         Self {
             state: AtomicU64::new(pack(0, VoicePhase::Off)),
+            render_ready: AtomicU64::new(0),
         }
     }
 }
@@ -124,6 +127,30 @@ impl VoiceRuntime {
         }
     }
 
+    /// 会话重建时强制丢弃已提交的湿声或淡出状态，重新进入预热。
+    ///
+    /// 新会话的人声链是全新实例，不能沿用旧链已经提交的 Wet/FadingOut；
+    /// 已处于 Off 或 Warmup 时保持不变。只在构造线程调用。
+    pub(crate) fn force_warmup(&self) {
+        loop {
+            let raw = self.state.load(Ordering::Acquire);
+            let (generation, phase) = unpack(raw);
+            match phase {
+                VoicePhase::Off | VoicePhase::Warmup => return,
+                VoicePhase::Wet | VoicePhase::FadingOut => {
+                    let next = pack(generation + 1, VoicePhase::Warmup);
+                    if self
+                        .state
+                        .compare_exchange_weak(raw, next, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     /// 当前阶段。
     pub fn phase(&self) -> VoicePhase {
         unpack(self.state.load(Ordering::Acquire)).1
@@ -140,8 +167,20 @@ impl VoiceRuntime {
         (phase, generation)
     }
 
-    /// 只允许发起预热的那一代把阶段推进到湿声。
+    /// 渲染侧报告：本代次的路径限幅影子预热已完成。
+    ///
+    /// 采集侧只有在收到同一代次的确认后才允许提交湿声，保证切环前
+    /// 两条路径限幅的延迟线已经填满。
+    pub(crate) fn mark_render_ready(&self, generation: u64) {
+        self.render_ready
+            .store(generation.wrapping_add(1), Ordering::Release);
+    }
+
+    /// 只允许发起预热且渲染侧已就绪的那一代把阶段推进到湿声。
     pub(crate) fn finish_warmup(&self, generation: u64) -> bool {
+        if self.render_ready.load(Ordering::Acquire) != generation.wrapping_add(1) {
+            return false;
+        }
         let expected = pack(generation, VoicePhase::Warmup);
         let next = pack(generation, VoicePhase::Wet);
         self.state
@@ -206,6 +245,7 @@ mod tests {
         runtime.request_enable();
         assert_eq!(runtime.generation(), warming, "重复启用不应推进代次");
 
+        runtime.mark_render_ready(warming);
         assert!(runtime.finish_warmup(warming));
         assert_eq!(runtime.phase(), VoicePhase::Wet);
 
@@ -219,6 +259,22 @@ mod tests {
     }
 
     #[test]
+    fn 渲染侧未就绪时不得提交湿声() {
+        let runtime = VoiceRuntime::new();
+        runtime.request_enable();
+        let warming = runtime.generation();
+        assert!(
+            !runtime.finish_warmup(warming),
+            "没有路径限幅预热不得切湿声"
+        );
+        assert_eq!(runtime.phase(), VoicePhase::Warmup);
+
+        runtime.mark_render_ready(warming);
+        assert!(runtime.finish_warmup(warming));
+        assert_eq!(runtime.phase(), VoicePhase::Wet);
+    }
+
+    #[test]
     fn 旧代次不能完成新一次预热() {
         let runtime = VoiceRuntime::new();
         runtime.request_enable();
@@ -227,8 +283,10 @@ mod tests {
         runtime.request_enable();
         let current = runtime.generation();
 
+        runtime.mark_render_ready(stale);
         assert!(!runtime.finish_warmup(stale), "旧代次不得切到湿声");
         assert_eq!(runtime.phase(), VoicePhase::Warmup);
+        runtime.mark_render_ready(current);
         assert!(runtime.finish_warmup(current));
         assert_eq!(runtime.phase(), VoicePhase::Wet);
     }
@@ -238,6 +296,7 @@ mod tests {
         let runtime = VoiceRuntime::new();
         runtime.request_enable();
         let warming = runtime.generation();
+        runtime.mark_render_ready(warming);
         assert!(runtime.finish_warmup(warming));
         runtime.request_disable();
         assert_eq!(runtime.phase(), VoicePhase::FadingOut);
@@ -253,10 +312,39 @@ mod tests {
     }
 
     #[test]
+    fn 会话重建时已提交状态必须重新预热() {
+        let runtime = VoiceRuntime::new();
+        runtime.force_warmup();
+        assert_eq!(runtime.phase(), VoicePhase::Off, "关闭状态不应被强制启用");
+
+        runtime.request_enable();
+        let warming = runtime.generation();
+        runtime.force_warmup();
+        assert_eq!(runtime.phase(), VoicePhase::Warmup);
+        assert_eq!(runtime.generation(), warming, "重复预热不应推进代次");
+
+        runtime.mark_render_ready(warming);
+        assert!(runtime.finish_warmup(warming));
+        assert_eq!(runtime.phase(), VoicePhase::Wet);
+        runtime.force_warmup();
+        assert_eq!(runtime.phase(), VoicePhase::Warmup, "湿声重建必须重新预热");
+        let rebuilt = runtime.generation();
+        assert!(rebuilt > warming, "重建应推进代次");
+
+        runtime.mark_render_ready(rebuilt);
+        assert!(runtime.finish_warmup(rebuilt));
+        runtime.request_disable();
+        assert_eq!(runtime.phase(), VoicePhase::FadingOut);
+        runtime.force_warmup();
+        assert_eq!(runtime.phase(), VoicePhase::Warmup, "淡出重建必须重新预热");
+    }
+
+    #[test]
     fn 临时旁路与关闭共用淡出路径() {
         let runtime = VoiceRuntime::new();
         runtime.request_enable();
         let warming = runtime.generation();
+        runtime.mark_render_ready(warming);
         assert!(runtime.finish_warmup(warming));
 
         runtime.request_bypass();
@@ -271,6 +359,7 @@ mod tests {
         let runtime = VoiceRuntime::new();
         runtime.request_enable();
         let warming = runtime.generation();
+        runtime.mark_render_ready(warming);
         assert!(runtime.finish_warmup(warming));
 
         runtime.request_disable();

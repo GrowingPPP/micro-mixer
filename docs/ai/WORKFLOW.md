@@ -42,9 +42,10 @@ node --test tools/test-remote-controls.js tools/test-app-packaging.js
 ```
 
 `voice-signalsmith` 特性捆绑 C++ 源码并通过 bindgen 生成绑定，需要 C++ 工具链与 libclang。
-该特性默认关闭，不属于默认双端 CI 门禁；默认 workspace 构建、`tools/win-cross-check.sh`
-与 CI 都不编译 C++，也不要求上述工具。第一阶段只在 `audio-core` 内验证该后端，
-不把 voice 特性接入 GUI/CLI，现有用户功能行为不变。
+该特性默认关闭，不属于默认 `quality.yml` 双端 CI 门禁；`quality.yml` 与
+`tools/win-cross-check.sh` 以默认特性运行，不编译 C++，也不要求上述工具。
+`tools/voice-spike/` 是独立 workspace，另有自己的验证命令，不计入该门禁。
+第一阶段只在 `audio-core` 内验证该后端，不把 voice 特性接入 GUI/CLI。
 
 完整操作组合的测试选择见[播放操作组合回归](../engineering/播放操作组合回归.md)。
 

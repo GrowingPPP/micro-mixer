@@ -574,6 +574,9 @@ struct VoiceTee {
     fade_generation: u64,
     fade_pos: usize,
     crossfade_frames: usize,
+    /// 最近一个有效湿声样本；链内 FIFO 暂时排空时用它补齐，避免把干声
+    /// 插进淡化中间造成权重跳变。
+    wet_hold: f32,
 }
 
 impl VoiceTee {
@@ -588,19 +591,14 @@ impl VoiceTee {
         chain.0.set_params(params);
 
         let (phase, generation) = runtime.snapshot();
+        // 新链是冷的；即使运行时尚处于 Wet/FadingOut，也只能从头预热，
+        // 不能把冷链直接当成 SteadyWet。构造入口会先把这类状态改为 Warmup。
         let state = match phase {
             VoicePhase::Off => VoiceTeeState::Idle,
-            VoicePhase::Warmup => VoiceTeeState::Warming,
-            VoicePhase::Wet => VoiceTeeState::SteadyWet,
-            VoicePhase::FadingOut => VoiceTeeState::FadingOut,
+            VoicePhase::Warmup | VoicePhase::Wet | VoicePhase::FadingOut => VoiceTeeState::Warming,
         };
         let crossfade_frames =
             ((sample_rate as f32 * VOICE_CROSSFADE_MS / 1000.0).round() as usize).max(1);
-        let fade_pos = if state == VoiceTeeState::SteadyWet {
-            crossfade_frames
-        } else {
-            0
-        };
 
         Self {
             runtime,
@@ -610,9 +608,18 @@ impl VoiceTee {
             warmup_generation: generation,
             warmup_frames: 0,
             fade_generation: generation,
-            fade_pos,
+            fade_pos: 0,
             crossfade_frames,
+            wet_hold: 0.0,
         }
+    }
+
+    /// 人声存在且处于预热、湿声或淡出阶段时，漂移水位使用低通估计。
+    fn uses_filtered_drift(&self) -> bool {
+        matches!(
+            self.runtime.phase(),
+            VoicePhase::Warmup | VoicePhase::Wet | VoicePhase::FadingOut
+        )
     }
 
     /// 消费一块干声，把当前应写环的样本写入 `out`，返回帧数。
@@ -623,51 +630,51 @@ impl VoiceTee {
         let (phase, generation) = self.runtime.snapshot();
         self.sync(phase, generation);
 
-        match phase {
-            VoicePhase::Off => {
+        match self.state {
+            VoiceTeeState::Idle => {
                 out[..frames].copy_from_slice(dry);
                 frames
             }
-            VoicePhase::Warmup => {
-                let produced = self.chain.0.process(dry, out);
+            VoiceTeeState::Warming => {
+                let produced = self.chain.0.process(dry, &mut out[..frames]);
                 self.warmup_frames = self.warmup_frames.saturating_add(produced);
                 // 预热期写环的始终是干声，湿声只用于填充链内 FIFO。
                 out[..frames].copy_from_slice(dry);
-                if self.warmup_frames >= self.chain.0.latency_frames()
-                    && self.runtime.finish_warmup(self.warmup_generation)
-                {
-                    self.state = VoiceTeeState::FadingIn;
-                    self.fade_pos = 0;
+                if self.warmup_frames >= self.chain.0.latency_frames() {
+                    let became_wet = self.runtime.finish_warmup(self.warmup_generation);
+                    if became_wet || self.runtime.phase() == VoicePhase::Wet {
+                        self.state = VoiceTeeState::FadingIn;
+                        self.fade_pos = 0;
+                    }
                 }
                 frames
             }
-            VoicePhase::Wet => {
+            VoiceTeeState::FadingIn => {
+                let wet_frames = self.chain.0.process(dry, &mut out[..frames]);
+                self.mix_fade(out, dry, wet_frames, frames, true);
+                if self.fade_pos >= self.crossfade_frames {
+                    let became_wet = self.runtime.finish_warmup(self.warmup_generation);
+                    // 正常预热已提交时为 Wet；淡出中重新启用则在这里补交预热。
+                    if became_wet || self.runtime.phase() == VoicePhase::Wet {
+                        self.state = VoiceTeeState::SteadyWet;
+                    }
+                }
+                frames
+            }
+            VoiceTeeState::SteadyWet => {
                 // 每次最多排出本回调输入帧数，块量化积压留在链内 FIFO，
                 // 避免小回调时向环形缓冲突发整块数据。
                 let wet_frames = self.chain.0.process(dry, &mut out[..frames]);
-                if self.state == VoiceTeeState::FadingIn {
-                    self.mix_fade(out, dry, wet_frames, frames, true);
-                    if self.fade_pos >= self.crossfade_frames {
-                        self.state = VoiceTeeState::SteadyWet;
-                    }
-                    frames
-                } else {
-                    self.state = VoiceTeeState::SteadyWet;
-                    wet_frames
-                }
+                self.fill_wet_hold(out, wet_frames, frames);
+                frames
             }
-            VoicePhase::FadingOut => {
-                // 淡出同样按输入帧数排出，缺湿声时用干声补齐，
-                // 保证写环速率与设备回调一致。
+            VoiceTeeState::FadingOut => {
+                // 淡出同样按输入帧数排出；缺湿声时保持最近湿声，保证写环速率
+                // 与设备回调一致且不产生硬跳。
                 let wet_frames = self.chain.0.process(dry, &mut out[..frames]);
                 self.mix_fade(out, dry, wet_frames, frames, false);
-                if self.fade_pos >= self.crossfade_frames
-                    && self.runtime.finish_fade_out(self.fade_generation)
-                {
-                    self.chain.0.reset();
-                    self.state = VoiceTeeState::Idle;
-                    self.warmup_frames = 0;
-                    self.fade_pos = 0;
+                if self.fade_pos >= self.crossfade_frames {
+                    self.complete_fade_out();
                 }
                 frames
             }
@@ -681,34 +688,136 @@ impl VoiceTee {
         }
         self.generation = generation;
         match phase {
+            VoicePhase::Off => match self.state {
+                VoiceTeeState::Idle | VoiceTeeState::FadingOut => {}
+                VoiceTeeState::Warming => {
+                    self.reset_chain();
+                    self.state = VoiceTeeState::Idle;
+                }
+                VoiceTeeState::FadingIn => {
+                    // 反向沿用当前干湿比例，避免淡入中途关闭产生突变。
+                    self.fade_pos = self.reversed_fade_pos();
+                    self.fade_generation = generation;
+                    self.state = VoiceTeeState::FadingOut;
+                }
+                VoiceTeeState::SteadyWet => {
+                    self.fade_pos = 0;
+                    self.fade_generation = generation;
+                    self.state = VoiceTeeState::FadingOut;
+                }
+            },
+            VoicePhase::Warmup => match self.state {
+                VoiceTeeState::FadingOut => {
+                    // 淡出中重新启用：链一直是热的，直接反向淡化回湿声。
+                    self.fade_pos = self.reversed_fade_pos();
+                    self.warmup_generation = generation;
+                    self.warmup_frames = self.chain.0.latency_frames();
+                    self.state = VoiceTeeState::FadingIn;
+                }
+                VoiceTeeState::FadingIn => {
+                    self.warmup_generation = generation;
+                }
+                VoiceTeeState::Idle | VoiceTeeState::Warming | VoiceTeeState::SteadyWet => {
+                    self.reset_chain();
+                    self.warmup_generation = generation;
+                    self.state = VoiceTeeState::Warming;
+                }
+            },
+            VoicePhase::Wet => match self.state {
+                VoiceTeeState::Idle => {
+                    // 新链不能冷启动成湿声；先预热再淡入。
+                    self.reset_chain();
+                    self.warmup_generation = generation;
+                    self.state = VoiceTeeState::Warming;
+                }
+                VoiceTeeState::Warming => {
+                    self.warmup_generation = generation;
+                }
+                VoiceTeeState::FadingIn | VoiceTeeState::SteadyWet => {}
+                VoiceTeeState::FadingOut => {
+                    self.fade_pos = self.reversed_fade_pos();
+                    self.warmup_generation = generation;
+                    self.state = VoiceTeeState::FadingIn;
+                }
+            },
+            VoicePhase::FadingOut => match self.state {
+                VoiceTeeState::Idle => {
+                    // 输出已是干声，直接结束这次淡出。
+                    self.runtime.finish_fade_out(generation);
+                }
+                VoiceTeeState::Warming => {
+                    self.reset_chain();
+                    self.runtime.finish_fade_out(generation);
+                    self.state = VoiceTeeState::Idle;
+                }
+                VoiceTeeState::FadingIn => {
+                    self.fade_pos = self.reversed_fade_pos();
+                    self.fade_generation = generation;
+                    self.state = VoiceTeeState::FadingOut;
+                }
+                VoiceTeeState::SteadyWet => {
+                    self.fade_pos = 0;
+                    self.fade_generation = generation;
+                    self.state = VoiceTeeState::FadingOut;
+                }
+                VoiceTeeState::FadingOut => {
+                    self.fade_generation = generation;
+                }
+            },
+        }
+    }
+
+    fn reversed_fade_pos(&self) -> usize {
+        self.crossfade_frames
+            .saturating_sub(self.fade_pos.min(self.crossfade_frames))
+    }
+
+    fn reset_chain(&mut self) {
+        self.chain.0.reset();
+        self.warmup_frames = 0;
+        self.fade_pos = 0;
+        self.wet_hold = 0.0;
+    }
+
+    /// 淡出完成后按当前运行时代次收尾；重新启用时保留热链继续淡入。
+    fn complete_fade_out(&mut self) {
+        let (phase, generation) = self.runtime.snapshot();
+        match phase {
             VoicePhase::Off => {
-                self.chain.0.reset();
+                self.reset_chain();
                 self.state = VoiceTeeState::Idle;
-                self.warmup_frames = 0;
-                self.fade_pos = 0;
             }
             VoicePhase::Warmup => {
-                self.chain.0.reset();
-                self.state = VoiceTeeState::Warming;
+                self.generation = generation;
                 self.warmup_generation = generation;
-                self.warmup_frames = 0;
+                self.warmup_frames = self.chain.0.latency_frames();
                 self.fade_pos = 0;
+                self.state = VoiceTeeState::FadingIn;
             }
             VoicePhase::Wet => {
-                self.state = VoiceTeeState::SteadyWet;
-                self.fade_pos = self.crossfade_frames;
+                self.generation = generation;
+                self.warmup_generation = generation;
+                self.fade_pos = 0;
+                self.state = VoiceTeeState::FadingIn;
             }
             VoicePhase::FadingOut => {
-                if self.state == VoiceTeeState::FadingIn {
-                    // 反向切换时沿用当前干湿比例，避免淡入中途关闭产生突变。
-                    self.fade_pos = self.crossfade_frames.saturating_sub(self.fade_pos);
-                } else if self.state != VoiceTeeState::FadingOut {
-                    self.fade_pos = 0;
+                let finished = self.runtime.finish_fade_out(self.fade_generation)
+                    || self.runtime.finish_fade_out(generation);
+                if finished || self.runtime.phase() == VoicePhase::Off {
+                    self.reset_chain();
+                    self.state = VoiceTeeState::Idle;
                 }
-                self.state = VoiceTeeState::FadingOut;
-                self.fade_generation = generation;
             }
         }
+    }
+
+    /// 链内 FIFO 暂时排空时保持最近湿声，保证写环帧数不短少。
+    fn fill_wet_hold(&mut self, out: &mut [f32], wet_frames: usize, frames: usize) {
+        let wet_frames = wet_frames.min(frames);
+        if wet_frames > 0 {
+            self.wet_hold = out[wet_frames - 1];
+        }
+        out[wet_frames..frames].fill(self.wet_hold);
     }
 
     fn mix_fade(
@@ -720,18 +829,19 @@ impl VoiceTee {
         fade_in: bool,
     ) {
         let fade = self.crossfade_frames.max(1) as f32;
-        for (index, slot) in out.iter_mut().enumerate().take(frames) {
+        let frames = frames.min(out.len()).min(dry.len());
+        for index in 0..frames {
+            let has_wet = index < wet_frames;
+            let wet = if has_wet { out[index] } else { self.wet_hold };
+            if has_wet {
+                self.wet_hold = wet;
+            }
             let progress = self.fade_pos.min(self.crossfade_frames) as f32 / fade;
             let dry_weight = if fade_in { 1.0 - progress } else { progress };
-            let has_wet = index < wet_frames;
-            let wet = if has_wet { *slot } else { 0.0 };
-            *slot = match (dry.get(index).copied(), has_wet) {
-                (Some(d), true) => wet + (d - wet) * dry_weight,
-                (Some(d), false) => d,
-                (None, true) => wet,
-                (None, false) => 0.0,
-            };
-            if self.fade_pos < self.crossfade_frames {
+            let d = dry[index];
+            out[index] = wet + (d - wet) * dry_weight;
+            // 没有湿声时冻结进度；等湿声恢复后从同一干湿比例继续。
+            if has_wet && self.fade_pos < self.crossfade_frames {
                 self.fade_pos += 1;
             }
         }
@@ -762,10 +872,19 @@ impl CaptureProcessor {
             return;
         }
 
-        // 1. 时钟漂移控制：用低通后的缓冲水位微调重采样比率
-        //    （读的是推送前的水位 —— 控制环要看的是"当前积压了多少"）
+        // 1. 时钟漂移控制：读取推送前的水位（"当前积压了多少"）。
+        //    人声会话的 tee 会按算法块突发写环，只有这时才使用低通估计；
+        //    没有变声或变声关闭时保持旧的瞬时水位行为。
         let fill_before = self.capacity.saturating_sub(self.ring.slots());
-        self.drift.update(fill_before, frames);
+        if self
+            .voice
+            .as_ref()
+            .is_some_and(|voice| voice.uses_filtered_drift())
+        {
+            self.drift.update(fill_before, frames);
+        } else {
+            self.drift.update_instant(fill_before);
+        }
         self.resampler.set_ratio(self.drift.ratio());
 
         // 2. 固定缓冲分块下混与重采样。任意设备回调大小都不会触发 Vec 增容。
@@ -848,6 +967,22 @@ pub fn panic_hook_fired() -> bool {
 /// 变声湿声路径的限幅上限（dBFS）：人声与音效在相加前各自独立限幅。
 const PATH_LIMITER_CEILING_DB: f32 = -3.0;
 
+/// 渲染侧在干声链与路径限幅链之间交叉淡化的时长（毫秒）。
+const PATH_LIMITER_CROSSFADE_MS: f32 = 10.0;
+
+/// 渲染侧路径限幅的接入阶段。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathLimiterState {
+    /// 未使用路径限幅，输出混音后单限幅链。
+    Idle,
+    /// 路径限幅已预热但输出仍走干声链。
+    Priming,
+    /// 输出交叉淡化到路径限幅链。
+    Active,
+    /// 退出路径限幅，交叉淡化回干声链。
+    Draining,
+}
+
 pub struct RenderProcessor {
     ring: Consumer<f32>,
     cmd: Consumer<QueuedCommand>,
@@ -867,6 +1002,18 @@ pub struct RenderProcessor {
     voice_limiter: Option<Limiter>,
     /// 湿声路径的音效限幅；仅存在变声会话时预分配，回调内不创建。
     sfx_limiter: Option<Limiter>,
+    /// 路径限幅链的接入阶段；与采集侧阶段解耦，只在本侧块边界切换。
+    path_state: PathLimiterState,
+    /// 路径限幅影子预热的累计帧数。
+    path_prime_frames: usize,
+    /// 干声链与路径限幅链的交叉淡化进度。
+    path_fade_pos: usize,
+    path_crossfade_frames: usize,
+    /// 路径限幅的人声/音效暂存；无变声会话时为空。
+    path_voice: Vec<f32>,
+    path_sfx: Vec<f32>,
+    /// 路径链已退出后仍需等待的音效限幅尾部帧数。
+    path_tail_frames: usize,
     /// 混音后的末端安全限幅；关闭变声时也是唯一一级。
     safety_limiter: Limiter,
     ctl: Arc<PlaybackControl>,
@@ -1021,23 +1168,86 @@ impl RenderProcessor {
         );
     }
 
+    /// 在渲染块边界推进路径限幅接入状态；采集侧提交后由本侧交叉淡化跟随。
+    fn sync_path_limiters(&mut self, phase: VoicePhase, generation: u64) {
+        if self.voice_limiter.is_none() || self.sfx_limiter.is_none() {
+            self.path_state = PathLimiterState::Idle;
+            return;
+        }
+        match phase {
+            VoicePhase::Warmup | VoicePhase::Wet => match self.path_state {
+                PathLimiterState::Idle => {
+                    // 在温启动与湿声阶段都先影子预热，切入时延迟线已经填满。
+                    self.path_state = PathLimiterState::Priming;
+                    self.path_prime_frames = 0;
+                    self.path_fade_pos = 0;
+                }
+                PathLimiterState::Draining => {
+                    // 淡出期间重新启用：沿当前权重反向切回路径链。
+                    self.path_fade_pos = self
+                        .path_crossfade_frames
+                        .saturating_sub(self.path_fade_pos.min(self.path_crossfade_frames));
+                    self.path_state = PathLimiterState::Active;
+                    self.mark_render_ready(generation);
+                }
+                PathLimiterState::Priming => {}
+                PathLimiterState::Active => {
+                    if phase == VoicePhase::Warmup {
+                        // 链在淡出中被保留，重新启用无需再次预热。
+                        self.mark_render_ready(generation);
+                    }
+                }
+            },
+            VoicePhase::FadingOut => match self.path_state {
+                PathLimiterState::Priming => {
+                    // 路径链从未参与输出，保持干声即可，不需要退出淡化。
+                    self.path_state = PathLimiterState::Idle;
+                    self.path_prime_frames = 0;
+                    self.path_fade_pos = 0;
+                    self.reset_path_limiters();
+                }
+                // 已切入的路径限幅保留到淡出完成。
+                PathLimiterState::Idle | PathLimiterState::Active | PathLimiterState::Draining => {}
+            },
+            VoicePhase::Off => match self.path_state {
+                PathLimiterState::Active => {
+                    // 采集侧已淡回干声，渲染侧再做一次路径链退出淡化。
+                    self.path_fade_pos = 0;
+                    self.path_state = PathLimiterState::Draining;
+                }
+                PathLimiterState::Priming => {
+                    self.path_state = PathLimiterState::Idle;
+                    self.path_prime_frames = 0;
+                    self.path_fade_pos = 0;
+                    self.reset_path_limiters();
+                }
+                PathLimiterState::Idle | PathLimiterState::Draining => {}
+            },
+        }
+    }
+
+    fn reset_path_limiters(&mut self) {
+        if let Some(limiter) = self.voice_limiter.as_mut() {
+            limiter.reset();
+        }
+        if let Some(limiter) = self.sfx_limiter.as_mut() {
+            limiter.reset();
+        }
+    }
+
+    fn mark_render_ready(&self, generation: u64) {
+        if let Some(runtime) = self.voice_runtime.as_ref() {
+            runtime.mark_render_ready(generation);
+        }
+    }
+
     fn process_block(&mut self, out: &mut [f32]) {
         self.apply_stop_epoch();
-        let phase = self
+        let (phase, generation) = self
             .voice_runtime
             .as_ref()
-            .map_or(VoicePhase::Off, |runtime| runtime.phase());
-        if phase != self.voice_phase
-            && (phase == VoicePhase::Wet || self.voice_phase == VoicePhase::Wet)
-        {
-            // 进出湿声链路时清空路径限幅的延迟线，避免旧会话尾音被新会话重新输出。
-            if let Some(limiter) = self.voice_limiter.as_mut() {
-                limiter.reset();
-            }
-            if let Some(limiter) = self.sfx_limiter.as_mut() {
-                limiter.reset();
-            }
-        }
+            .map_or((VoicePhase::Off, 0), |runtime| runtime.snapshot());
+        self.sync_path_limiters(phase, generation);
         self.voice_phase = phase;
         let dev_ch = self.out_channels.max(1);
         let frames = out.len() / dev_ch;
@@ -1078,28 +1288,98 @@ impl RenderProcessor {
         // 3. 混音（增益在实时线程读取，无锁）
         let mg = db_to_lin(self.ctl.mic_gain_db.get());
         let sg = db_to_lin(self.ctl.sfx_gain_db.get());
-        let path_active = self.voice_phase == VoicePhase::Wet;
-        if path_active {
-            // 湿声链路：人声与音效各自限幅后再相加，两路增益互不压制。
-            for sample in mic.iter_mut() {
+        let path_session = self.voice_limiter.is_some() && self.sfx_limiter.is_some();
+        let path_processing = path_session && self.path_state != PathLimiterState::Idle;
+        if path_processing {
+            // 路径限幅需要独立的干声与音效副本；缓冲全部预分配。
+            self.path_voice[..used].copy_from_slice(mic);
+            self.path_sfx[..used].copy_from_slice(sfx);
+        }
+        for sample in mic.iter_mut() {
+            *sample *= mg;
+        }
+        for sample in sfx.iter_mut() {
+            *sample *= sg;
+        }
+        if path_processing {
+            for sample in &mut self.path_voice[..used] {
                 *sample *= mg;
             }
-            for sample in sfx.iter_mut() {
+            for sample in &mut self.path_sfx[..used] {
                 *sample *= sg;
             }
+            // 影子预热也走真实样本：延迟线与增益状态在切入前就已收敛。
             if let (Some(voice_limiter), Some(sfx_limiter)) =
                 (self.voice_limiter.as_mut(), self.sfx_limiter.as_mut())
             {
-                voice_limiter.process_in_place(mic);
-                sfx_limiter.process_in_place(sfx);
+                voice_limiter.process_in_place(&mut self.path_voice[..used]);
+                sfx_limiter.process_in_place(&mut self.path_sfx[..used]);
             }
+        }
+        // 干声链：混音后单限幅；路径链与干声链按当前权重交叉混合后再进入末端限幅。
+        for i in 0..used {
+            mic[i] += sfx[i];
+        }
+        if path_processing {
             for i in 0..used {
-                mic[i] += sfx[i];
+                self.path_voice[i] += self.path_sfx[i];
             }
-        } else {
-            // 干声链路：沿用混音后单限幅，关闭变声时与既有引擎逐样本一致。
-            for i in 0..used {
-                mic[i] = mic[i] * mg + sfx[i] * sg;
+            match self.path_state {
+                PathLimiterState::Idle => {}
+                PathLimiterState::Priming => {
+                    self.path_prime_frames += frames;
+                    let prime_target = self
+                        .voice_limiter
+                        .as_ref()
+                        .map_or(0, |limiter| limiter.latency_frames());
+                    if self.path_prime_frames >= prime_target {
+                        self.path_state = PathLimiterState::Active;
+                        self.path_fade_pos = 0;
+                        // 允许采集侧提交湿声：路径限幅延迟线已用真实样本填满。
+                        if let Some(runtime) = self.voice_runtime.as_ref() {
+                            runtime.mark_render_ready(generation);
+                        }
+                    }
+                }
+                PathLimiterState::Active => {
+                    let denom = self.path_crossfade_frames.max(1) as f32;
+                    for frame in 0..used / 2 {
+                        let weight =
+                            self.path_fade_pos.min(self.path_crossfade_frames) as f32 / denom;
+                        for channel in 0..2 {
+                            let i = frame * 2 + channel;
+                            mic[i] += (self.path_voice[i] - mic[i]) * weight;
+                        }
+                        if self.path_fade_pos < self.path_crossfade_frames {
+                            self.path_fade_pos += 1;
+                        }
+                    }
+                }
+                PathLimiterState::Draining => {
+                    let denom = self.path_crossfade_frames.max(1) as f32;
+                    for frame in 0..used / 2 {
+                        let weight =
+                            1.0 - self.path_fade_pos.min(self.path_crossfade_frames) as f32 / denom;
+                        for channel in 0..2 {
+                            let i = frame * 2 + channel;
+                            mic[i] += (self.path_voice[i] - mic[i]) * weight;
+                        }
+                        if self.path_fade_pos < self.path_crossfade_frames {
+                            self.path_fade_pos += 1;
+                        }
+                    }
+                    if self.path_fade_pos >= self.path_crossfade_frames {
+                        self.path_state = PathLimiterState::Idle;
+                        self.path_fade_pos = 0;
+                        self.path_prime_frames = 0;
+                        if let Some(limiter) = self.voice_limiter.as_mut() {
+                            limiter.reset();
+                        }
+                        if let Some(limiter) = self.sfx_limiter.as_mut() {
+                            limiter.reset();
+                        }
+                    }
+                }
             }
         }
 
@@ -1110,13 +1390,25 @@ impl RenderProcessor {
                 as u32,
             Ordering::Relaxed,
         );
-        // 停止确认要等音效走完当前链路：湿声还多一级音效路径限幅；
-        // 人声不参与音效停止判定。
+        // 停止确认要等音效走完当前链路：路径链还多一级音效限幅；
+        // 人声不参与音效停止判定。淡出完成后仍保留一个路径尾部的等待窗口。
+        let sfx_latency = self
+            .sfx_limiter
+            .as_ref()
+            .map_or(0, |limiter| limiter.latency_frames());
+        let path_in_chain = path_session
+            && (matches!(phase, VoicePhase::Wet | VoicePhase::FadingOut)
+                || self.path_state == PathLimiterState::Active
+                || (self.path_state == PathLimiterState::Draining
+                    && self.path_fade_pos < self.path_crossfade_frames));
+        if path_in_chain {
+            self.path_tail_frames = sfx_latency;
+        } else {
+            self.path_tail_frames = self.path_tail_frames.saturating_sub(frames);
+        }
         let tail_frames = self.safety_limiter.latency_frames()
-            + if path_active {
-                self.sfx_limiter
-                    .as_ref()
-                    .map_or(0, |limiter| limiter.latency_frames())
+            + if self.path_tail_frames > 0 {
+                sfx_latency
             } else {
                 0
             };
@@ -1278,14 +1570,20 @@ impl EngineParts {
                 let block_frames = ((output_format.sample_rate as f32 * setup.block_ms / 1000.0)
                     .round() as usize)
                     .max(1);
+                // 设备重建会复用同一个 runtime；旧链已提交的湿声不能进入新会话。
+                // 新链必须从预热开始，不能把冷链接成 SteadyWet。
+                setup.runtime.force_warmup();
                 let tee = VoiceTee::new(setup, block_frames, output_format.sample_rate);
                 (Some(tee), vec![0.0; capture_output_samples + block_frames])
             }
             None => (None, Vec::new()),
         };
         let voice_runtime = voice_tee.as_ref().map(|tee| Arc::clone(&tee.runtime));
+        // 固定内部分块容量；更大的设备回调会完整处理成多个块。
+        const FRAMES_CAP: usize = 8192;
         // 路径限幅只在存在变声会话时预分配；湿声以外的阶段完全跳过。
-        let (voice_limiter, sfx_limiter) = if voice_tee.is_some() {
+        let has_voice_session = voice_tee.is_some();
+        let (voice_limiter, sfx_limiter) = if has_voice_session {
             let make_path_limiter = || {
                 Limiter::new_with_channels(
                     output_format.sample_rate,
@@ -1298,6 +1596,15 @@ impl EngineParts {
             (Some(make_path_limiter()), Some(make_path_limiter()))
         } else {
             (None, None)
+        };
+        let path_crossfade_frames = ((output_format.sample_rate as f32 * PATH_LIMITER_CROSSFADE_MS
+            / 1000.0)
+            .round() as usize)
+            .max(1);
+        let (path_voice, path_sfx) = if has_voice_session {
+            (vec![0.0; FRAMES_CAP * 2], vec![0.0; FRAMES_CAP * 2])
+        } else {
+            (Vec::new(), Vec::new())
         };
         let capture = CaptureProcessor {
             in_channels: input_format.ch(),
@@ -1312,8 +1619,6 @@ impl EngineParts {
             voice_out,
         };
 
-        // 固定内部分块容量；更大的设备回调会完整处理成多个块。
-        const FRAMES_CAP: usize = 8192;
         let players = slots
             .iter()
             .map(|s| FilePlayer::new(s, output_format.sample_rate))
@@ -1334,6 +1639,13 @@ impl EngineParts {
             sfx_idle_frames: 0,
             voice_limiter,
             sfx_limiter,
+            path_state: PathLimiterState::Idle,
+            path_prime_frames: 0,
+            path_fade_pos: 0,
+            path_crossfade_frames,
+            path_voice,
+            path_sfx,
+            path_tail_frames: 0,
             safety_limiter: Limiter::with_channels(output_format.sample_rate, 2),
             ctl: control.clone(),
             stats: stats.clone(),
@@ -3211,12 +3523,9 @@ mod tests {
         const 缓冲毫秒: u32 = 100;
         const 采集帧: usize = 480; // 10 ms
         const 渲染帧: usize = 960; // 每两个采集块消费一次 20 ms
-        let mut e = EngineParts::build(
-            StreamFormat::new(48_000, 1),
-            StreamFormat::stereo(48_000),
-            空槽位(),
-            缓冲毫秒,
-        );
+                                   // 漂移低通只服务变声 tee 的块状写环；没有人声会话时保持旧瞬时行为。
+        let (mut e, runtime) = 构造带变声引擎与缓冲(变声延迟帧, 缓冲毫秒);
+        runtime.request_enable();
         let 输入 = vec![0.1f32; 采集帧];
         // 预填到目标水位，避免启动欠载干扰比率观测。
         for _ in 0..10 {
@@ -3244,6 +3553,54 @@ mod tests {
             (0.99..=1.01).contains(&最小) && (0.99..=1.01).contains(&最大),
             "滤波后的比率应靠近 1：{最小}..{最大}"
         );
+    }
+
+    #[test]
+    fn 无变声或变声关闭时漂移保持瞬时水位() {
+        const 采集帧: usize = 480;
+        const 渲染帧: usize = 960;
+        let mut plain = EngineParts::build(
+            StreamFormat::new(48_000, 1),
+            StreamFormat::stereo(48_000),
+            空槽位(),
+            100,
+        );
+        let (mut voiced, runtime) = 构造带变声引擎与缓冲(变声延迟帧, 100);
+        assert_eq!(runtime.phase(), VoicePhase::Off);
+        let 输入 = vec![0.1f32; 采集帧];
+        for _ in 0..10 {
+            plain.capture.process(&输入);
+            voiced.capture.process(&输入);
+        }
+        let mut plain_out = vec![0.0f32; 渲染帧 * 2];
+        let mut voiced_out = vec![0.0f32; 渲染帧 * 2];
+        for step in 0..400 {
+            let plain_fill = plain.capture.capacity - plain.capture.ring.slots();
+            let voiced_fill = voiced.capture.capacity - voiced.capture.ring.slots();
+            let plain_expected = plain.capture.drift.ratio_for(plain_fill);
+            let voiced_expected = voiced.capture.drift.ratio_for(voiced_fill);
+            plain.capture.process(&输入);
+            voiced.capture.process(&输入);
+            assert!(
+                (plain.capture.resampler.ratio() - plain_expected).abs() < 1e-12,
+                "无变声构建必须直接使用瞬时水位"
+            );
+            assert!(
+                (voiced.capture.resampler.ratio() - voiced_expected).abs() < 1e-12,
+                "变声关闭时必须直接使用瞬时水位"
+            );
+            assert_eq!(
+                plain.capture.resampler.ratio(),
+                voiced.capture.resampler.ratio(),
+                "同一构建下带 voice Off 与不带 voice 的比率应一致"
+            );
+            if step % 2 == 1 {
+                plain.render.process(&mut plain_out);
+                voiced.render.process(&mut voiced_out);
+            }
+        }
+        assert_eq!(runtime.phase(), VoicePhase::Off);
+        assert_eq!(voiced.render.voice_phase(), VoicePhase::Off);
     }
 
     #[test]
@@ -3693,6 +4050,400 @@ mod tests {
         assert_eq!(e.render.voice_phase(), VoicePhase::Wet);
         assert!(!e.control.is_playing());
         assert_eq!(e.stats.underruns.load(Ordering::Relaxed), 0);
+    }
+
+    // ─────────────────────────────────────────── 过渡连续性回归
+
+    /// 取左声道的最长连续零值段（帧）。
+    fn 最长零值段(buf: &[f32]) -> usize {
+        let mut longest = 0usize;
+        let mut run = 0usize;
+        for frame in buf.as_chunks::<2>().0 {
+            if frame[0] == 0.0 {
+                run += 1;
+                longest = longest.max(run);
+            } else {
+                run = 0;
+            }
+        }
+        longest
+    }
+
+    fn 左声道(buf: &[f32]) -> Vec<f32> {
+        buf.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|frame| frame[0])
+            .collect()
+    }
+
+    fn 最大相邻步进(samples: &[f32]) -> f32 {
+        samples
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    fn 正弦输入(频率: f32, 起始帧: usize, 帧数: usize) -> Vec<f32> {
+        (0..帧数)
+            .map(|i| {
+                let n = 起始帧 + i;
+                (std::f32::consts::TAU * 频率 * n as f32 / 48_000.0).sin() * 0.2
+            })
+            .collect()
+    }
+
+    /// 推进一组采集/渲染回调，返回本次输出左声道。
+    fn 推进回调(
+        e: &mut EngineParts,
+        input: &[f32],
+        fed: &mut usize,
+        out: &mut [f32],
+        收集: &mut Vec<f32>,
+    ) {
+        e.capture.process(input);
+        *fed += input.len();
+        e.render.process(out);
+        收集.extend_from_slice(&左声道(out));
+    }
+
+    #[test]
+    fn 启用关闭过渡不产生静音洞() {
+        for 回调帧 in [480usize, 256, 128, 441] {
+            let (mut e, runtime) = 构造带变声引擎与缓冲(变声延迟帧, 变声缓冲毫秒);
+            e.control.mic_gain_db.set(0.0);
+            e.control.sfx_gain_db.set(-100.0);
+            let 输入 = vec![0.2f32; 回调帧];
+            let mut out = vec![0.0f32; 回调帧 * 2];
+            for _ in 0..40 {
+                e.capture.process(&输入);
+                e.render.process(&mut out);
+            }
+
+            let mut 收集 = Vec::new();
+            runtime.request_enable();
+            for _ in 0..120 {
+                e.capture.process(&输入);
+                e.render.process(&mut out);
+                收集.extend_from_slice(&左声道(&out));
+            }
+            assert_eq!(runtime.phase(), VoicePhase::Wet);
+            runtime.request_disable();
+            for _ in 0..120 {
+                e.capture.process(&输入);
+                e.render.process(&mut out);
+                收集.extend_from_slice(&左声道(&out));
+            }
+            assert_eq!(runtime.phase(), VoicePhase::Off);
+
+            let 零值段 = 最长零值段(&收集);
+            let 最小 = 收集.iter().copied().fold(f32::INFINITY, f32::min);
+            assert_eq!(
+                零值段, 0,
+                "{回调帧} 帧回调：启用/关闭过渡出现 {零值段} 帧静音洞"
+            );
+            assert!(
+                最小 > 0.15,
+                "{回调帧} 帧回调：过渡输出最小值 {最小}，接近静音"
+            );
+        }
+    }
+
+    #[test]
+    fn 音效路径限幅影子预热无静音洞() {
+        for 回调帧 in [480usize, 256, 128, 441] {
+            let (mut e, runtime) =
+                构造带槽位变声引擎(vec![构造槽位(vec![0.25f32; 96_000], true)]);
+            e.control.mic_gain_db.set(-100.0);
+            e.control.sfx_gain_db.set(0.0);
+            assert!(e.control.play(0));
+            let 输入 = vec![0.0f32; 回调帧];
+            let mut out = vec![0.0f32; 回调帧 * 2];
+            for _ in 0..40 {
+                e.capture.process(&输入);
+                e.render.process(&mut out);
+            }
+
+            let mut 收集 = Vec::new();
+            runtime.request_enable();
+            for _ in 0..120 {
+                e.capture.process(&输入);
+                e.render.process(&mut out);
+                收集.extend_from_slice(&左声道(&out));
+            }
+            assert_eq!(runtime.phase(), VoicePhase::Wet);
+            runtime.request_disable();
+            for _ in 0..120 {
+                e.capture.process(&输入);
+                e.render.process(&mut out);
+                收集.extend_from_slice(&左声道(&out));
+            }
+            assert_eq!(runtime.phase(), VoicePhase::Off);
+
+            let 零值段 = 最长零值段(&收集);
+            let 最小 = 收集.iter().copied().fold(f32::INFINITY, f32::min);
+            assert_eq!(
+                零值段, 0,
+                "{回调帧} 帧回调：音效路径限幅切换出现 {零值段} 帧静音洞"
+            );
+            assert!(
+                (最小 - 0.25).abs() < 1e-5,
+                "{回调帧} 帧回调：音效输出最小值 {最小}，应保持 0.25"
+            );
+        }
+    }
+
+    #[test]
+    fn 变声启用关闭过渡步进有界() {
+        for 回调帧 in [480usize, 256, 128, 441] {
+            let (mut e, runtime) = 构造带变声引擎与缓冲(变声延迟帧, 变声缓冲毫秒);
+            e.control.mic_gain_db.set(0.0);
+            e.control.sfx_gain_db.set(-100.0);
+            let mut out = vec![0.0f32; 回调帧 * 2];
+            let mut fed = 0usize;
+            let mut 收集 = Vec::new();
+            for _ in 0..40 {
+                推进回调(
+                    &mut e,
+                    &正弦输入(137.0, fed, 回调帧),
+                    &mut fed,
+                    &mut out,
+                    &mut 收集,
+                );
+            }
+            收集.clear();
+
+            runtime.request_enable();
+            for _ in 0..120 {
+                推进回调(
+                    &mut e,
+                    &正弦输入(137.0, fed, 回调帧),
+                    &mut fed,
+                    &mut out,
+                    &mut 收集,
+                );
+            }
+            assert_eq!(runtime.phase(), VoicePhase::Wet);
+            runtime.request_disable();
+            for _ in 0..120 {
+                推进回调(
+                    &mut e,
+                    &正弦输入(137.0, fed, 回调帧),
+                    &mut fed,
+                    &mut out,
+                    &mut 收集,
+                );
+            }
+            assert_eq!(runtime.phase(), VoicePhase::Off);
+
+            let 输入满幅 = 正弦输入(137.0, 0, 4_800);
+            let 输入步进 = 最大相邻步进(&输入满幅);
+            let 过渡步进 = 最大相邻步进(&收集);
+            assert!(
+                过渡步进 < 输入步进 * 4.0 + 0.002,
+                "{回调帧} 帧回调：过渡最大步进 {过渡步进}，输入步进 {输入步进}"
+            );
+            assert_eq!(
+                e.stats.underruns.load(Ordering::Relaxed),
+                0,
+                "{回调帧} 帧回调过渡不应欠载"
+            );
+        }
+    }
+
+    #[test]
+    fn 淡出中重新启用不产生权重突变() {
+        for 回调帧 in [256usize, 128, 441] {
+            let (mut e, runtime) = 构造带变声引擎与缓冲(变声延迟帧, 变声缓冲毫秒);
+            e.control.mic_gain_db.set(0.0);
+            e.control.sfx_gain_db.set(-100.0);
+            let mut out = vec![0.0f32; 回调帧 * 2];
+            let mut fed = 0usize;
+            let mut 收集 = Vec::new();
+            for _ in 0..40 {
+                推进回调(
+                    &mut e,
+                    &正弦输入(137.0, fed, 回调帧),
+                    &mut fed,
+                    &mut out,
+                    &mut 收集,
+                );
+            }
+            runtime.request_enable();
+            for _ in 0..120 {
+                推进回调(
+                    &mut e,
+                    &正弦输入(137.0, fed, 回调帧),
+                    &mut fed,
+                    &mut out,
+                    &mut 收集,
+                );
+            }
+            assert_eq!(runtime.phase(), VoicePhase::Wet);
+
+            runtime.request_disable();
+            for _ in 0..(480 / 回调帧).max(1) {
+                推进回调(
+                    &mut e,
+                    &正弦输入(137.0, fed, 回调帧),
+                    &mut fed,
+                    &mut out,
+                    &mut 收集,
+                );
+            }
+            assert_eq!(runtime.phase(), VoicePhase::FadingOut);
+            let 切换前 = 收集.len();
+            runtime.request_enable();
+            for _ in 0..120 {
+                推进回调(
+                    &mut e,
+                    &正弦输入(137.0, fed, 回调帧),
+                    &mut fed,
+                    &mut out,
+                    &mut 收集,
+                );
+            }
+            assert_eq!(runtime.phase(), VoicePhase::Wet);
+
+            // 只看重新启用边界附近的样本，避免把更早的过渡算进来。
+            let 起点 = 切换前.saturating_sub(回调帧);
+            let 边界样本 = &收集[起点..];
+            let 输入步进 = 最大相邻步进(&正弦输入(137.0, 0, 4_800));
+            let 边界步进 = 最大相邻步进(边界样本);
+            assert!(
+                边界步进 < 输入步进 * 4.0 + 0.002,
+                "{回调帧} 帧回调：淡出中重新启用最大步进 {边界步进}，输入步进 {输入步进}"
+            );
+        }
+    }
+
+    #[test]
+    fn 重建会话在湿声或淡出阶段必须重新预热() {
+        let runtime = Arc::new(VoiceRuntime::new());
+        let 输入 = vec![0.2f32; 变声块帧];
+        let mut out = vec![0.0f32; 变声块帧 * 2];
+
+        let make_setup = |runtime: &Arc<VoiceRuntime>| {
+            VoiceSetup::new(
+                VoiceParams::default(),
+                变声块毫秒,
+                runtime.clone(),
+                Box::new(DelayBackend::new(变声延迟帧)),
+            )
+        };
+        let make_engine = |runtime: &Arc<VoiceRuntime>| {
+            EngineParts::build_with_voice(
+                StreamFormat::new(48_000, 1),
+                StreamFormat::stereo(48_000),
+                空槽位(),
+                变声缓冲毫秒,
+                Some(make_setup(runtime)),
+            )
+        };
+
+        let mut first = make_engine(&runtime);
+        runtime.request_enable();
+        for _ in 0..20 {
+            first.capture.process(&输入);
+            first.render.process(&mut out);
+        }
+        assert_eq!(runtime.phase(), VoicePhase::Wet);
+
+        let mut rebuilt = make_engine(&runtime);
+        assert_eq!(
+            runtime.phase(),
+            VoicePhase::Warmup,
+            "已处于湿声的会话重建时必须重新预热"
+        );
+        assert_eq!(rebuilt.render.voice_phase(), VoicePhase::Off);
+
+        // 采集与渲染一起推进：渲染侧完成路径限幅影子预热后采集才提交湿声。
+        let mut 收集 = Vec::new();
+        for _ in 0..20 {
+            rebuilt.capture.process(&输入);
+            rebuilt.render.process(&mut out);
+            收集.extend_from_slice(&左声道(&out));
+        }
+        assert_eq!(runtime.phase(), VoicePhase::Wet);
+        // 跳过末端安全限幅的固定前视，之后不允许再出现冷启动静音。
+        let 稳定 = &收集[200..];
+        let 静音帧数 = 稳定.iter().filter(|s| s.abs() < 1e-6).count();
+        assert_eq!(静音帧数, 0, "重建后的新链冷启动产生 {静音帧数} 帧静音");
+        assert!(
+            稳定.iter().all(|s| (s - 0.2).abs() < 0.02),
+            "重建后的新链应从干声平滑进入湿声"
+        );
+
+        // 淡出阶段重建同样不能沿用旧代次。
+        runtime.request_disable();
+        assert_eq!(runtime.phase(), VoicePhase::FadingOut);
+        let _third = make_engine(&runtime);
+        assert_eq!(
+            runtime.phase(),
+            VoicePhase::Warmup,
+            "已处于淡出阶段的会话重建时必须重新预热"
+        );
+    }
+
+    #[test]
+    fn 淡出阶段停止仍等待音效限幅尾部() {
+        let 淡出帧 = (48_000.0 * FADE_MS / 1000.0).round() as usize;
+        let (mut e, runtime) =
+            构造带槽位变声引擎(vec![构造槽位(vec![0.25f32; 96_000], true)]);
+        静音进入湿声(&mut e, &runtime);
+        e.control.mic_gain_db.set(-100.0);
+        e.control.sfx_gain_db.set(0.0);
+        assert!(e.control.play(0));
+        let mut 块 = vec![0.0f32; 变声块帧 * 2];
+        for _ in 0..10 {
+            e.capture.process(&vec![0.0f32; 变声块帧]);
+            e.render.process(&mut 块);
+        }
+        assert_eq!(e.render.voice_phase(), VoicePhase::Wet);
+        assert!(e.control.stop_all());
+        runtime.request_disable();
+
+        let mut 单帧 = [0.0f32; 2];
+        let 等待 = 等待停止确认(&mut e, &mut 单帧);
+        let 至少等待 = 淡出帧 + 2 * 路径前视帧();
+        assert!(
+            等待 >= 至少等待,
+            "淡出阶段停止在 {等待} 帧确认，早于音效限幅与末端尾部 {至少等待} 帧"
+        );
+    }
+
+    #[test]
+    fn 无湿声时不推进淡化进度() {
+        let runtime = Arc::new(VoiceRuntime::new());
+        let setup = VoiceSetup::new(
+            VoiceParams::default(),
+            变声块毫秒,
+            runtime,
+            Box::new(DelayBackend::new(变声延迟帧)),
+        );
+        let mut tee = VoiceTee::new(setup, 变声块帧, 48_000);
+        let dry = vec![0.5f32; 小回调帧];
+        let mut out = vec![0.0f32; 小回调帧 + 变声块帧];
+
+        tee.fade_pos = 0;
+        tee.mix_fade(&mut out[..小回调帧], &dry, 0, 小回调帧, true);
+        assert_eq!(
+            tee.fade_pos, 0,
+            "没有湿声时淡入进度不得推进（当前 {}）",
+            tee.fade_pos
+        );
+        assert!(
+            out[..小回调帧].iter().all(|s| (*s - 0.5).abs() < 1e-6),
+            "淡入起点应保持纯干声"
+        );
+
+        tee.fade_pos = 240;
+        tee.mix_fade(&mut out[..小回调帧], &dry, 0, 小回调帧, false);
+        assert_eq!(
+            tee.fade_pos, 240,
+            "没有湿声时淡出进度不得推进（当前 {}）",
+            tee.fade_pos
+        );
     }
 
     /// 长时回归用更小的斜坡步长，避免 10 秒累计幅度触发限幅而改变样本序号。

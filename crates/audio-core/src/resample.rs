@@ -149,13 +149,30 @@ impl DriftController {
         self.filtered_fill += alpha * (fill - self.filtered_fill);
     }
 
+    /// 直接采用本次回调的瞬时水位，不做低通。
+    ///
+    /// 这是人声会话不存在或未启用时的旧行为；滤波只服务变声 tee 的块状写环。
+    pub fn update_instant(&mut self, fill: usize) {
+        self.filtered_fill = fill as f64;
+        self.filter_primed = true;
+    }
+
     /// 根据滤波后的水位估计算出应该使用的重采样比率。
     ///
     /// **符号很关键**：水位偏高 = 产出多于消费 → 必须**降低**比率。
     /// 若写成 `1 + corr`（水位越高比率越大）就构成正反馈，
     /// 缓冲会被一路顶到容量上限并持续溢出。
     pub fn ratio(&self) -> f64 {
-        let err = (self.filtered_fill - self.target_fill) / self.target_fill;
+        self.ratio_for_fill(self.filtered_fill)
+    }
+
+    /// 给定瞬时水位直接计算比率，不改变控制器状态。
+    pub fn ratio_for(&self, fill: usize) -> f64 {
+        self.ratio_for_fill(fill as f64)
+    }
+
+    fn ratio_for_fill(&self, fill: f64) -> f64 {
+        let err = (fill - self.target_fill) / self.target_fill;
         let corr = (-err * self.gain).clamp(-self.max_correction, self.max_correction);
         self.base_ratio * (1.0 + corr)
     }
@@ -369,6 +386,23 @@ mod tests {
         c.update(100, 480);
         let r = c.ratio();
         assert!(r > 1.0, "水位远低于目标时比率必须 > 1，实际 {r}");
+    }
+
+    #[test]
+    fn 瞬时水位接口保持旧比率公式() {
+        let mut c = DriftController::new(1.0, 1_000, 48_000);
+        for fill in [0usize, 100, 1_000, 1_500, 100_000] {
+            c.update_instant(fill);
+            assert!(
+                (c.ratio() - c.ratio_for(fill)).abs() < 1e-12,
+                "瞬时水位 {fill} 应直接进入旧比率公式"
+            );
+        }
+        // 瞬时接口不经过低通：相邻两次水位变化立即反映到比率。
+        c.update_instant(1_500);
+        let high = c.ratio();
+        c.update_instant(500);
+        assert!(c.ratio() > high, "水位下降后比率必须立即上升");
     }
 
     #[test]
