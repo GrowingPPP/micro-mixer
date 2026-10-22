@@ -508,28 +508,68 @@ impl Config {
         text
     }
 
+    /// 读取一项配置的文本表示。与 `set` 共用点路径解析，未知项返回错误。
+    ///
+    /// 未设置的设备与数值输出空行，便于调用方判断"未配置"；列表按逗号分隔，
+    /// 与 `set` 的输入格式一致。布尔值输出 `true` / `false`。
+    pub fn get(&self, key: &str) -> Result<String> {
+        let value = match ConfigKey::parse(key)? {
+            ConfigKey::InputDevice => self.input_device.clone().unwrap_or_default(),
+            ConfigKey::OutputDevice => self.output_device.clone().unwrap_or_default(),
+            ConfigKey::MonitorDevice => self.monitor_device.clone().unwrap_or_default(),
+            ConfigKey::BufferMs => self.buffer_ms.map(|v| v.to_string()).unwrap_or_default(),
+            ConfigKey::MicGainDb => self.mic_gain_db.map(|v| v.to_string()).unwrap_or_default(),
+            ConfigKey::SfxGainDb => self.sfx_gain_db.map(|v| v.to_string()).unwrap_or_default(),
+            ConfigKey::Monitor => self.monitor.to_string(),
+            ConfigKey::Looping => self.looping.to_string(),
+            ConfigKey::SoundDirs => join_paths(&self.sound_dirs),
+            ConfigKey::SoundFiles => join_paths(&self.sound_files),
+            ConfigKey::SoundNames => self.sound_names.join("\n"),
+            ConfigKey::SoundTags => self.sound_tags.join("\n"),
+            ConfigKey::SoundGains => self
+                .sound_gains
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            ConfigKey::Hotkeys => self.hotkeys.join(","),
+            ConfigKey::VoiceEnabled => self.voice.enabled.to_string(),
+            ConfigKey::VoiceActivePreset => self.voice.active_preset.clone(),
+            ConfigKey::VoiceBypassHotkey => self.voice.bypass_hotkey.clone(),
+            ConfigKey::VoiceNextPresetHotkey => self.voice.next_preset_hotkey.clone(),
+            ConfigKey::VoicePrevPresetHotkey => self.voice.prev_preset_hotkey.clone(),
+        };
+        Ok(value)
+    }
+
     /// 用 `key value` 设置一项。返回是否成功。
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
         let v = value.trim();
-        match key {
-            "input_device" => {
+        match ConfigKey::parse(key)? {
+            ConfigKey::InputDevice => {
                 self.input_device = if v.is_empty() || v == "none" {
                     None
                 } else {
                     Some(v.to_string())
                 }
             }
-            "output_device" => {
+            ConfigKey::OutputDevice => {
                 self.output_device = if v.is_empty() || v == "none" {
                     None
                 } else {
                     Some(v.to_string())
                 }
             }
-            "buffer_ms" => self.buffer_ms = Some(v.parse().context("buffer_ms 需要是整数")?),
-            "mic_gain_db" => self.mic_gain_db = Some(v.parse().context("mic_gain_db 需要是数字")?),
-            "sfx_gain_db" => self.sfx_gain_db = Some(v.parse().context("sfx_gain_db 需要是数字")?),
-            "sound_dirs" => {
+            ConfigKey::BufferMs => {
+                self.buffer_ms = Some(v.parse().context("buffer_ms 需要是整数")?)
+            }
+            ConfigKey::MicGainDb => {
+                self.mic_gain_db = Some(v.parse().context("mic_gain_db 需要是数字")?)
+            }
+            ConfigKey::SfxGainDb => {
+                self.sfx_gain_db = Some(v.parse().context("sfx_gain_db 需要是数字")?)
+            }
+            ConfigKey::SoundDirs => {
                 self.sound_dirs = v
                     .split(',')
                     .map(|x| x.trim())
@@ -537,7 +577,7 @@ impl Config {
                     .map(|x| expand(x.to_string()))
                     .collect()
             }
-            "sound_files" => {
+            ConfigKey::SoundFiles => {
                 self.sound_files = v
                     .split(',')
                     .map(|x| x.trim())
@@ -545,14 +585,18 @@ impl Config {
                     .map(|x| expand(x.to_string()))
                     .collect()
             }
-            "monitor" => self.monitor = parse_bool(v),
-            "looping" => self.looping = v.parse().context("looping 需要是 true 或 false")?,
-            "monitor_device" => self.monitor_device = parse_str(v),
-            "sound_names" => {
+            ConfigKey::Monitor => self.monitor = parse_bool(v),
+            ConfigKey::Looping => {
+                self.looping = v.parse().context("looping 需要是 true 或 false")?
+            }
+            ConfigKey::MonitorDevice => self.monitor_device = parse_str(v),
+            ConfigKey::SoundNames => {
                 self.sound_names = v.split('\n').map(|x| x.trim().to_string()).collect()
             }
-            "sound_tags" => self.sound_tags = v.split('\n').map(|x| x.trim().to_string()).collect(),
-            "sound_gains" => {
+            ConfigKey::SoundTags => {
+                self.sound_tags = v.split('\n').map(|x| x.trim().to_string()).collect()
+            }
+            ConfigKey::SoundGains => {
                 self.sound_gains = v
                     .split(',')
                     .map(|x| x.trim())
@@ -560,7 +604,7 @@ impl Config {
                     .filter_map(|x| x.parse::<f32>().ok())
                     .collect()
             }
-            "hotkeys" => {
+            ConfigKey::Hotkeys => {
                 self.hotkeys = if v.is_empty() {
                     Vec::new()
                 } else {
@@ -570,24 +614,18 @@ impl Config {
                         .collect()
                 }
             }
-            "voice.enabled" => {
+            ConfigKey::VoiceEnabled => {
                 self.voice.enabled = v.parse().context("voice.enabled 需要是 true 或 false")?
             }
-            "voice.active_preset" => {
+            ConfigKey::VoiceActivePreset => {
                 if self.find_voice_preset(v).is_none() {
                     anyhow::bail!("未知的变声预设「{v}」");
                 }
                 self.voice.active_preset = v.to_owned();
             }
-            "voice.bypass_hotkey" => self.voice.bypass_hotkey = v.to_owned(),
-            "voice.next_preset_hotkey" => self.voice.next_preset_hotkey = v.to_owned(),
-            "voice.prev_preset_hotkey" => self.voice.prev_preset_hotkey = v.to_owned(),
-            other => anyhow::bail!(
-                "未知配置项「{other}」。可用：input_device / output_device / buffer_ms / \
-                 mic_gain_db / sfx_gain_db / sound_dirs / sound_files / sound_gains / \
-                 monitor / looping / hotkeys / voice.enabled / voice.active_preset / \
-                 voice.bypass_hotkey / voice.next_preset_hotkey / voice.prev_preset_hotkey"
-            ),
+            ConfigKey::VoiceBypassHotkey => self.voice.bypass_hotkey = v.to_owned(),
+            ConfigKey::VoiceNextPresetHotkey => self.voice.next_preset_hotkey = v.to_owned(),
+            ConfigKey::VoicePrevPresetHotkey => self.voice.prev_preset_hotkey = v.to_owned(),
         }
         Ok(())
     }
@@ -723,6 +761,72 @@ impl Config {
         g.resize(count, 0.0);
         g
     }
+}
+
+/// `config get/set` 支持的点路径。
+///
+/// 键名解析与错误文案只在这里维护一份，避免 `get` 与 `set` 对同一项给出不同判断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigKey {
+    InputDevice,
+    OutputDevice,
+    MonitorDevice,
+    BufferMs,
+    MicGainDb,
+    SfxGainDb,
+    Monitor,
+    Looping,
+    SoundDirs,
+    SoundFiles,
+    SoundNames,
+    SoundTags,
+    SoundGains,
+    Hotkeys,
+    VoiceEnabled,
+    VoiceActivePreset,
+    VoiceBypassHotkey,
+    VoiceNextPresetHotkey,
+    VoicePrevPresetHotkey,
+}
+
+const CONFIG_KEY_LIST: &str = "input_device / output_device / monitor_device / buffer_ms / \
+     mic_gain_db / sfx_gain_db / sound_dirs / sound_files / sound_names / sound_tags / \
+     sound_gains / monitor / looping / hotkeys / voice.enabled / voice.active_preset / \
+     voice.bypass_hotkey / voice.next_preset_hotkey / voice.prev_preset_hotkey";
+
+impl ConfigKey {
+    fn parse(key: &str) -> Result<Self> {
+        Ok(match key {
+            "input_device" => Self::InputDevice,
+            "output_device" => Self::OutputDevice,
+            "monitor_device" => Self::MonitorDevice,
+            "buffer_ms" => Self::BufferMs,
+            "mic_gain_db" => Self::MicGainDb,
+            "sfx_gain_db" => Self::SfxGainDb,
+            "monitor" => Self::Monitor,
+            "looping" => Self::Looping,
+            "sound_dirs" => Self::SoundDirs,
+            "sound_files" => Self::SoundFiles,
+            "sound_names" => Self::SoundNames,
+            "sound_tags" => Self::SoundTags,
+            "sound_gains" => Self::SoundGains,
+            "hotkeys" => Self::Hotkeys,
+            "voice.enabled" => Self::VoiceEnabled,
+            "voice.active_preset" => Self::VoiceActivePreset,
+            "voice.bypass_hotkey" => Self::VoiceBypassHotkey,
+            "voice.next_preset_hotkey" => Self::VoiceNextPresetHotkey,
+            "voice.prev_preset_hotkey" => Self::VoicePrevPresetHotkey,
+            other => anyhow::bail!("未知配置项「{other}」。可用：{CONFIG_KEY_LIST}"),
+        })
+    }
+}
+
+fn join_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// 原子写入配置文本：同目录临时文件写完并同步后，重命名覆盖目标。

@@ -20,12 +20,12 @@ use clap::{Parser, Subcommand};
 use audio_core::device::{AudioBackend, Direction, StreamFormat, StreamHealth};
 use audio_session::{
     resolve_device, DumpOptions, Library, MonitorOptions, Playback, Session, SessionOptions,
-    SoundSpec,
+    SoundSpec, VoiceOptions,
 };
 use backend_cpal::CpalBackend;
 use hotkeys::Hotkeys;
 
-use app_config::Config;
+use app_config::{Config, VoiceParamsConfig};
 use remote as remote_ctl;
 
 fn take_monitor_warning(health: &StreamHealth, warned: &mut bool) -> Option<String> {
@@ -125,6 +125,12 @@ enum Cmd {
         buffer_ms: Option<u32>,
         #[arg(long)]
         duration: Option<u64>,
+        /// 本次运行启用变声并使用指定预设（不写入配置）
+        #[arg(long, conflicts_with = "voice_off")]
+        voice_preset: Option<String>,
+        /// 本次运行关闭变声（不写入配置）
+        #[arg(long)]
+        voice_off: bool,
         /// 开启手机遥控：局域网内用浏览器打开 http://<电脑IP>:<端口> 触发音效。
         /// 省略端口则用 8765。热键被游戏吞掉时的兜底通路。
         #[arg(long, num_args = 0..=1, default_missing_value = "8765")]
@@ -136,7 +142,8 @@ enum Cmd {
 
     /// 查看或修改配置（~/.config/mixer/config.toml）
     Config {
-        /// `set <项> <值>` 修改并保存；`path` 打印路径；不带参数则打印当前配置
+        /// `get <项>` 打印单项；`set <项> <值>` 修改并保存；`path` 打印路径；
+        /// 不带参数则打印当前配置
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -194,6 +201,7 @@ fn main() -> Result<()> {
                     remote: None,
                     monitor: false,
                     monitor_device: None,
+                    voice: None,
                 },
             )
         }
@@ -209,10 +217,14 @@ fn main() -> Result<()> {
             normalize,
             buffer_ms,
             duration,
+            voice_preset,
+            voice_off,
             remote,
             remote_bind,
         } => {
             let cfg = Config::load();
+            // 运行期覆盖先于设备枚举与开流解析：互斥参数或未知预设不能触碰音频。
+            let voice = play_voice_options(&cfg, voice_preset.as_deref(), voice_off)?;
 
             let mut files = file;
             if let Some(d) = dir {
@@ -239,6 +251,7 @@ fn main() -> Result<()> {
                     remote: remote.map(|port| (port, remote_bind)),
                     monitor: cfg.monitor,
                     monitor_device: cfg.monitor_device,
+                    voice,
                 },
             )
         }
@@ -247,6 +260,10 @@ fn main() -> Result<()> {
 
 // ─────────────────────────────────────────── config
 
+/// CLI 每次调用独立读取、修改并原子保存配置。
+///
+/// 与运行中的 GUI 并发写同一文件时没有跨进程锁，以最后写入的完整快照为准；
+/// 因此这里只写用户显式执行的 `config set`，播放参数不能隐式落盘。
 fn cmd_config(args: &[String]) -> Result<()> {
     let path = Config::path();
     match args.first().map(|s| s.as_str()) {
@@ -270,14 +287,26 @@ fn cmd_config(args: &[String]) -> Result<()> {
                 }
             }
             println!(
-                "\n可设置项: input_device / output_device / buffer_ms / mic_gain_db / \
-                 sfx_gain_db / sound_dirs / hotkeys"
+                "\n可读写项: input_device / output_device / monitor_device / buffer_ms / \
+                 mic_gain_db / sfx_gain_db / sound_dirs / sound_files / sound_gains / \
+                 monitor / looping / hotkeys / voice.enabled / voice.active_preset / \
+                 voice.bypass_hotkey / voice.next_preset_hotkey / voice.prev_preset_hotkey"
             );
-            println!("用法: mixer config set output_device \"VB-Cable\"\n");
+            println!("用法: mixer config get voice.active_preset");
+            println!("      mixer config set output_device \"VB-Cable\"\n");
             Ok(())
         }
         Some("path") => {
             println!("{}", path.display());
+            Ok(())
+        }
+        Some("get") => {
+            if args.len() != 2 {
+                anyhow::bail!("用法: mixer config get <项>");
+            }
+            let c = Config::load();
+            // 先解析再输出：未知项必须报错，不能用空行伪装成功。
+            println!("{}", c.get(&args[1])?);
             Ok(())
         }
         Some("set") => {
@@ -291,7 +320,9 @@ fn cmd_config(args: &[String]) -> Result<()> {
             println!("✅ 已写入 {}", p.display());
             Ok(())
         }
-        Some(other) => anyhow::bail!("未知子命令「{other}」。可用: set / path（或不带参数查看）"),
+        Some(other) => {
+            anyhow::bail!("未知子命令「{other}」。可用: get / set / path（或不带参数查看）")
+        }
     }
 }
 
@@ -630,6 +661,8 @@ struct RunOptions {
     remote: Option<(u16, String)>,
     monitor: bool,
     monitor_device: Option<String>,
+    /// 已按本次运行参数解析的人声配置；`None` 表示不建立人声链。
+    voice: Option<VoiceOptions>,
 }
 
 /// 在加载前把路径、身份、增益与热键装成条目，避免过滤坏文件后再用位置拼接。
@@ -691,6 +724,100 @@ fn playback_specs(
     Ok(specs)
 }
 
+// ─────────────────────────────────────────── 变声
+
+/// 本次运行的变声状态；只用于构造会话，不写回配置。
+struct PlayVoice {
+    enabled: bool,
+    /// 无 `voice` 特性时不会构造人声链，因而不读取该字段。
+    #[cfg_attr(not(feature = "voice"), allow(dead_code))]
+    params: VoiceParamsConfig,
+}
+
+/// 合并 `--voice-preset` / `--voice-off` 与持久配置。
+///
+/// 两个覆盖参数互斥；显式预设优先于配置的启用状态。解析只影响本次运行，
+/// 调用方不得据此保存配置。
+fn resolve_play_voice(
+    config: &Config,
+    preset_override: Option<&str>,
+    voice_off: bool,
+) -> Result<PlayVoice> {
+    anyhow::ensure!(
+        !(preset_override.is_some() && voice_off),
+        "`--voice-preset` 与 `--voice-off` 不能同时使用"
+    );
+    let (preset_id, enabled) = match preset_override {
+        Some(id) => (id.to_owned(), true),
+        None if voice_off => (config.voice.active_preset.clone(), false),
+        None => config.voice.effective_active_preset(&config.voice_presets),
+    };
+    let preset = config
+        .find_voice_preset(&preset_id)
+        .with_context(|| format!("未知的变声预设「{preset_id}」"))?;
+    Ok(PlayVoice {
+        enabled,
+        params: preset.params,
+    })
+}
+
+/// 与 GUI 一致的默认块长；CLI 不暴露运行期块长参数。
+#[cfg(feature = "voice")]
+const VOICE_BLOCK_MS: f32 = 10.0;
+
+/// 构造本次会话的人声配置。关闭时返回 `None`，不建立人声链。
+///
+/// `--voice-off` 不需要后端，因此无变声特性的构建仍可关闭配置中的变声；
+/// 一旦需要启用，缺少后端就是错误，不能静默丢弃。
+#[cfg(feature = "voice")]
+fn play_voice_options(
+    config: &Config,
+    preset_override: Option<&str>,
+    voice_off: bool,
+) -> Result<Option<VoiceOptions>> {
+    let voice = resolve_play_voice(config, preset_override, voice_off)?;
+    if !voice.enabled {
+        return Ok(None);
+    }
+    let params = voice.params;
+    Ok(Some(VoiceOptions {
+        enabled: true,
+        params: audio_core::voice::VoiceParams {
+            pitch_semitones: params.pitch_semitones,
+            formant_semitones: params.formant_semitones,
+            gate_enabled: params.gate_enabled,
+            gate_db: params.gate_db,
+            eq_low_enabled: params.eq_low_enabled,
+            eq_low_db: params.eq_low_db,
+            eq_mid_enabled: params.eq_mid_enabled,
+            eq_mid_db: params.eq_mid_db,
+            eq_high_enabled: params.eq_high_enabled,
+            eq_high_db: params.eq_high_db,
+            drive_enabled: params.drive_enabled,
+            drive: params.drive,
+            robot_enabled: params.robot_enabled,
+            robot_hz: params.robot_hz,
+            robot_mix: params.robot_mix,
+        },
+        block_ms: VOICE_BLOCK_MS,
+        backend: audio_session::signalsmith_voice_backend_factory(VOICE_BLOCK_MS),
+    }))
+}
+
+#[cfg(not(feature = "voice"))]
+fn play_voice_options(
+    config: &Config,
+    preset_override: Option<&str>,
+    voice_off: bool,
+) -> Result<Option<VoiceOptions>> {
+    let voice = resolve_play_voice(config, preset_override, voice_off)?;
+    anyhow::ensure!(
+        !voice.enabled,
+        "当前构建未包含变声支持（voice 特性）；请使用带变声的构建，或加 `--voice-off` 仅运行音效"
+    );
+    Ok(None)
+}
+
 fn run(b: &CpalBackend, options: RunOptions) -> Result<()> {
     let RunOptions {
         input,
@@ -705,6 +832,7 @@ fn run(b: &CpalBackend, options: RunOptions) -> Result<()> {
         remote,
         monitor,
         monitor_device,
+        voice,
     } = options;
     // 1. 名称先解析为稳定标识，比较与开流都使用同一端点身份。
     let devices = b.devices()?;
@@ -842,7 +970,7 @@ fn run(b: &CpalBackend, options: RunOptions) -> Result<()> {
             mic_gain_db: mic_gain,
             sfx_gain_db: sfx_gain,
             monitor: monitor_options,
-            voice: None,
+            voice,
         },
         dump,
     )?;
@@ -1341,6 +1469,207 @@ mod tests {
                 assert_eq!(capture.as_deref(), Some("CABLE Output"));
             }
             _ => panic!("应解析为 selftest"),
+        }
+    }
+
+    #[test]
+    fn 变声配置_get_读取启用预设与热键() {
+        let mut config = Config::default();
+        config.set("voice.enabled", "true").unwrap();
+        config.set("voice.active_preset", "builtin:male").unwrap();
+        config.set("voice.bypass_hotkey", "Cmd+Shift+B").unwrap();
+        config
+            .set("voice.next_preset_hotkey", "Cmd+Shift+Right")
+            .unwrap();
+        config
+            .set("voice.prev_preset_hotkey", "Cmd+Shift+Left")
+            .unwrap();
+        config.set("monitor", "false").unwrap();
+        config.set("buffer_ms", "40").unwrap();
+
+        let persisted = Config::try_parse(&config.to_text()).unwrap();
+        assert_eq!(persisted.get("voice.enabled").unwrap(), "true");
+        assert_eq!(
+            persisted.get("voice.active_preset").unwrap(),
+            "builtin:male"
+        );
+        assert_eq!(persisted.get("voice.bypass_hotkey").unwrap(), "Cmd+Shift+B");
+        assert_eq!(
+            persisted.get("voice.next_preset_hotkey").unwrap(),
+            "Cmd+Shift+Right"
+        );
+        assert_eq!(
+            persisted.get("voice.prev_preset_hotkey").unwrap(),
+            "Cmd+Shift+Left"
+        );
+        assert_eq!(persisted.get("monitor").unwrap(), "false");
+        assert_eq!(persisted.get("buffer_ms").unwrap(), "40");
+    }
+
+    #[test]
+    fn 变声配置_set_拒绝未知预设且不写入() {
+        let mut config = Config::default();
+        config.set("voice.active_preset", "builtin:male").unwrap();
+        let before = config.clone();
+        let error = config
+            .set("voice.active_preset", "user:missing")
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("user:missing"),
+            "错误应指出未知预设：{error:#}"
+        );
+        assert_eq!(config, before, "失败的预设写入不能改变配置");
+    }
+
+    #[test]
+    fn 变声配置_set_拒绝越界参数且不写入() {
+        let mut config = Config::default();
+        config.set("buffer_ms", "40").unwrap();
+        let before = config.clone();
+        assert!(
+            config.set("buffer_ms", "4294967296").is_err(),
+            "超出 u32 范围的缓冲值必须报错"
+        );
+        assert_eq!(config, before, "失败的数值写入不能改变配置");
+    }
+
+    #[test]
+    fn 变声配置_set_拒绝非法布尔值且不写入() {
+        let mut config = Config::default();
+        let before = config.clone();
+        assert!(
+            config.set("voice.enabled", "yes").is_err(),
+            "voice.enabled 只接受 true / false"
+        );
+        assert_eq!(config, before, "失败的布尔写入不能改变配置");
+    }
+
+    #[test]
+    fn 变声播放参数覆盖本次启用状态且不改配置() {
+        let cli = Cli::try_parse_from([
+            "mixer",
+            "play",
+            "--file",
+            "a.wav",
+            "--voice-preset",
+            "builtin:male",
+        ])
+        .unwrap();
+        match cli.cmd {
+            Cmd::Play {
+                voice_preset,
+                voice_off,
+                ..
+            } => {
+                assert_eq!(voice_preset.as_deref(), Some("builtin:male"));
+                assert!(!voice_off);
+            }
+            _ => panic!("应解析为 play"),
+        }
+
+        let mut config = Config::default();
+        config.set("voice.enabled", "false").unwrap();
+        config.set("voice.active_preset", "builtin:female").unwrap();
+        let before = config.clone();
+        let choice = resolve_play_voice(&config, Some("builtin:male"), false).unwrap();
+        assert!(choice.enabled, "--voice-preset 必须为本次运行启用变声");
+        assert_eq!(choice.params.pitch_semitones, -4.0, "应使用男声预设参数");
+        let off = resolve_play_voice(&config, None, true).unwrap();
+        assert!(!off.enabled, "--voice-off 必须关闭本次运行的变声");
+        assert_eq!(config, before, "运行期覆盖不得改写持久配置");
+    }
+
+    #[test]
+    fn 变声播放参数互斥时报错() {
+        let config = Config::default();
+        assert!(
+            resolve_play_voice(&config, Some("builtin:male"), true).is_err(),
+            "两个变声参数同时出现必须失败"
+        );
+        assert!(
+            Cli::try_parse_from([
+                "mixer",
+                "play",
+                "--file",
+                "a.wav",
+                "--voice-preset",
+                "builtin:male",
+                "--voice-off",
+            ])
+            .is_err(),
+            "参数互斥应在解析阶段失败"
+        );
+    }
+
+    #[test]
+    fn 未提供变声参数时沿用配置状态() {
+        let mut enabled = Config::default();
+        enabled.set("voice.enabled", "true").unwrap();
+        enabled.set("voice.active_preset", "builtin:child").unwrap();
+        let choice = resolve_play_voice(&enabled, None, false).unwrap();
+        assert!(choice.enabled);
+        assert_eq!(choice.params.pitch_semitones, 7.0, "应使用激活预设参数");
+
+        let disabled = Config::default();
+        let choice = resolve_play_voice(&disabled, None, false).unwrap();
+        assert!(!choice.enabled);
+
+        #[cfg(feature = "voice")]
+        {
+            let options = play_voice_options(&enabled, None, false)
+                .unwrap()
+                .expect("配置启用时应建立变声会话");
+            assert!(options.enabled);
+            assert!(
+                play_voice_options(&disabled, None, false)
+                    .unwrap()
+                    .is_none(),
+                "配置关闭时不应创建人声链"
+            );
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            let error = play_voice_options(&enabled, None, false)
+                .err()
+                .expect("无变声特性时应报错");
+            assert!(
+                format!("{error:#}").contains("voice"),
+                "无变声特性时应明确报错：{error:#}"
+            );
+            let error = play_voice_options(&disabled, Some("builtin:male"), false)
+                .err()
+                .expect("显式 --voice-preset 在无变声特性时也必须报错");
+            assert!(
+                format!("{error:#}").contains("voice"),
+                "无变声特性时应明确报错：{error:#}"
+            );
+            assert!(play_voice_options(&disabled, None, false)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn 未知变声预设不启动音频() {
+        let config = Config::default();
+        let error = play_voice_options(&config, Some("user:missing"), false)
+            .err()
+            .expect("未知预设必须在建立会话前报错");
+        assert!(
+            format!("{error:#}").contains("user:missing"),
+            "错误应指出未知预设：{error:#}"
+        );
+    }
+
+    #[test]
+    fn 变声配置_get_未知项报错() {
+        let config = Config::default();
+        for key in ["voice.unknown", "future_key"] {
+            let error = config.get(key).unwrap_err();
+            assert!(
+                format!("{error:#}").contains(key),
+                "未知项必须报错且不能输出空值：{error:#}"
+            );
         }
     }
 }
