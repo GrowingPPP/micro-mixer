@@ -93,7 +93,8 @@ impl LinearResampler {
 /// 实际频率也会差 ±10–100 ppm。不做处理时环形缓冲会逐渐被抽干或撑爆，
 /// 表现为周期性爆音或延迟持续增大。
 ///
-/// 做法：监控缓冲水位，微调重采样比率把长期漂移吸收掉。
+/// 做法：监控缓冲水位，微调重采样比率把长期漂移吸收掉。回调边界上的
+/// 水位会随块写入呈锯齿，控制环使用约 200 ms 的低通估计而不是瞬时值。
 #[derive(Debug, Clone)]
 pub struct DriftController {
     base_ratio: f64,
@@ -103,28 +104,58 @@ pub struct DriftController {
     gain: f64,
     /// 单次修正上限，防止抖动
     max_correction: f64,
+    /// 采集回调采样率，用于把块帧数换算成时间步长
+    sample_rate: u32,
+    /// 低通后的水位估计（样本数）；首个真实水位到达前保持目标值
+    filtered_fill: f64,
+    /// 是否已用首个真实水位初始化滤波
+    filter_primed: bool,
 }
 
+/// 水位估计的低通时间常数。
+const FILL_FILTER_TAU_SECS: f64 = 0.2;
+
 impl DriftController {
-    /// `target_fill` 建议为 10–20 ms 对应的样本数。
-    pub fn new(base_ratio: f64, target_fill: usize) -> Self {
+    /// `target_fill` 建议为 10–20 ms 对应的样本数；
+    /// `sample_rate` 是采集回调的采样率。
+    pub fn new(base_ratio: f64, target_fill: usize, sample_rate: u32) -> Self {
+        let target_fill = target_fill.max(1) as f64;
         Self {
             base_ratio,
-            target_fill: target_fill.max(1) as f64,
+            target_fill,
             gain: 0.20,
             // ±2%：稳态漂移只需 ~0.01%，余量用于消化启动瞬态。
             // 再大就会有可闻的音高偏移（2% ≈ 34 音分）。
             max_correction: 0.02,
+            sample_rate: sample_rate.max(1),
+            filtered_fill: target_fill,
+            filter_primed: false,
         }
     }
 
-    /// 根据当前水位算出应该使用的重采样比率。
+    /// 用当前水位与本次回调帧数更新低通估计。**实时安全。**
+    ///
+    /// 时间步长按 `frames / sample_rate` 计算，与回调块大小无关；
+    /// 首个水位直接作为估计初值。
+    pub fn update(&mut self, fill: usize, frames: usize) {
+        let fill = fill as f64;
+        if !self.filter_primed {
+            self.filtered_fill = fill;
+            self.filter_primed = true;
+            return;
+        }
+        let dt = frames as f64 / self.sample_rate as f64;
+        let alpha = 1.0 - (-dt / FILL_FILTER_TAU_SECS).exp();
+        self.filtered_fill += alpha * (fill - self.filtered_fill);
+    }
+
+    /// 根据滤波后的水位估计算出应该使用的重采样比率。
     ///
     /// **符号很关键**：水位偏高 = 产出多于消费 → 必须**降低**比率。
     /// 若写成 `1 + corr`（水位越高比率越大）就构成正反馈，
     /// 缓冲会被一路顶到容量上限并持续溢出。
-    pub fn ratio_for(&self, fill: usize) -> f64 {
-        let err = (fill as f64 - self.target_fill) / self.target_fill;
+    pub fn ratio(&self) -> f64 {
+        let err = (self.filtered_fill - self.target_fill) / self.target_fill;
         let corr = (-err * self.gain).clamp(-self.max_correction, self.max_correction);
         self.base_ratio * (1.0 + corr)
     }
@@ -231,32 +262,121 @@ mod tests {
         );
     }
 
+    fn 峰峰值(values: &[f64]) -> f64 {
+        let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+        max - min
+    }
+
+    #[test]
+    fn 漂移滤波器平滑块状水位锯齿() {
+        let target = 10_000usize;
+        let mut c = DriftController::new(1.0, target, 48_000);
+        let mut raw = Vec::new();
+        let mut filtered = Vec::new();
+        // 10 ms 回调边界上，水位围绕目标呈 ±1 块的锯齿。
+        for step in 0..500 {
+            let fill = if step % 2 == 0 {
+                target - 960
+            } else {
+                target + 960
+            };
+            c.update(fill, 480);
+            // 前 2 秒约 10 个时间常数，等待滤波进入稳态。
+            if step >= 200 {
+                raw.push(fill as f64);
+                filtered.push(c.filtered_fill);
+            }
+        }
+        let raw_pp = 峰峰值(&raw);
+        let filtered_pp = 峰峰值(&filtered);
+        assert!(
+            filtered_pp < raw_pp * 0.1,
+            "低通后的水位峰峰值应明显小于原始锯齿：原始 {raw_pp:.1}，滤波 {filtered_pp:.1}"
+        );
+    }
+
+    #[test]
+    fn 持续块状写入时漂移比率不贴修正上限() {
+        let target = 9_600usize;
+        let mut c = DriftController::new(1.0, target, 48_000);
+        let mut fill = target as f64;
+        let mut late = Vec::new();
+        // 每步 = 10 ms 采集块；推送前采样让水位带半块幅度的锯齿。
+        for step in 0..1_000 {
+            let instant = fill + if step % 2 == 0 { -960.0 } else { 960.0 };
+            c.update(instant.max(0.0) as usize, 480);
+            let ratio = c.ratio();
+            fill = (fill + (ratio - 1.0) * 960.0).max(0.0);
+            // 连续 10 秒；跳过前 2 秒（约 10 个时间常数）的启动瞬态。
+            if step >= 200 {
+                late.push(ratio - 1.0);
+            }
+        }
+        let 最大修正 = late.iter().fold(0f64, |m, v| m.max(v.abs()));
+        assert!(
+            最大修正 < 0.005,
+            "连续 10 秒块状写入后，修正应远离 ±2% 上限，实测最大 {最大修正}"
+        );
+        assert!(
+            late.iter().all(|v| v.abs() < 0.019),
+            "滤波后不应再贴住修正上限"
+        );
+    }
+
+    #[test]
+    fn 稳态下漂移比率收敛到一() {
+        let target = 9_600usize;
+        let mut c = DriftController::new(1.0, target, 48_000);
+        // 先让估计经历一段偏高水位，再回到目标稳态。
+        for _ in 0..50 {
+            c.update(target + 2_000, 480);
+        }
+        for _ in 0..200 {
+            c.update(target, 480);
+        }
+        assert!(
+            (c.ratio() - 1.0).abs() < 1e-4,
+            "稳态水位下修正应接近 0，实际比率 {}",
+            c.ratio()
+        );
+        // 首个水位到达前保持中性，到达后直接作为估计。
+        let mut fresh = DriftController::new(1.0, target, 48_000);
+        assert!((fresh.ratio() - 1.0).abs() < 1e-12);
+        fresh.update(target, 480);
+        assert!((fresh.ratio() - 1.0).abs() < 1e-12);
+    }
+
     #[test]
     fn 漂移控制器在水位达标时不修正() {
-        let c = DriftController::new(1.0, 1000);
-        assert!((c.ratio_for(1000) - 1.0).abs() < 1e-9);
+        let mut c = DriftController::new(1.0, 1000, 48_000);
+        c.update(1000, 480);
+        assert!((c.ratio() - 1.0).abs() < 1e-9);
     }
 
     #[test]
     fn 水位偏高时必须降低比率() {
         // 这条是防回归的关键：符号写反会构成正反馈，把缓冲顶爆
-        let c = DriftController::new(1.0, 1000);
-        let r = c.ratio_for(5000);
+        let mut c = DriftController::new(1.0, 1000, 48_000);
+        c.update(5000, 480);
+        let r = c.ratio();
         assert!(r < 1.0, "水位远高于目标时比率必须 < 1，实际 {r}");
     }
 
     #[test]
     fn 水位偏低时必须提高比率() {
-        let c = DriftController::new(1.0, 1000);
-        let r = c.ratio_for(100);
+        let mut c = DriftController::new(1.0, 1000, 48_000);
+        c.update(100, 480);
+        let r = c.ratio();
         assert!(r > 1.0, "水位远低于目标时比率必须 > 1，实际 {r}");
     }
 
     #[test]
     fn 漂移控制器有界() {
-        let c = DriftController::new(1.0, 1000);
         for fill in [0usize, 1, 500, 5000, 100_000] {
-            let r = c.ratio_for(fill);
+            let mut c = DriftController::new(1.0, 1000, 48_000);
+            c.update(fill, 480);
+            let r = c.ratio();
             assert!(
                 (0.975..=1.025).contains(&r),
                 "水位 {fill} 时比率 {r} 越界（应限制在 ±2% 内）"
@@ -268,12 +388,13 @@ mod tests {
     fn 漂移控制器能把缓冲拉回目标() {
         // 模拟闭环：启动瞬态把缓冲灌到目标 3 倍，应在一秒内量级收敛
         let target = 1920usize;
-        let c = DriftController::new(1.0, target);
+        let mut c = DriftController::new(1.0, target, 48_000);
         let mut fill = (target * 3) as f64;
         let mut steps = 0;
         // 每步 = 一个 10ms 回调（480 帧 = 960 样本）
         while steps < 1000 && (fill - target as f64).abs() > target as f64 * 0.1 {
-            let r = c.ratio_for(fill as usize);
+            c.update(fill as usize, 480);
+            let r = c.ratio();
             fill = (fill + (r - 1.0) * 960.0).max(0.0);
             steps += 1;
         }

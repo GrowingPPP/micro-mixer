@@ -762,10 +762,11 @@ impl CaptureProcessor {
             return;
         }
 
-        // 1. 时钟漂移控制：按缓冲水位微调重采样比率
+        // 1. 时钟漂移控制：用低通后的缓冲水位微调重采样比率
         //    （读的是推送前的水位 —— 控制环要看的是"当前积压了多少"）
         let fill_before = self.capacity.saturating_sub(self.ring.slots());
-        self.resampler.set_ratio(self.drift.ratio_for(fill_before));
+        self.drift.update(fill_before, frames);
+        self.resampler.set_ratio(self.drift.ratio());
 
         // 2. 固定缓冲分块下混与重采样。任意设备回调大小都不会触发 Vec 增容。
         let inv = 1.0 / ch as f32;
@@ -1303,7 +1304,7 @@ impl EngineParts {
             mono: vec![0.0; capture_chunk_frames],
             resampled: vec![0.0; capture_output_samples],
             resampler: LinearResampler::new(base_ratio),
-            drift: DriftController::new(base_ratio, target_samples),
+            drift: DriftController::new(base_ratio, target_samples, input_format.sample_rate),
             ring: producer,
             capacity,
             stats: stats.clone(),
@@ -2997,11 +2998,17 @@ mod tests {
         let (mut e, runtime) =
             构造带槽位变声引擎(vec![构造槽位(vec![4.0f32; 96_000], true)]);
         静音进入湿声(&mut e, &runtime);
+        let mut out = vec![0.0f32; 变声块帧 * 2];
+        // 静音期让漂移估计收敛，避免启动瞬态改变过载信号的相位。
+        let 静音 = vec![0.0f32; 变声块帧];
+        for _ in 0..160 {
+            e.capture.process(&静音);
+            e.render.process(&mut out);
+        }
         e.control.mic_gain_db.set(0.0);
         e.control.sfx_gain_db.set(0.0);
         assert!(e.control.play(0));
 
-        let mut out = vec![0.0f32; 变声块帧 * 2];
         let mut 已喂帧 = 0usize;
         for _ in 0..12 {
             let mic = 正弦块(440.0, 已喂帧, 变声块帧);
@@ -3197,6 +3204,46 @@ mod tests {
                 "{回调帧} 帧回调不应撑爆环形缓冲"
             );
         }
+    }
+
+    #[test]
+    fn 漂移滤波在块状采集回调下保持比率平滑() {
+        const 缓冲毫秒: u32 = 100;
+        const 采集帧: usize = 480; // 10 ms
+        const 渲染帧: usize = 960; // 每两个采集块消费一次 20 ms
+        let mut e = EngineParts::build(
+            StreamFormat::new(48_000, 1),
+            StreamFormat::stereo(48_000),
+            空槽位(),
+            缓冲毫秒,
+        );
+        let 输入 = vec![0.1f32; 采集帧];
+        // 预填到目标水位，避免启动欠载干扰比率观测。
+        for _ in 0..10 {
+            e.capture.process(&输入);
+        }
+        let mut out = vec![0.0f32; 渲染帧 * 2];
+        let mut ratios = Vec::new();
+        for step in 0..1_000 {
+            e.capture.process(&输入);
+            if step % 2 == 1 {
+                e.render.process(&mut out);
+            }
+            // 跳过前 2 秒（约 10 个滤波时间常数）的启动瞬态。
+            if step >= 200 {
+                ratios.push(e.capture.resampler.ratio());
+            }
+        }
+        let 最小 = ratios.iter().copied().fold(f64::INFINITY, f64::min);
+        let 最大 = ratios.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            最大 - 最小 < 0.002,
+            "块状水位不应让比率来回跳变：{最小}..{最大}"
+        );
+        assert!(
+            (0.99..=1.01).contains(&最小) && (0.99..=1.01).contains(&最大),
+            "滤波后的比率应靠近 1：{最小}..{最大}"
+        );
     }
 
     #[test]
