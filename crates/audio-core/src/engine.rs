@@ -19,7 +19,7 @@ use crate::decode::DecodedAudio;
 use crate::device::StreamFormat;
 use crate::limiter::Limiter;
 use crate::resample::{DriftController, LinearResampler};
-use crate::voice::{VoiceChain, VoicePhase, VoiceRuntime, VoiceSetup};
+use crate::voice::{VoiceChain, VoiceControl, VoicePhase, VoiceRuntime, VoiceSetup};
 
 // ─────────────────────────────────────────── 无锁原子量
 
@@ -582,13 +582,15 @@ struct VoiceTee {
 impl VoiceTee {
     fn new(setup: VoiceSetup, block_frames: usize, sample_rate: u32) -> Self {
         let VoiceSetup {
-            params,
-            runtime,
-            backend,
-            ..
+            control, backend, ..
         } = setup;
-        let mut chain = SendVoiceChain(VoiceChain::new(backend, block_frames));
-        chain.0.set_params(params);
+        let runtime = control.runtime();
+        let chain = SendVoiceChain(VoiceChain::new_with_control(
+            backend,
+            block_frames,
+            sample_rate,
+            control,
+        ));
 
         let (phase, generation) = runtime.snapshot();
         // 新链是冷的；即使运行时尚处于 Wet/FadingOut，也只能从头预热，
@@ -1493,9 +1495,17 @@ pub struct EngineParts {
     pub render: RenderProcessor,
     pub control: Arc<PlaybackControl>,
     pub stats: Arc<EngineStats>,
+    voice_control: Option<VoiceControl>,
 }
 
 impl EngineParts {
+    /// 变声会话的控制句柄；没有变声会话时为 `None`。
+    ///
+    /// 返回的是可克隆的宿主侧句柄；会话释放后仍可安全读取状态。
+    pub fn voice_control(&self) -> Option<VoiceControl> {
+        self.voice_control.clone()
+    }
+
     /// 组装引擎。
     ///
     /// * `input_format` —— 真实麦克风的实际格式
@@ -1561,6 +1571,7 @@ impl EngineParts {
 
         let base_ratio = output_format.sample_rate as f64 / input_format.sample_rate.max(1) as f64;
 
+        let voice_control = voice.as_ref().map(|setup| setup.control.clone());
         let max_capture_ratio = base_ratio * 1.02;
         let capture_chunk_frames = ((8192.0 / max_capture_ratio).floor() as usize).clamp(1, 1024);
         let capture_output_samples =
@@ -1572,7 +1583,7 @@ impl EngineParts {
                     .max(1);
                 // 设备重建会复用同一个 runtime；旧链已提交的湿声不能进入新会话。
                 // 新链必须从预热开始，不能把冷链接成 SteadyWet。
-                setup.runtime.force_warmup();
+                setup.control.runtime().force_warmup();
                 let tee = VoiceTee::new(setup, block_frames, output_format.sample_rate);
                 (Some(tee), vec![0.0; capture_output_samples + block_frames])
             }
@@ -1663,6 +1674,7 @@ impl EngineParts {
             render,
             control,
             stats,
+            voice_control,
         }
     }
 }
@@ -2965,6 +2977,8 @@ mod tests {
         delay_frames: usize,
         line: Vec<f32>,
         position: usize,
+        resets: Arc<AtomicUsize>,
+        params: Arc<Mutex<VoiceParams>>,
     }
 
     impl DelayBackend {
@@ -2973,7 +2987,17 @@ mod tests {
                 delay_frames,
                 line: vec![0.0; delay_frames],
                 position: 0,
+                resets: Arc::new(AtomicUsize::new(0)),
+                params: Arc::new(Mutex::new(VoiceParams::neutral())),
             }
+        }
+
+        fn resets(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.resets)
+        }
+
+        fn params(&self) -> Arc<Mutex<VoiceParams>> {
+            Arc::clone(&self.params)
         }
     }
 
@@ -3000,11 +3024,17 @@ mod tests {
         }
 
         fn reset(&mut self) {
+            self.resets.fetch_add(1, Ordering::Relaxed);
             self.line.fill(0.0);
             self.position = 0;
         }
 
-        fn set_params(&mut self, _params: VoiceParams) {}
+        fn set_params(&mut self, params: VoiceParams) {
+            *self
+                .params
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = params;
+        }
     }
 
     fn 构造带变声引擎(delay_frames: usize) -> (EngineParts, Arc<VoiceRuntime>) {
@@ -4569,5 +4599,188 @@ mod tests {
             跳过 > 0 && 跳过 <= 上限,
             "关闭过渡跳过 {跳过} 样本，应在上限 {上限} 内"
         );
+    }
+
+    fn 构造带记录变声引擎(
+        delay_frames: usize,
+    ) -> (
+        EngineParts,
+        Arc<VoiceRuntime>,
+        Arc<AtomicUsize>,
+        Arc<Mutex<VoiceParams>>,
+    ) {
+        let backend = DelayBackend::new(delay_frames);
+        let resets = backend.resets();
+        let params = backend.params();
+        let runtime = Arc::new(VoiceRuntime::new());
+        let setup = VoiceSetup::new(
+            VoiceParams::default(),
+            变声块毫秒,
+            runtime.clone(),
+            Box::new(backend),
+        );
+        let engine = EngineParts::build_with_voice(
+            StreamFormat::new(48_000, 1),
+            StreamFormat::new(48_000, 2),
+            空槽位(),
+            变声缓冲毫秒,
+            Some(setup),
+        );
+        (engine, runtime, resets, params)
+    }
+
+    #[test]
+    fn 切换预设不重置链且不跳过样本() {
+        let (mut e, runtime, resets, backend_params) = 构造带记录变声引擎(变声延迟帧);
+        let control = e.voice_control().expect("变声会话应暴露控制句柄");
+        静音进入湿声(&mut e, &runtime);
+        e.control.mic_gain_db.set(0.0);
+        e.control.sfx_gain_db.set(-100.0);
+        assert_eq!(control.phase(), VoicePhase::Wet);
+
+        let mut out = vec![0.0f32; 变声块帧 * 2];
+        let mut fed = 0usize;
+        for _ in 0..40 {
+            let input = 斜坡块(fed, 变声块帧);
+            e.capture.process(&input);
+            fed += 变声块帧;
+            e.render.process(&mut out);
+        }
+        let 切换前偏移 = 变声偏移(&e, fed, out[out.len() - 2]);
+        let 切换前重置 = resets.load(Ordering::Relaxed);
+
+        control.set_params(VoiceParams {
+            pitch_semitones: 5.0,
+            formant_semitones: -3.0,
+            gate_enabled: true,
+            gate_db: -60.0,
+            eq_low_enabled: true,
+            eq_low_db: 0.0,
+            eq_mid_enabled: true,
+            eq_mid_db: 0.0,
+            eq_high_enabled: true,
+            eq_high_db: 0.0,
+            ..VoiceParams::neutral()
+        });
+        assert_eq!(control.phase(), VoicePhase::Wet, "切换预设不得改变运行阶段");
+
+        for _ in 0..100 {
+            let input = 斜坡块(fed, 变声块帧);
+            e.capture.process(&input);
+            fed += 变声块帧;
+            e.render.process(&mut out);
+        }
+        let 切换后偏移 = 变声偏移(&e, fed, out[out.len() - 2]);
+
+        assert_eq!(
+            resets.load(Ordering::Relaxed),
+            切换前重置,
+            "切换预设不得重置后端"
+        );
+        assert!(
+            (切换后偏移 - 切换前偏移).abs() <= (变声延迟帧 + 变声块帧) as i64,
+            "切换后偏移 {切换后偏移} 与切换前 {切换前偏移} 相差超过算法延迟"
+        );
+        assert_eq!(
+            backend_params
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pitch_semitones,
+            5.0,
+            "新快照必须到达后端"
+        );
+    }
+
+    #[test]
+    fn 渲染侧人声限幅使用同一参数快照() {
+        let (mut e, runtime, _resets, _backend_params) = 构造带记录变声引擎(0);
+        let control = e.voice_control().expect("变声会话应暴露控制句柄");
+        静音进入湿声(&mut e, &runtime);
+        e.control.mic_gain_db.set(0.0);
+        e.control.sfx_gain_db.set(-100.0);
+        assert_eq!(control.phase(), VoicePhase::Wet);
+        assert_eq!(e.render.voice_phase(), VoicePhase::Wet);
+
+        let generation = control.generation();
+        control.set_params(VoiceParams {
+            gate_enabled: true,
+            gate_db: -20.0,
+            ..VoiceParams::neutral()
+        });
+        assert!(control.params().gate_enabled);
+        assert_eq!(control.generation(), generation, "发布参数不得推进运行代次");
+        assert_eq!(control.phase(), VoicePhase::Wet);
+        assert_eq!(
+            e.render.voice_phase(),
+            VoicePhase::Wet,
+            "渲染侧应继续使用同一阶段快照"
+        );
+
+        let quiet = vec![0.02f32; 变声块帧];
+        let mut out = vec![0.0f32; 变声块帧 * 2];
+        for _ in 0..120 {
+            e.capture.process(&quiet);
+            e.render.process(&mut out);
+        }
+        let peak = 取峰值(&out);
+        assert!(peak < 0.005, "采集侧应已应用新门限，渲染峰值 {peak}");
+        assert_eq!(e.render.voice_phase(), VoicePhase::Wet);
+        assert_eq!(control.phase(), VoicePhase::Wet);
+        assert_eq!(control.generation(), generation);
+    }
+
+    #[test]
+    fn 复用控制句柄重建引擎沿用参数快照() {
+        let control = VoiceControl::new(VoiceParams::default());
+        let make_engine = || {
+            let setup = VoiceSetup::with_control(
+                control.clone(),
+                变声块毫秒,
+                Box::new(DelayBackend::new(变声延迟帧)),
+            );
+            EngineParts::build_with_voice(
+                StreamFormat::new(48_000, 1),
+                StreamFormat::new(48_000, 2),
+                空槽位(),
+                变声缓冲毫秒,
+                Some(setup),
+            )
+        };
+
+        let mut first = make_engine();
+        let runtime = control.runtime();
+        静音进入湿声(&mut first, &runtime);
+        assert_eq!(control.phase(), VoicePhase::Wet);
+
+        let published = VoiceParams {
+            pitch_semitones: 4.0,
+            formant_semitones: -2.0,
+            drive_enabled: true,
+            drive: 0.5,
+            ..VoiceParams::neutral()
+        };
+        control.set_params(published);
+
+        // 旧引擎仍在时构建新引擎：两条链共享同一快照，读取互不影响。
+        let mut second = make_engine();
+        assert_eq!(control.phase(), VoicePhase::Warmup, "重建必须重新预热");
+        assert_eq!(
+            second
+                .voice_control()
+                .expect("重建会话应暴露控制句柄")
+                .params(),
+            published
+        );
+
+        // 旧链继续读取后，新链仍能完成预热并保持同一份参数。
+        let mut out = vec![0.0f32; 变声块帧 * 2];
+        first.capture.process(&vec![0.2f32; 变声块帧]);
+        first.render.process(&mut out);
+        for _ in 0..40 {
+            second.capture.process(&vec![0.2f32; 变声块帧]);
+            second.render.process(&mut out);
+        }
+        assert_eq!(control.phase(), VoicePhase::Wet);
+        assert_eq!(control.params(), published);
     }
 }

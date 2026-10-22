@@ -2,6 +2,7 @@
 
 pub mod backend;
 pub mod chain;
+pub mod control;
 pub mod effects;
 pub mod params;
 pub mod runtime;
@@ -11,6 +12,7 @@ pub mod signalsmith;
 
 pub use backend::VoiceBackend;
 pub use chain::VoiceChain;
+pub use control::{VoiceControl, VoiceParamBuffer};
 pub use effects::EffectChain;
 pub use params::VoiceParams;
 pub use runtime::{VoicePhase, VoiceRuntime, VoiceSetup};

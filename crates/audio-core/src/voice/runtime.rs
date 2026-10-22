@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use super::{VoiceBackend, VoiceParams};
+use super::{VoiceBackend, VoiceControl, VoiceParams};
 
 /// 变声运行阶段。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,25 +205,37 @@ impl VoiceRuntime {
 /// `block_ms` 按输出采样率解释，决定 [`super::VoiceChain`] 的固定适配块，
 /// 必须是 `(0, 40]` 毫秒内的有限值。`backend` 由宿主在非实时线程创建并注入，
 /// 测试可使用可控延迟替身。后端的 `Send` 约束保证引擎可以随采集处理移动到
-/// 音频线程。`params` 在构造时写入后端。
+/// 音频线程。构造时控制句柄里已经包含初始参数快照。
 pub struct VoiceSetup {
-    pub params: VoiceParams,
+    pub control: VoiceControl,
     pub block_ms: f32,
-    pub runtime: Arc<VoiceRuntime>,
     pub backend: Box<dyn VoiceBackend + Send>,
 }
 
 impl VoiceSetup {
+    /// 兼容入口：复用运行状态并在内部创建参数快照与控制句柄。
     pub fn new(
         params: VoiceParams,
         block_ms: f32,
         runtime: Arc<VoiceRuntime>,
         backend: Box<dyn VoiceBackend + Send>,
     ) -> Self {
-        Self {
-            params,
+        Self::with_control(
+            VoiceControl::with_runtime(runtime, params),
             block_ms,
-            runtime,
+            backend,
+        )
+    }
+
+    /// 用已有控制句柄创建会话输入；重建会话时可复用同一参数快照。
+    pub fn with_control(
+        control: VoiceControl,
+        block_ms: f32,
+        backend: Box<dyn VoiceBackend + Send>,
+    ) -> Self {
+        Self {
+            control,
+            block_ms,
             backend,
         }
     }
