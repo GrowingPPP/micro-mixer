@@ -1860,7 +1860,15 @@ impl AudioHost {
         let preview_generation = self.preview_gen.clone();
         let controls = self.preview_control.clone();
         let requests = self.audio_requests.clone();
+        #[cfg(feature = "voice")]
+        let voice = self.voice.clone();
         Arc::new(move || {
+            // 手机停止也是全局停止：待机时 playback 已不活跃，但人声试听仍可用。
+            // 只取消仍属于当前会话的代次，且不在监听回调里 join 所有者线程。
+            #[cfg(feature = "voice")]
+            if requests.generation.load(Ordering::Acquire) == generation {
+                voice.preview_cancel();
+            }
             // A handler may already have been cloned when its session is released.
             // Only affect a preview associated with that exact session. Avoid
             // joining under a remote listener callback (listener shutdown could
@@ -2088,12 +2096,6 @@ impl AudioHost {
         let gain = sound_gain(gain_db)?;
         anyhow::ensure!(!sound_id.trim().is_empty(), "素材标识不能为空");
         anyhow::ensure!(!self.is_quitting(), "程序正在退出");
-        // 本机输出同一时间只允许一个试听；音效试听开始前先取消人声试听。
-        #[cfg(feature = "voice")]
-        {
-            let _operation = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
-            self.cancel_voice_preview_inner();
-        }
         // Allocate before any device lookup/decode. A stop during prepare must
         // invalidate this request rather than let it assign a fresh token later.
         let (token, session_generation, audio) = {
@@ -2101,6 +2103,10 @@ impl AudioHost {
             if !self.audio_request_is_current(ticket) {
                 return Ok(());
             }
+            // 取消人声试听与分配音效试听 token 必须在同一临界区，
+            // 否则新的人声试听可能夹在两次加锁之间启动，两个本机试听同时输出。
+            #[cfg(feature = "voice")]
+            self.cancel_voice_preview_inner();
             let (session_generation, playback) = self
                 .running
                 .lock()

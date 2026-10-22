@@ -3310,3 +3310,162 @@ fn 采集试听回放使用负三分贝限幅而渲染试听不重复限幅() {
         );
     }
 }
+
+#[cfg(feature = "voice")]
+#[test]
+fn 录制中修改参数立即取消试听且不播放() {
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let clips = install_voice_preview_player(&host);
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    for _ in 0..5 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+    assert_eq!(host.voice_status().preview.state, "recording");
+
+    let status = host
+        .voice_set_params(VoiceParamsDto {
+            pitch_semitones: 9.0,
+            ..VoiceParamsDto::default()
+        })
+        .unwrap();
+    assert_eq!(status.preview.state, "idle", "改参必须立即结束录制状态");
+    assert!(
+        wait_for(Duration::from_secs(1), || {
+            host.voice_status();
+            host.voice_preview_thread.lock().unwrap().is_none()
+        }),
+        "改参取消后录制线程必须退出"
+    );
+    assert!(clips.try_recv().is_err(), "改参取消后不得播放半段");
+    assert!(
+        host.voice.preview_control().unwrap().take().is_none(),
+        "记录区应被清空"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 手机停止在待机时取消人声试听() {
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let clips = install_voice_preview_player(&host);
+    host.stop();
+    assert!(!host.status().running, "关闭音效应进入待机");
+    assert!(host.status().passthrough, "待机会话仍在转发人声");
+
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    for _ in 0..5 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+
+    let playback = host
+        .running
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .playback
+        .clone();
+    host.remote_stop_handler(playback, 1)();
+
+    assert_eq!(
+        host.voice_status().preview.state,
+        "idle",
+        "待机时手机停止也必须取消人声试听"
+    );
+    assert!(
+        wait_for(Duration::from_secs(1), || {
+            host.voice_status();
+            host.voice_preview_thread.lock().unwrap().is_none()
+        }),
+        "取消后录制线程必须退出"
+    );
+    assert!(clips.try_recv().is_err(), "取消后不得回放半段");
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 过期手机停止不能取消新会话的人声试听() {
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let clips = install_voice_preview_player(&host);
+    let playback = host
+        .running
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .playback
+        .clone();
+    let stale = host.remote_stop_handler(playback, 1);
+    host.audio_requests.register_session(2);
+
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    for _ in 0..5 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+
+    stale();
+    assert_eq!(
+        host.voice_status().preview.state,
+        "recording",
+        "旧会话回调不能取消新会话的人声试听"
+    );
+    assert!(clips.try_recv().is_err());
+    host.stop_all().unwrap();
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 人声与音效试听并发开始时最多一个本机输出() {
+    let (host, _backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let host = Arc::new(host);
+    for _ in 0..20 {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let voice_host = host.clone();
+        let voice_barrier = barrier.clone();
+        let voice = std::thread::spawn(move || {
+            voice_barrier.wait();
+            voice_host.voice_preview_start().unwrap();
+        });
+
+        let sound_host = host.clone();
+        let sound_barrier = barrier.clone();
+        let sound = std::thread::spawn(move || {
+            sound_barrier.wait();
+            let backend = FakeBackend::default();
+            let _ = sound_host.launch_preview(
+                "contended-sound".into(),
+                0.0,
+                || Ok(Arc::new(vec![0.2; 88_200])),
+                move |samples, token, generation, audio| {
+                    play_samples(
+                        backend,
+                        samples,
+                        DeviceId::new("fake preview"),
+                        StreamFormat::new(44_100, 6),
+                        audio,
+                        token,
+                        generation,
+                    )
+                },
+            );
+        });
+
+        voice.join().unwrap();
+        sound.join().unwrap();
+
+        let voice_active = matches!(
+            host.voice_status().preview.state.as_str(),
+            "preparing" | "recording" | "playing"
+        );
+        let sound_active = host.preview_control.lock().unwrap().is_some();
+        assert!(
+            !(voice_active && sound_active),
+            "人声试听与音效试听不能同时占用本机输出"
+        );
+        host.stop_all().unwrap();
+    }
+}

@@ -931,10 +931,20 @@ impl VoiceService {
         let params = VoiceParams::from(params).sanitized();
         {
             let mut state = self.lock();
-            state.params = params;
-            state.operation = state.operation.wrapping_add(1);
-            if let Some(control) = &state.control {
-                control.set_params(params);
+            // audio-core 在参数变化时会取消自身记录；宿主状态必须同步取消，
+            // 否则录制循环只能等到超时并误报“没有录到人声”。
+            if state.params != params {
+                if matches!(
+                    state.preview,
+                    VoicePreviewStatus::Preparing | VoicePreviewStatus::Recording { .. }
+                ) {
+                    Self::cancel_preview(&self.shared.preview_epoch, &mut state);
+                }
+                state.params = params;
+                state.operation = state.operation.wrapping_add(1);
+                if let Some(control) = &state.control {
+                    control.set_params(params);
+                }
             }
         }
         Ok(self.status())

@@ -1494,3 +1494,28 @@ fn 会话释放清除试听状态() {
     assert_eq!(preview.state, "idle");
     assert!(!service.preview_is_current(generation));
 }
+
+#[test]
+fn 录制中修改参数立即取消试听() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+
+    let generation = service.preview_begin();
+    service.preview_mark_recording(generation);
+    let status = service
+        .set_params(VoiceParamsDto {
+            pitch_semitones: 9.0,
+            ..VoiceParamsDto::default()
+        })
+        .unwrap();
+    assert_eq!(status.preview.state, "idle", "改参必须立即结束录制状态");
+    assert!(!service.preview_is_current(generation));
+
+    // 参数没有变化时不能打断正在进行的录制。
+    let generation = service.preview_begin();
+    service.preview_mark_recording(generation);
+    let current = service.status().params;
+    let status = service.set_params(current).unwrap();
+    assert_eq!(status.preview.state, "recording", "参数未变化不应取消录制");
+    assert!(service.preview_is_current(generation));
+}
