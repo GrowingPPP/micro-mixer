@@ -3400,4 +3400,423 @@ mod tests {
         assert_eq!(runtime.phase(), VoicePhase::Off);
         assert_eq!(e.render.voice_phase(), VoicePhase::Off);
     }
+
+    /// 同一输入与命令下，带变声引擎在关闭阶段必须与现有引擎逐样本一致。
+    fn 对照渲染一步(
+        基准: &mut EngineParts,
+        变声: &mut EngineParts,
+        输入: &[f32],
+        基准输出: &mut [f32],
+        变声输出: &mut [f32],
+        场景: &str,
+    ) {
+        基准.capture.process(输入);
+        变声.capture.process(输入);
+        基准.render.process(基准输出);
+        变声.render.process(变声输出);
+        assert_eq!(
+            基准输出, 变声输出,
+            "变声关闭时{场景}必须与现有引擎逐样本一致"
+        );
+    }
+
+    #[test]
+    fn 变声关闭时现有单音效语义不变() {
+        let a = || 构造槽位([0.25, 0.0].repeat(96_000), false);
+        let b = || 构造槽位([0.0, 0.4].repeat(96_000), false);
+        let (mut voiced, runtime) = 构造带槽位变声引擎(vec![a(), b()]);
+        let mut plain = EngineParts::build(
+            StreamFormat::new(48_000, 1),
+            StreamFormat::stereo(48_000),
+            vec![a(), b()],
+            变声缓冲毫秒,
+        );
+        assert_eq!(runtime.phase(), VoicePhase::Off);
+        for engine in [&mut plain, &mut voiced] {
+            engine.control.mic_gain_db.set(-100.0);
+            engine.control.sfx_gain_db.set(0.0);
+        }
+
+        let 输入 = vec![0.2f32; 变声块帧];
+        let mut plain_out = vec![0.0f32; 变声块帧 * 2];
+        let mut voiced_out = vec![0.0f32; 变声块帧 * 2];
+        // 先预填环形缓冲，让两侧从同一水位开始。
+        for _ in 0..10 {
+            plain.capture.process(&输入);
+            voiced.capture.process(&输入);
+        }
+
+        assert!(plain.control.play(0));
+        assert!(voiced.control.play(0));
+        对照渲染一步(
+            &mut plain,
+            &mut voiced,
+            &输入,
+            &mut plain_out,
+            &mut voiced_out,
+            "播放音效",
+        );
+        assert!((voiced_out[voiced_out.len() - 2] - 0.25).abs() < 1e-6);
+        assert!(voiced_out[voiced_out.len() - 1].abs() < 1e-6);
+
+        // 播放中切换：A 淡出、B 开始，逐帧仍只有一个音效，且与基准一致。
+        assert!(plain.control.play(1));
+        assert!(voiced.control.play(1));
+        for _ in 0..8 {
+            对照渲染一步(
+                &mut plain,
+                &mut voiced,
+                &输入,
+                &mut plain_out,
+                &mut voiced_out,
+                "切换音效",
+            );
+            assert!(
+                voiced_out
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .all(|frame| frame[0].abs() < 1e-6 || frame[1].abs() < 1e-6),
+                "变声关闭时 A→B 仍不得叠加"
+            );
+        }
+        assert!(voiced_out[voiced_out.len() - 2].abs() < 1e-6);
+        assert!((voiced_out[voiced_out.len() - 1] - 0.4).abs() < 1e-6);
+        assert_eq!(plain.control.active_slot(), voiced.control.active_slot());
+        assert_eq!(plain.control.active_slot(), 1);
+
+        // 循环：A 播完一遍后从开头继续，输出保持左声道指纹。
+        plain.control.set_looping(true);
+        voiced.control.set_looping(true);
+        assert!(plain.control.play(0));
+        assert!(voiced.control.play(0));
+        for _ in 0..=96_000 / 变声块帧 {
+            对照渲染一步(
+                &mut plain,
+                &mut voiced,
+                &输入,
+                &mut plain_out,
+                &mut voiced_out,
+                "循环播放",
+            );
+        }
+        assert!((voiced_out[voiced_out.len() - 2] - 0.25).abs() < 1e-6);
+        assert!(voiced_out[voiced_out.len() - 1].abs() < 1e-6);
+
+        // 停止：淡出音效后麦克风继续从输出环透传，且与基准一致。
+        for engine in [&mut plain, &mut voiced] {
+            engine.control.mic_gain_db.set(0.0);
+        }
+        assert!(plain.control.stop_all());
+        assert!(voiced.control.stop_all());
+        let mut 停止帧 = 0usize;
+        while !plain.control.stop_all_finished() || !voiced.control.stop_all_finished() {
+            对照渲染一步(
+                &mut plain,
+                &mut voiced,
+                &输入,
+                &mut plain_out,
+                &mut voiced_out,
+                "停止音效",
+            );
+            停止帧 += 变声块帧;
+            assert!(停止帧 < 48_000, "停止确认迟迟不完成");
+        }
+        对照渲染一步(
+            &mut plain,
+            &mut voiced,
+            &输入,
+            &mut plain_out,
+            &mut voiced_out,
+            "停止完成后",
+        );
+        assert!(voiced_out
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|frame| { (frame[0] - 0.2).abs() < 1e-5 && (frame[1] - 0.2).abs() < 1e-5 }));
+        assert_eq!(voiced.control.active_slot(), -1);
+        assert_eq!(runtime.phase(), VoicePhase::Off);
+        assert_eq!(voiced.render.voice_phase(), VoicePhase::Off);
+        assert_eq!(voiced.stats.underruns.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn 变声开启时音效仍单音效() {
+        let (mut e, runtime) = 构造带槽位变声引擎(vec![
+            构造槽位([0.25, 0.0].repeat(96_000), true),
+            构造槽位([0.0, 0.4].repeat(96_000), true),
+        ]);
+        静音进入湿声(&mut e, &runtime);
+        e.control.mic_gain_db.set(-100.0);
+        e.control.sfx_gain_db.set(0.0);
+        assert_eq!(e.render.voice_phase(), VoicePhase::Wet);
+
+        let 输入 = vec![0.0f32; 变声块帧];
+        let mut out = vec![0.0f32; 变声块帧 * 2];
+        assert!(e.control.play(0));
+        for _ in 0..10 {
+            e.capture.process(&输入);
+            e.render.process(&mut out);
+        }
+        assert!((out[out.len() - 2] - 0.25).abs() < 1e-6);
+        assert!(out[out.len() - 1].abs() < 1e-6);
+
+        // 人声湿声路径中切换音效：旧音效淡出，新音效才开始。
+        assert!(e.control.play(1));
+        for step in 0..12 {
+            e.capture.process(&输入);
+            e.render.process(&mut out);
+            assert!(
+                out.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .all(|frame| frame[0].abs() < 1e-6 || frame[1].abs() < 1e-6),
+                "变声开启时切换音效不得叠加：L={} R={}",
+                out[out.len() - 2],
+                out[out.len() - 1]
+            );
+            if step == 0 {
+                let 最大步进 = out
+                    .as_chunks::<2>()
+                    .0
+                    .windows(2)
+                    .map(|pair| (pair[1][0] - pair[0][0]).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    最大步进 < 0.002,
+                    "旧音效应淡出而不是硬切，最大步进 {最大步进}"
+                );
+            }
+        }
+        assert!(out[out.len() - 2].abs() < 1e-6);
+        assert!((out[out.len() - 1] - 0.4).abs() < 1e-6);
+        assert_eq!(e.control.active_slot(), 1);
+        assert_eq!(e.render.players.iter().filter(|p| p.active).count(), 1);
+    }
+
+    #[test]
+    fn 变声湿声不进入监听路径() {
+        let (mut primary, runtime) =
+            构造带槽位变声引擎(vec![构造槽位([0.25f32, 0.0].repeat(96_000), true)]);
+        let mut monitor = EngineParts::build(
+            StreamFormat::new(48_000, 1),
+            StreamFormat::stereo(48_000),
+            vec![构造槽位([0.25f32, 0.0].repeat(96_000), true)],
+            变声缓冲毫秒,
+        );
+        静音进入湿声(&mut primary, &runtime);
+        primary.control.mic_gain_db.set(0.0);
+        primary.control.sfx_gain_db.set(0.0);
+        monitor.control.sfx_gain_db.set(0.0);
+        assert_eq!(primary.render.voice_phase(), VoicePhase::Wet);
+        assert_eq!(monitor.render.voice_phase(), VoicePhase::Off);
+        assert!(primary.control.play_linked(0, &monitor.control));
+
+        let 人声 = vec![0.3f32; 变声块帧];
+        let mut primary_out = vec![0.0f32; 变声块帧 * 2];
+        let mut monitor_out = vec![0.0f32; 变声块帧 * 2];
+        for _ in 0..20 {
+            primary.capture.process(&人声);
+            primary.render.process(&mut primary_out);
+            monitor.render.process(&mut monitor_out);
+        }
+
+        // 主输出同时含湿声人声与音效；监听只有音效，右声道必须保持静音。
+        assert!((primary_out[primary_out.len() - 2] - 0.55).abs() < 1e-5);
+        assert!((primary_out[primary_out.len() - 1] - 0.3).abs() < 1e-5);
+        assert!((monitor_out[monitor_out.len() - 2] - 0.25).abs() < 1e-5);
+        assert!(
+            monitor_out
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|frame| frame[1].abs() < 1e-6),
+            "监听路径不得出现人声湿声"
+        );
+    }
+
+    #[test]
+    fn 停止音效后变声人声继续转发() {
+        let (mut e, runtime) =
+            构造带槽位变声引擎(vec![构造槽位(vec![0.25f32; 96_000], true)]);
+        静音进入湿声(&mut e, &runtime);
+        e.control.mic_gain_db.set(0.0);
+        e.control.sfx_gain_db.set(0.0);
+        assert!(e.control.play(0));
+
+        let 人声 = vec![0.2f32; 变声块帧];
+        let mut out = vec![0.0f32; 变声块帧 * 2];
+        for _ in 0..20 {
+            e.capture.process(&人声);
+            e.render.process(&mut out);
+        }
+        assert_eq!(e.render.voice_phase(), VoicePhase::Wet);
+        assert!(
+            (out[out.len() - 2] - 0.45).abs() < 1e-5,
+            "左声道 {} 右声道 {}",
+            out[out.len() - 2],
+            out[out.len() - 1]
+        );
+        assert!(
+            (out[out.len() - 1] - 0.45).abs() < 1e-5,
+            "左声道 {} 右声道 {}",
+            out[out.len() - 2],
+            out[out.len() - 1]
+        );
+
+        assert!(e.control.stop_all());
+        let mut 停止帧 = 0usize;
+        while !e.control.stop_all_finished() {
+            e.capture.process(&人声);
+            e.render.process(&mut out);
+            停止帧 += 变声块帧;
+            assert_eq!(
+                e.render.voice_phase(),
+                VoicePhase::Wet,
+                "停止音效不得改变变声阶段"
+            );
+            assert!(取峰值(&out) > 0.15, "停止音效后麦克风仍应持续转发");
+            assert!(停止帧 < 24_000, "停止确认迟迟不完成");
+        }
+
+        e.capture.process(&人声);
+        e.render.process(&mut out);
+        assert!(
+            out.as_chunks::<2>()
+                .0
+                .iter()
+                .all(|frame| (frame[0] - 0.2).abs() < 1e-5 && (frame[1] - 0.2).abs() < 1e-5),
+            "停止音效后输出应只剩变声人声"
+        );
+        assert_eq!(runtime.phase(), VoicePhase::Wet);
+        assert_eq!(e.render.voice_phase(), VoicePhase::Wet);
+        assert!(!e.control.is_playing());
+        assert_eq!(e.stats.underruns.load(Ordering::Relaxed), 0);
+    }
+
+    /// 长时回归用更小的斜坡步长，避免 10 秒累计幅度触发限幅而改变样本序号。
+    const 长时斜坡步长: f32 = 1e-6;
+    /// 每步采集与渲染使用同组回调大小但顺序错开，覆盖不同回调组合。
+    const 混合采集帧: [usize; 8] = [480, 960, 128, 480, 240, 4800, 480, 64];
+    const 混合渲染帧: [usize; 8] = [960, 480, 480, 128, 240, 4800, 64, 480];
+
+    fn 长时斜坡块(起始: usize, 帧数: usize) -> Vec<f32> {
+        (0..帧数)
+            .map(|i| (起始 + i) as f32 * 长时斜坡步长)
+            .collect()
+    }
+
+    fn 变声偏移按步长(e: &EngineParts, fed: usize, last_left: f32, 步长: f32) -> i64 {
+        let fill_frames = (e.stats.ring_fill.load(Ordering::Relaxed) / 2) as i64;
+        let source_index = (last_left / 步长).round() as i64;
+        fed as i64 - source_index - fill_frames
+    }
+
+    /// 推进一轮混合回调，返回本次渲染的最后一个左声道样本。
+    fn 混合推进(e: &mut EngineParts, fed: &mut usize, 步: usize, out: &mut [f32]) -> f32 {
+        let 采集帧 = 混合采集帧[步 % 混合采集帧.len()];
+        let 渲染帧 = 混合渲染帧[步 % 混合渲染帧.len()];
+        let input = 长时斜坡块(*fed, 采集帧);
+        e.capture.process(&input);
+        *fed += 采集帧;
+        let rendered = &mut out[..渲染帧 * 2];
+        e.render.process(rendered);
+        rendered[rendered.len() - 2]
+    }
+
+    /// 混合回调期间用对齐的 10 ms 回调稳定测量点。
+    fn 对齐推进(e: &mut EngineParts, fed: &mut usize, out: &mut [f32]) -> f32 {
+        let input = 长时斜坡块(*fed, 变声块帧);
+        e.capture.process(&input);
+        *fed += 变声块帧;
+        e.render.process(&mut out[..变声块帧 * 2]);
+        out[变声块帧 * 2 - 2]
+    }
+
+    #[test]
+    fn 变声预热和关闭过渡无欠载() {
+        const 目标帧数: usize = 48_000 * 10;
+        let (mut e, runtime) = 构造带变声引擎(变声延迟帧);
+        let mut out = vec![0.0f32; 4800 * 2];
+        let mut fed = 0usize;
+        let mut 最后样本 = 0.0f32;
+        for _ in 0..10 {
+            e.capture.process(&长时斜坡块(fed, 变声块帧));
+            fed += 变声块帧;
+        }
+
+        // 干声阶段运行 2.5 秒后测量基线偏移。
+        let mut 步 = 0usize;
+        while fed < 120_000 {
+            最后样本 = 混合推进(&mut e, &mut fed, 步, &mut out);
+            步 += 1;
+        }
+        for _ in 0..10 {
+            最后样本 = 对齐推进(&mut e, &mut fed, &mut out);
+        }
+        assert_eq!(runtime.phase(), VoicePhase::Off);
+        let 干偏移 = 变声偏移按步长(&e, fed, 最后样本, 长时斜坡步长);
+
+        runtime.request_enable();
+        while runtime.phase() != VoicePhase::Wet {
+            最后样本 = 混合推进(&mut e, &mut fed, 步, &mut out);
+            步 += 1;
+        }
+        for _ in 0..10 {
+            最后样本 = 对齐推进(&mut e, &mut fed, &mut out);
+        }
+        assert_eq!(e.render.voice_phase(), VoicePhase::Wet, "预热后应进入湿声");
+        let 湿偏移 = 变声偏移按步长(&e, fed, 最后样本, 长时斜坡步长);
+
+        while fed < 336_000 {
+            最后样本 = 混合推进(&mut e, &mut fed, 步, &mut out);
+            步 += 1;
+        }
+        runtime.request_disable();
+        while runtime.phase() != VoicePhase::Off {
+            最后样本 = 混合推进(&mut e, &mut fed, 步, &mut out);
+            步 += 1;
+        }
+        for _ in 0..10 {
+            最后样本 = 对齐推进(&mut e, &mut fed, &mut out);
+        }
+        assert_eq!(e.render.voice_phase(), VoicePhase::Off, "淡出后应回到干声");
+        let 干偏移_关闭后 = 变声偏移按步长(&e, fed, 最后样本, 长时斜坡步长);
+
+        while fed < 目标帧数 {
+            let _ = 混合推进(&mut e, &mut fed, 步, &mut out);
+            步 += 1;
+        }
+
+        assert!(fed >= 目标帧数, "混合回调应覆盖 10 秒");
+        assert!(
+            e.stats.rendered_frames.load(Ordering::Relaxed) >= (目标帧数 - 48_000) as u64,
+            "渲染回调也应覆盖接近 10 秒"
+        );
+        assert_eq!(
+            e.stats.underruns.load(Ordering::Relaxed),
+            0,
+            "预热与关闭过渡全程不应欠载"
+        );
+        assert_eq!(
+            e.stats.overruns.load(Ordering::Relaxed),
+            0,
+            "混合回调不应撑爆环形缓冲"
+        );
+        assert_eq!(runtime.phase(), VoicePhase::Off);
+        assert_eq!(e.render.voice_phase(), VoicePhase::Off);
+
+        let 重复 = 湿偏移 - 干偏移;
+        let 跳过 = 湿偏移 - 干偏移_关闭后;
+        let 上限 = (变声延迟帧 + 变声块帧 + 路径前视帧()) as i64;
+        assert!(
+            重复 > 0 && 重复 <= 上限,
+            "启用过渡重复 {重复} 样本，应在上限 {上限} 内"
+        );
+        assert!(
+            跳过 > 0 && 跳过 <= 上限,
+            "关闭过渡跳过 {跳过} 样本，应在上限 {上限} 内"
+        );
+    }
 }
