@@ -259,8 +259,15 @@ def main() -> int:
         "注意不同 crate 的 MIT/Apache 正文里版权人不同，所以看起来相似的条文会有多份 —— "
         "这是对的，每个版权声明都要保留。\n"
     )
+    # 标题相同的多份原文（不同版权人）按覆盖的 crate 列表决定顺序。
+    # 否则相同标题会退回到字典插入顺序，而该顺序取决于跨进程不稳定的集合遍历，
+    # 连续生成会出现内容相同但顺序不同的差异。
     for i, (_key, (title, (text, users))) in enumerate(
-        sorted(texts.items(), key=lambda kv: kv[1][0].lower()), start=1
+        sorted(
+            texts.items(),
+            key=lambda kv: (kv[1][0].lower(), tuple(sorted(set(kv[1][1][1])))),
+        ),
+        start=1,
     ):
         L.append(f"\n### {i}. {title}\n")
         crates = users

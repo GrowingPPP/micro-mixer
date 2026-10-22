@@ -46,6 +46,21 @@ function Find-NsisInstaller([string]$Directory, [string]$ProductName, [string]$V
            Sort-Object LastWriteTime -Descending | Select-Object -First 1
 }
 
+function Copy-DistributionDocuments([string]$SourceRoot, [string]$Destination) {
+    # 许可证与第三方声明随安装包一起交付；变声使用 Signalsmith（MIT）等第三方代码，
+    # 缺少声明时直接失败，避免生成合规信息不全的产物。
+    if (-not (Test-Path -LiteralPath $Destination)) {
+        New-Item -ItemType Directory -Path $Destination | Out-Null
+    }
+    foreach ($name in @('LICENSE', 'THIRD-PARTY-NOTICES.md')) {
+        $source = Join-Path $SourceRoot $name
+        if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+            throw "缺少分发文件：$source"
+        }
+        Copy-Item -LiteralPath $source -Destination (Join-Path $Destination $name) -Force
+    }
+}
+
 $tauriConfig = Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot 'tauri.conf.json') | ConvertFrom-Json
 $AppName = Get-TauriProductName $tauriConfig
 
@@ -130,6 +145,23 @@ if ($TestSmokeHarness) {
         $found = Find-NsisInstaller $installerDir '测试 名称' '0.1.0'
         if ($null -eq $found -or $found.FullName -cne $expectedInstaller) { throw '安装包选择误用了旧名或旧版本' }
         if ($null -ne (Find-NsisInstaller $installerDir '不存在' '0.1.0')) { throw '缺少本次安装包时不得兜底选择旧产物' }
+        $docSource = Join-Path $testDir 'doc-source'
+        $docTarget = Join-Path $testDir 'doc-target'
+        New-Item -ItemType Directory -Path $docSource | Out-Null
+        [IO.File]::WriteAllText((Join-Path $docSource 'LICENSE'), 'license')
+        [IO.File]::WriteAllText((Join-Path $docSource 'THIRD-PARTY-NOTICES.md'), 'notices')
+        Copy-DistributionDocuments $docSource $docTarget
+        foreach ($name in @('LICENSE', 'THIRD-PARTY-NOTICES.md')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $docTarget $name) -PathType Leaf)) {
+                throw "分发文件未复制：$name"
+            }
+        }
+        $incompleteSource = Join-Path $testDir 'doc-incomplete'
+        New-Item -ItemType Directory -Path $incompleteSource | Out-Null
+        [IO.File]::WriteAllText((Join-Path $incompleteSource 'LICENSE'), 'license')
+        $rejected = $false
+        try { Copy-DistributionDocuments $incompleteSource $docTarget | Out-Null } catch { $rejected = $true }
+        if (-not $rejected) { throw '缺少第三方声明时不得生成安装包目录' }
         $plainBuildArguments = @(Get-TauriBuildArguments $true)
         if (($plainBuildArguments -join ' ') -ne 'build --no-bundle' -or
             $plainBuildArguments -contains '--bundles') { throw 'NoInstaller 构建参数错误' }
@@ -164,7 +196,7 @@ if ($TestSmokeHarness) {
             try { Test-SmokeResult $case.Exit $case.Output | Out-Null } catch { $rejected = $true }
             if (-not $rejected) { throw '失败或不完整结果被误判为通过' }
         }
-        Ok '冒烟门禁回归通过：产品名/安装包筛选 + 构建参数 + WAV + 正常完成 + 6 类失败/不完整结果'
+        Ok '冒烟门禁回归通过：产品名/安装包筛选 + 分发文件 + 构建参数 + WAV + 正常完成 + 6 类失败/不完整结果'
     } finally {
         Remove-Item -Recurse -Force $testDir
     }
@@ -255,8 +287,10 @@ Step '3/4' '安装包'
 
 if ($NoInstaller) {
     Warn '按参数要求跳过了'
+    $distDir = Join-Path $Root 'target\release'
 } else {
-    $nsis = Find-NsisInstaller (Join-Path $Root 'target\release\bundle\nsis') $AppName $tauriConfig.version
+    $distDir = Join-Path $Root 'target\release\bundle\nsis'
+    $nsis = Find-NsisInstaller $distDir $AppName $tauriConfig.version
     if ($null -eq $nsis) {
         Bad "没找到本次 NSIS 安装包：${AppName}_$($tauriConfig.version)_*-setup.exe"
         exit 1
@@ -264,6 +298,12 @@ if ($NoInstaller) {
     Ok "安装包：$($nsis.Name)（$([math]::Round($nsis.Length / 1MB, 1)) MB）"
     Write-Host "     $($nsis.FullName)"
 }
+
+# 安装包本身只含 exe；许可证与第三方声明放在同一交付目录，随安装包一起分发。
+# 变声的 C++ 后端由 cc 静态编入 exe，不需要额外 DLL；安装包与 CRT/DLL 完整性
+# 仍需 Windows 真机安装验收。
+Copy-DistributionDocuments $Root $distDir
+Ok "LICENSE 与第三方声明：$distDir"
 
 # ── 4. 下一步 ──────────────────────────────────────────────────
 Step '4/4' '下一步'

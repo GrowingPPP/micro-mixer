@@ -70,6 +70,34 @@ test('macOS packaging and app verification derive names from metadata, including
   }
 });
 
+test('第三方声明包含变声依赖并随双端产物分发', () => {
+  const notices = fs.readFileSync(path.join(root, 'THIRD-PARTY-NOTICES.md'), 'utf8');
+  for (const crate of ['signalsmith-stretch', 'cc', 'bindgen', 'clang-sys']) {
+    assert.match(notices, new RegExp(`^- ${crate} \\d+\\.\\d+\\.\\d+$`, 'm'),
+      `${crate} must be listed in the shipped notices`);
+  }
+  assert.match(notices, /Copyright 2024 Colin Marc/,
+    'Signalsmith Stretch copyright must be retained');
+  assert.match(notices, /Permission is hereby granted, free of charge/,
+    'Signalsmith Stretch MIT text must be retained');
+
+  const mac = fs.readFileSync(path.join(root, 'apps/mixer-gui/build-app.sh'), 'utf8');
+  const copyIntoApp = 'cp "$REPO_ROOT/THIRD-PARTY-NOTICES.md" "$APP/Contents/Resources/THIRD-PARTY-NOTICES.md"';
+  const copyIntoDmg = 'cp "$REPO_ROOT/THIRD-PARTY-NOTICES.md" "$STAGE/第三方依赖声明.md"';
+  assert.ok(mac.includes(copyIntoApp), 'macOS app must bundle the notices');
+  assert.ok(mac.includes(copyIntoDmg), 'DMG must expose the notices without opening the app');
+  assert.ok(mac.indexOf(copyIntoApp) < mac.indexOf('── 2/4 重新签名 ──'),
+    'notices must be copied before signing');
+  assert.ok(mac.includes('[ -f "$DMG_APP/Contents/Resources/THIRD-PARTY-NOTICES.md" ]'),
+    'mounted DMG verification must check the bundled notices');
+
+  const windows = fs.readFileSync(path.join(root, 'apps/mixer-gui/build-app-windows.ps1'), 'utf8');
+  assert.match(windows, /Copy-DistributionDocuments \$Root \$distDir/,
+    'Windows build must publish notices with the installer');
+  assert.ok(windows.includes("'THIRD-PARTY-NOTICES.md'"),
+    'Windows distribution documents must include the notices');
+});
+
 test('macOS permission prompts identify the same application as the bundle metadata', () => {
   const plist = fs.readFileSync(path.join(root, 'apps/mixer-gui/Info.plist'), 'utf8');
   for (const key of ['NSMicrophoneUsageDescription', 'NSDownloadsFolderUsageDescription',
