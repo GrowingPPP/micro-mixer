@@ -7,6 +7,7 @@ pub mod chain;
 pub mod control;
 pub mod effects;
 pub mod params;
+pub mod preview;
 pub mod runtime;
 
 #[cfg(feature = "voice")]
@@ -17,6 +18,10 @@ pub use chain::VoiceChain;
 pub use control::{VoiceControl, VoiceParamBuffer};
 pub use effects::EffectChain;
 pub use params::VoiceParams;
+pub use preview::{
+    PreviewError, VoicePreviewBuffer, VoicePreviewClip, VoicePreviewControl, VoicePreviewSource,
+    VoicePreviewStart,
+};
 pub use runtime::{VoicePhase, VoiceRuntime, VoiceSetup};
 
 /// 按输出采样率创建变声后端的工厂。

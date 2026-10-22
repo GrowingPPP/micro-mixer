@@ -12,10 +12,13 @@ use anyhow::{Context, Result};
 use audio_core::decode::decode_file;
 use audio_core::device::{AudioBackend, DeviceId, DeviceInfo, Direction, StreamFormat};
 use audio_core::engine::{EngineParts, EngineStats, PlaybackControl, RenderProcessor, SfxSlot};
-use audio_core::voice::{VoiceControl, VoiceParams, VoiceSetup};
+use audio_core::voice::{VoiceControl, VoiceParams, VoicePreviewBuffer, VoiceSetup};
 use backend_cpal::{CpalBackend, StreamHealth};
 
-pub use audio_core::voice::{VoiceBackend, VoiceBackendFactory};
+pub use audio_core::voice::{
+    PreviewError, VoiceBackend, VoiceBackendFactory, VoicePreviewClip, VoicePreviewControl,
+    VoicePreviewSource, VoicePreviewStart,
+};
 
 /// 创建按输出采样率构造 Signalsmith 后端的工厂。
 ///
@@ -347,6 +350,7 @@ pub struct Session {
     pub monitor_health: Arc<StreamHealth>,
     pub dump_dropped_samples: Arc<AtomicU64>,
     voice_control: Option<VoiceControl>,
+    voice_preview_control: Option<VoicePreviewControl>,
     shutdown: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -461,6 +465,14 @@ impl Session {
         self.voice_control.clone()
     }
 
+    /// 人声试听控制句柄；会话没有变声配置时为 `None`。
+    ///
+    /// 记录区在会话构造时按输出采样率分配，随会话释放回收。句柄可克隆，
+    /// 但只应在本会话存续期间使用。
+    pub fn voice_preview_control(&self) -> Option<VoicePreviewControl> {
+        self.voice_preview_control.clone()
+    }
+
     pub fn open(options: SessionOptions) -> Result<Self> {
         Self::open_with_dump(options, None)
     }
@@ -502,7 +514,8 @@ impl Session {
         startup_timeout: Duration,
     ) -> Result<Self> {
         // 后端在建立任何流之前创建；失败时直接返回，不留下半套会话。
-        let voice = match options.voice.take() {
+        // 记录区与后端同生命周期，释放会话时一并回收。
+        let (voice, voice_preview_control) = match options.voice.take() {
             Some(voice) => {
                 let backend = (voice.backend)(options.output_format.sample_rate)
                     .context("创建变声后端失败")?;
@@ -510,9 +523,14 @@ impl Session {
                 if voice.enabled {
                     control.request_enable();
                 }
-                Some(VoiceSetup::with_control(control, voice.block_ms, backend))
+                let preview_buffer =
+                    VoicePreviewBuffer::new(options.output_format.sample_rate, 3.0);
+                let preview = VoicePreviewControl::new(&control, preview_buffer.clone());
+                let setup = VoiceSetup::with_control(control, voice.block_ms, backend)
+                    .with_preview(preview_buffer);
+                (Some(setup), Some(preview))
             }
-            None => None,
+            None => (None, None),
         };
         let voice_control = voice.as_ref().map(|setup| setup.control.clone());
         // 人声链只进入主输出；监听仍使用无变声引擎，保持仅音效。
@@ -702,6 +720,7 @@ impl Session {
                 monitor_health,
                 dump_dropped_samples,
                 voice_control,
+                voice_preview_control,
                 shutdown,
                 thread: Some(thread),
             }),

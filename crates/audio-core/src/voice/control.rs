@@ -194,8 +194,11 @@ impl VoiceControl {
     }
 
     /// 发布完整参数快照；下一次算法块边界生效。
+    ///
+    /// 参数切换会改变试听听到的声音，尚未完成的记录随之失效。
     pub fn set_params(&self, params: VoiceParams) {
         self.param_buffer.publish(params);
+        self.runtime.cancel_preview();
     }
 
     /// 最近一次完整参数快照。

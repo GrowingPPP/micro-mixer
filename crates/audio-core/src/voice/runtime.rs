@@ -7,6 +7,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use super::preview::{PreviewError, PreviewSnapshot, VoicePreviewSource};
 use super::{VoiceBackend, VoiceControl, VoiceParams};
 
 /// 变声运行阶段。
@@ -50,6 +51,33 @@ fn unpack(raw: u64) -> (u64, VoicePhase) {
     )
 }
 
+const PREVIEW_KIND_BITS: u32 = 3;
+const PREVIEW_KIND_MASK: u64 = (1 << PREVIEW_KIND_BITS) - 1;
+
+const PREVIEW_INACTIVE: u64 = 0;
+const PREVIEW_CAPTURE_ACTIVE: u64 = 1;
+const PREVIEW_RENDER_ACTIVE: u64 = 2;
+const PREVIEW_CAPTURE_FINISHED: u64 = 3;
+const PREVIEW_RENDER_FINISHED: u64 = 4;
+
+#[inline]
+fn pack_preview(generation: u64, kind: u64) -> u64 {
+    (generation << PREVIEW_KIND_BITS) | kind
+}
+
+#[inline]
+fn unpack_preview(raw: u64) -> (u64, u64) {
+    (raw >> PREVIEW_KIND_BITS, raw & PREVIEW_KIND_MASK)
+}
+
+#[inline]
+fn preview_active_kind(source: VoicePreviewSource) -> u64 {
+    match source {
+        VoicePreviewSource::Capture => PREVIEW_CAPTURE_ACTIVE,
+        VoicePreviewSource::Render => PREVIEW_RENDER_ACTIVE,
+    }
+}
+
 /// 采集侧与渲染侧共享的变声状态。
 ///
 /// 请求方法可在任意线程调用；采集回调通过 [`VoiceRuntime::phase`] 读取阶段，
@@ -59,6 +87,8 @@ pub struct VoiceRuntime {
     state: AtomicU64,
     /// 渲染侧完成路径限幅影子预热的代次（存 generation + 1，0 表示未就绪）。
     render_ready: AtomicU64,
+    /// 试听代次、来源与完成状态打包；阶段变化时取消。
+    preview: AtomicU64,
 }
 
 impl Default for VoiceRuntime {
@@ -66,6 +96,7 @@ impl Default for VoiceRuntime {
         Self {
             state: AtomicU64::new(pack(0, VoicePhase::Off)),
             render_ready: AtomicU64::new(0),
+            preview: AtomicU64::new(pack_preview(0, PREVIEW_INACTIVE)),
         }
     }
 }
@@ -89,6 +120,8 @@ impl VoiceRuntime {
                         .compare_exchange_weak(raw, next, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
+                        // 试听记录绑定当前阶段的信号路径，阶段变化后旧路径不再成立。
+                        self.cancel_preview();
                         return;
                     }
                 }
@@ -122,6 +155,7 @@ impl VoiceRuntime {
                 .compare_exchange_weak(raw, next, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                self.cancel_preview();
                 return;
             }
         }
@@ -144,6 +178,7 @@ impl VoiceRuntime {
                         .compare_exchange_weak(raw, next, Ordering::AcqRel, Ordering::Acquire)
                         .is_ok()
                     {
+                        self.cancel_preview();
                         return;
                     }
                 }
@@ -183,9 +218,14 @@ impl VoiceRuntime {
         }
         let expected = pack(generation, VoicePhase::Warmup);
         let next = pack(generation, VoicePhase::Wet);
-        self.state
+        let changed = self
+            .state
             .compare_exchange(expected, next, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .is_ok();
+        if changed {
+            self.cancel_preview();
+        }
+        changed
     }
 
     /// 只允许发起这次淡出的那一代把阶段推进到关闭。
@@ -194,9 +234,135 @@ impl VoiceRuntime {
     pub(crate) fn finish_fade_out(&self, generation: u64) -> bool {
         let expected = pack(generation, VoicePhase::FadingOut);
         let next = pack(generation, VoicePhase::Off);
-        self.state
+        let changed = self
+            .state
             .compare_exchange(expected, next, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .is_ok();
+        if changed {
+            self.cancel_preview();
+        }
+        changed
+    }
+
+    /// 开始一次试听；已有记录占用记录区时返回 [`PreviewError::AlreadyActive`]。
+    pub(crate) fn start_preview(&self, source: VoicePreviewSource) -> Result<u64, PreviewError> {
+        loop {
+            let raw = self.preview.load(Ordering::Acquire);
+            let (generation, kind) = unpack_preview(raw);
+            if kind != PREVIEW_INACTIVE {
+                return Err(PreviewError::AlreadyActive);
+            }
+            // 代次在取消后继续递增，旧写入者无法命中新一次记录。
+            let next_generation = generation.wrapping_add(1);
+            let next = pack_preview(next_generation, preview_active_kind(source));
+            if self
+                .preview
+                .compare_exchange_weak(raw, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(next_generation);
+            }
+        }
+    }
+
+    /// 取消当前试听；代次保留以便旧写入继续被丢弃。
+    pub(crate) fn cancel_preview(&self) -> bool {
+        loop {
+            let raw = self.preview.load(Ordering::Acquire);
+            let (generation, kind) = unpack_preview(raw);
+            if kind == PREVIEW_INACTIVE {
+                return false;
+            }
+            let next = pack_preview(generation, PREVIEW_INACTIVE);
+            if self
+                .preview
+                .compare_exchange_weak(raw, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    /// 音频侧报告记录区已写满，把当前代次标记为冻结。
+    pub(crate) fn finish_preview(&self, generation: u64) -> bool {
+        loop {
+            let raw = self.preview.load(Ordering::Acquire);
+            let (current, kind) = unpack_preview(raw);
+            if current != generation {
+                return false;
+            }
+            let finished = match kind {
+                PREVIEW_CAPTURE_ACTIVE => PREVIEW_CAPTURE_FINISHED,
+                PREVIEW_RENDER_ACTIVE => PREVIEW_RENDER_FINISHED,
+                _ => return false,
+            };
+            if self
+                .preview
+                .compare_exchange_weak(
+                    raw,
+                    pack_preview(generation, finished),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    /// 控制线程取走冻结片段后释放记录区。
+    pub(crate) fn complete_preview(&self, generation: u64) -> bool {
+        loop {
+            let raw = self.preview.load(Ordering::Acquire);
+            let (current, kind) = unpack_preview(raw);
+            if current != generation
+                || !matches!(kind, PREVIEW_CAPTURE_FINISHED | PREVIEW_RENDER_FINISHED)
+            {
+                return false;
+            }
+            if self
+                .preview
+                .compare_exchange_weak(
+                    raw,
+                    pack_preview(generation, PREVIEW_INACTIVE),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    /// 当前试听状态；没有记录占用记录区时返回 `None`。
+    pub(crate) fn preview_snapshot(&self) -> Option<PreviewSnapshot> {
+        let (generation, kind) = unpack_preview(self.preview.load(Ordering::Acquire));
+        match kind {
+            PREVIEW_CAPTURE_ACTIVE => Some(PreviewSnapshot {
+                generation,
+                source: VoicePreviewSource::Capture,
+                finished: false,
+            }),
+            PREVIEW_RENDER_ACTIVE => Some(PreviewSnapshot {
+                generation,
+                source: VoicePreviewSource::Render,
+                finished: false,
+            }),
+            PREVIEW_CAPTURE_FINISHED => Some(PreviewSnapshot {
+                generation,
+                source: VoicePreviewSource::Capture,
+                finished: true,
+            }),
+            PREVIEW_RENDER_FINISHED => Some(PreviewSnapshot {
+                generation,
+                source: VoicePreviewSource::Render,
+                finished: true,
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -210,6 +376,8 @@ pub struct VoiceSetup {
     pub control: VoiceControl,
     pub block_ms: f32,
     pub backend: Box<dyn VoiceBackend + Send>,
+    /// 会话创建的三秒记录区；采集触点在关闭或旁路阶段复用人声链写入它。
+    pub(crate) preview: Option<Arc<super::VoicePreviewBuffer>>,
 }
 
 impl VoiceSetup {
@@ -237,7 +405,16 @@ impl VoiceSetup {
             control,
             block_ms,
             backend,
+            preview: None,
         }
+    }
+
+    /// 接入会话创建的人声试听记录区。
+    ///
+    /// 引擎只读记录区的预分配容量，采集与渲染回调按运行时发布的代次写入。
+    pub fn with_preview(mut self, preview: Arc<super::VoicePreviewBuffer>) -> Self {
+        self.preview = Some(preview);
+        self
     }
 }
 

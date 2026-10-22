@@ -19,6 +19,7 @@ use crate::decode::DecodedAudio;
 use crate::device::StreamFormat;
 use crate::limiter::Limiter;
 use crate::resample::{DriftController, LinearResampler};
+use crate::voice::preview::{PreviewSnapshot, VoicePreviewBuffer, VoicePreviewSource};
 use crate::voice::{VoiceChain, VoiceControl, VoicePhase, VoiceRuntime, VoiceSetup};
 
 // ─────────────────────────────────────────── 无锁原子量
@@ -577,12 +578,21 @@ struct VoiceTee {
     /// 最近一个有效湿声样本；链内 FIFO 暂时排空时用它补齐，避免把干声
     /// 插进淡化中间造成权重跳变。
     wet_hold: f32,
+    /// 会话创建的试听记录区；没有预览配置时为空。
+    preview: Option<Arc<VoicePreviewBuffer>>,
+    /// 当前采集侧试听代次；0 表示未参与试听。
+    preview_generation: u64,
+    /// 试听链已产出的帧数，用于跳过算法延迟中的初始样本。
+    preview_primed: usize,
 }
 
 impl VoiceTee {
     fn new(setup: VoiceSetup, block_frames: usize, sample_rate: u32) -> Self {
         let VoiceSetup {
-            control, backend, ..
+            control,
+            backend,
+            preview,
+            ..
         } = setup;
         let runtime = control.runtime();
         let chain = SendVoiceChain(VoiceChain::new_with_control(
@@ -613,6 +623,9 @@ impl VoiceTee {
             fade_pos: 0,
             crossfade_frames,
             wet_hold: 0.0,
+            preview,
+            preview_generation: 0,
+            preview_primed: 0,
         }
     }
 
@@ -631,9 +644,30 @@ impl VoiceTee {
         let frames = dry.len();
         let (phase, generation) = self.runtime.snapshot();
         self.sync(phase, generation);
+        self.sync_preview(self.runtime.preview_snapshot());
 
         match self.state {
             VoiceTeeState::Idle => {
+                if self.preview_generation != 0 {
+                    let wet_frames = self.chain.0.process(dry, &mut out[..frames]);
+                    let latency = self.chain.0.latency_frames();
+                    let skip = latency.saturating_sub(self.preview_primed).min(wet_frames);
+                    self.preview_primed = self.preview_primed.saturating_add(wet_frames);
+                    let preview_generation = self.preview_generation;
+                    let mut full = false;
+                    if let Some(preview) = self.preview.as_ref() {
+                        for &sample in &out[skip..wet_frames] {
+                            if !preview.push(preview_generation, sample) {
+                                break;
+                            }
+                        }
+                        full = preview.is_full();
+                    }
+                    if full {
+                        self.finish_preview(preview_generation);
+                    }
+                }
+                // 试听只写记录区；环形缓冲始终得到干声，正式转发不受影响。
                 out[..frames].copy_from_slice(dry);
                 frames
             }
@@ -681,6 +715,46 @@ impl VoiceTee {
                 frames
             }
         }
+    }
+
+    /// 按运行时代次同步采集试听：只有关闭或旁路阶段使用采集侧来源。
+    ///
+    /// 试听代次变化时从零预热当前链；取消或完成时停止写入并复位链路，
+    /// 避免下一次试听混入上半段样本。
+    fn sync_preview(&mut self, preview: Option<PreviewSnapshot>) {
+        let active = if self.preview.is_some() {
+            preview.and_then(|snapshot| {
+                (!snapshot.finished && snapshot.source == VoicePreviewSource::Capture)
+                    .then_some(snapshot.generation)
+            })
+        } else {
+            None
+        };
+        match active {
+            Some(generation) => {
+                if self.preview_generation != generation {
+                    self.preview_generation = generation;
+                    self.preview_primed = 0;
+                    self.chain.0.reset();
+                }
+            }
+            None => {
+                if self.preview_generation != 0 {
+                    self.preview_generation = 0;
+                    self.preview_primed = 0;
+                    if self.state == VoiceTeeState::Idle {
+                        self.chain.0.reset();
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish_preview(&mut self, generation: u64) {
+        self.runtime.finish_preview(generation);
+        self.preview_generation = 0;
+        self.preview_primed = 0;
+        self.chain.0.reset();
     }
 
     /// 按运行时代次同步本地状态；同代次内的阶段推进由本状态机完成。
@@ -1030,6 +1104,8 @@ pub struct RenderProcessor {
     /// 渲染侧在块边界读取变声阶段，供路径限幅选择处理链路。
     voice_runtime: Option<Arc<VoiceRuntime>>,
     voice_phase: VoicePhase,
+    /// 会话创建的试听记录区；湿声阶段在路径限幅后写入左声道。
+    preview: Option<Arc<VoicePreviewBuffer>>,
 }
 
 impl RenderProcessor {
@@ -1249,6 +1325,10 @@ impl RenderProcessor {
             .voice_runtime
             .as_ref()
             .map_or((VoicePhase::Off, 0), |runtime| runtime.snapshot());
+        let preview = self
+            .voice_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.preview_snapshot());
         self.sync_path_limiters(phase, generation);
         self.voice_phase = phase;
         let dev_ch = self.out_channels.max(1);
@@ -1316,6 +1396,21 @@ impl RenderProcessor {
             {
                 voice_limiter.process_in_place(&mut self.path_voice[..used]);
                 sfx_limiter.process_in_place(&mut self.path_sfx[..used]);
+            }
+            // 试听在路径限幅之后、混入音效之前取左声道；来源与代次由运行时发布。
+            if let (Some(buffer), Some(snapshot)) = (self.preview.as_ref(), preview) {
+                if !snapshot.finished && snapshot.source == VoicePreviewSource::Render {
+                    for frame in self.path_voice[..used].as_chunks::<2>().0 {
+                        if !buffer.push(snapshot.generation, frame[0]) {
+                            break;
+                        }
+                    }
+                    if buffer.is_full() {
+                        if let Some(runtime) = self.voice_runtime.as_ref() {
+                            runtime.finish_preview(snapshot.generation);
+                        }
+                    }
+                }
             }
         }
         // 干声链：混音后单限幅；路径链与干声链按当前权重交叉混合后再进入末端限幅。
@@ -1572,6 +1667,7 @@ impl EngineParts {
         let base_ratio = output_format.sample_rate as f64 / input_format.sample_rate.max(1) as f64;
 
         let voice_control = voice.as_ref().map(|setup| setup.control.clone());
+        let preview = voice.as_ref().and_then(|setup| setup.preview.clone());
         let max_capture_ratio = base_ratio * 1.02;
         let capture_chunk_frames = ((8192.0 / max_capture_ratio).floor() as usize).clamp(1, 1024);
         let capture_output_samples =
@@ -1667,6 +1763,7 @@ impl EngineParts {
             sample_rate: output_format.sample_rate,
             voice_runtime,
             voice_phase: VoicePhase::Off,
+            preview,
         };
 
         Self {
@@ -1683,7 +1780,10 @@ impl EngineParts {
 mod tests {
     use super::*;
     use crate::test_support::count_allocations;
-    use crate::voice::{VoiceBackend, VoiceParams, VoicePhase, VoiceRuntime, VoiceSetup};
+    use crate::voice::{
+        VoiceBackend, VoiceParams, VoicePhase, VoicePreviewBuffer, VoicePreviewControl,
+        VoicePreviewSource, VoiceRuntime, VoiceSetup,
+    };
     use std::cell::Cell;
 
     fn 空槽位() -> Vec<SfxSlot> {
@@ -4439,6 +4539,259 @@ mod tests {
         assert!(
             等待 >= 至少等待,
             "淡出阶段停止在 {等待} 帧确认，早于音效限幅与末端尾部 {至少等待} 帧"
+        );
+    }
+
+    /// 试听夹具：一条增益后端、一份三秒记录区与会话控制。
+    struct 试听夹具 {
+        engine: EngineParts,
+        runtime: Arc<VoiceRuntime>,
+        control: VoiceControl,
+        buffer: Arc<VoicePreviewBuffer>,
+        preview: VoicePreviewControl,
+    }
+
+    struct GainBackend {
+        gain: f32,
+    }
+
+    impl VoiceBackend for GainBackend {
+        fn process(&mut self, input: &[f32], output: &mut [f32]) -> usize {
+            let frames = input.len().min(output.len());
+            for (slot, sample) in output[..frames].iter_mut().zip(&input[..frames]) {
+                *slot = *sample * self.gain;
+            }
+            frames
+        }
+
+        fn latency_frames(&self) -> usize {
+            0
+        }
+
+        fn reset(&mut self) {}
+
+        fn set_params(&mut self, _params: VoiceParams) {}
+    }
+
+    fn 构造试听夹具(gain: f32) -> 试听夹具 {
+        let runtime = Arc::new(VoiceRuntime::new());
+        let control = VoiceControl::with_runtime(runtime.clone(), VoiceParams::neutral());
+        let buffer = VoicePreviewBuffer::new(48_000, 3.0);
+        let preview = VoicePreviewControl::new(&control, buffer.clone());
+        let setup =
+            VoiceSetup::with_control(control.clone(), 变声块毫秒, Box::new(GainBackend { gain }))
+                .with_preview(buffer.clone());
+        let engine = EngineParts::build_with_voice(
+            StreamFormat::new(48_000, 1),
+            StreamFormat::stereo(48_000),
+            空槽位(),
+            变声缓冲毫秒,
+            Some(setup),
+        );
+        试听夹具 {
+            engine,
+            runtime,
+            control,
+            buffer,
+            preview,
+        }
+    }
+
+    fn 驱动试听(夹具: &mut 试听夹具, 块数: usize) -> Vec<f32> {
+        let input = vec![0.1f32; 变声块帧];
+        let mut out = vec![0.0f32; 变声块帧 * 2];
+        for _ in 0..块数 {
+            夹具.engine.capture.process(&input);
+            夹具.engine.render.process(&mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn 关闭状态试听只录湿声不转发() {
+        let mut 夹具 = 构造试听夹具(2.0);
+        夹具.engine.control.mic_gain_db.set(0.0);
+        夹具.engine.control.sfx_gain_db.set(-100.0);
+        assert_eq!(夹具.runtime.phase(), VoicePhase::Off);
+
+        let start = 夹具.preview.start().expect("关闭状态应开始采集试听");
+        assert_eq!(start.source, VoicePreviewSource::Capture);
+        let out = 驱动试听(&mut 夹具, 320);
+
+        assert_eq!(
+            夹具.runtime.phase(),
+            VoicePhase::Off,
+            "试听不得改变变声阶段"
+        );
+        let left = 左声道(&out);
+        assert!(
+            (left[变声块帧 - 1] - 0.1).abs() < 1e-3,
+            "环形缓冲输出必须保持干声，实际 {}",
+            left[变声块帧 - 1]
+        );
+        assert!(夹具.preview.is_finished());
+        let clip = 夹具.preview.take().expect("写满三秒后应冻结");
+        assert_eq!(clip.samples.len(), 48_000 * 3);
+        assert_eq!(clip.sample_rate, 48_000);
+        assert!(!clip.post_limiter, "采集侧片段尚未经过渲染限幅");
+        assert!(
+            clip.samples
+                .iter()
+                .all(|sample| (*sample - 0.2).abs() < 1e-4),
+            "记录区应包含后端处理后的湿声"
+        );
+    }
+
+    #[test]
+    fn 临时旁路试听同样只录不转发() {
+        let mut 夹具 = 构造试听夹具(2.0);
+        let runtime = 夹具.runtime.clone();
+        静音进入湿声(&mut 夹具.engine, &runtime);
+        assert_eq!(runtime.phase(), VoicePhase::Wet);
+        夹具.engine.control.mic_gain_db.set(0.0);
+        for _ in 0..8 {
+            驱动试听(&mut 夹具, 1);
+        }
+
+        runtime.request_bypass();
+        for _ in 0..80 {
+            if runtime.phase() == VoicePhase::Off {
+                break;
+            }
+            驱动试听(&mut 夹具, 1);
+        }
+        assert_eq!(runtime.phase(), VoicePhase::Off, "旁路完成后应回到关闭");
+
+        // 预设必须在开始试听前切换；试听期间切预设会取消记录。
+        夹具.control.set_params(VoiceParams {
+            pitch_semitones: 5.0,
+            ..VoiceParams::neutral()
+        });
+        let start = 夹具.preview.start().expect("旁路后应开始采集试听");
+        assert_eq!(start.source, VoicePreviewSource::Capture);
+        let out = 驱动试听(&mut 夹具, 320);
+        let left = 左声道(&out);
+        assert!(
+            (left[变声块帧 - 1] - 0.1).abs() < 1e-3,
+            "旁路期间输出必须保持原声，实际 {}",
+            left[变声块帧 - 1]
+        );
+        let clip = 夹具.preview.take().expect("写满三秒后应冻结");
+        assert!(
+            clip.samples
+                .iter()
+                .all(|sample| (*sample - 0.2).abs() < 1e-4),
+            "记录区应包含按当前预设处理后的声音"
+        );
+    }
+
+    #[test]
+    fn 启用状态试听从人声限幅之后取音() {
+        let mut 夹具 = 构造试听夹具(2.0);
+        let runtime = 夹具.runtime.clone();
+        静音进入湿声(&mut 夹具.engine, &runtime);
+        assert_eq!(runtime.phase(), VoicePhase::Wet);
+        夹具.engine.control.mic_gain_db.set(0.0);
+        夹具.engine.control.sfx_gain_db.set(-100.0);
+
+        let input = vec![0.1f32; 变声块帧];
+        let mut out = vec![0.0f32; 变声块帧 * 2];
+        for _ in 0..8 {
+            夹具.engine.capture.process(&input);
+            夹具.engine.render.process(&mut out);
+        }
+        let start = 夹具.preview.start().expect("湿声阶段应开始渲染侧试听");
+        assert_eq!(start.source, VoicePreviewSource::Render);
+
+        let mut 参考 = Vec::with_capacity(48_000 * 3);
+        for _ in 0..320 {
+            夹具.engine.capture.process(&input);
+            夹具.engine.render.process(&mut out);
+            // 音效静音时 path_voice 等于人声路径限幅后的左声道。
+            for frame in 夹具.engine.render.path_voice[..变声块帧 * 2]
+                .as_chunks::<2>()
+                .0
+            {
+                参考.push(frame[0]);
+            }
+        }
+        assert!(夹具.preview.is_finished());
+        let clip = 夹具.preview.take().expect("写满三秒后应冻结");
+        assert!(clip.post_limiter, "渲染侧片段已经过路径限幅");
+        assert_eq!(clip.samples.len(), 48_000 * 3);
+        assert_eq!(
+            clip.samples.as_slice(),
+            &参考[..48_000 * 3],
+            "预览必须与路径限幅后的左声道逐样本一致"
+        );
+    }
+
+    #[test]
+    fn 试听取消后清空且不留下半段() {
+        let mut 夹具 = 构造试听夹具(2.0);
+        夹具.engine.control.mic_gain_db.set(0.0);
+        夹具.engine.control.sfx_gain_db.set(-100.0);
+        let start = 夹具.preview.start().expect("关闭状态应开始采集试听");
+        assert_eq!(start.source, VoicePreviewSource::Capture);
+
+        驱动试听(&mut 夹具, 20);
+        assert!(夹具.buffer.write_pos() > 0, "取消前应已记录部分样本");
+        夹具.preview.stop();
+        assert_eq!(夹具.buffer.write_pos(), 0, "取消必须清空记录区");
+        assert!(!夹具.preview.is_finished());
+        assert!(夹具.preview.take().is_none(), "取消后不得返回半段");
+
+        let out = 驱动试听(&mut 夹具, 8);
+        let left = 左声道(&out);
+        assert!(
+            left.iter().all(|sample| (*sample - 0.1).abs() < 1e-3),
+            "取消试听不得中断正式转发"
+        );
+        assert_eq!(夹具.runtime.phase(), VoicePhase::Off);
+    }
+
+    #[test]
+    fn 试听写入零分配无锁() {
+        let mut 夹具 = 构造试听夹具(2.0);
+        夹具.engine.control.mic_gain_db.set(0.0);
+        夹具.engine.control.sfx_gain_db.set(-100.0);
+        let input = vec![0.1f32; 变声块帧];
+        let mut out = vec![0.0f32; 变声块帧 * 2];
+
+        夹具.preview.start().expect("关闭状态应开始采集试听");
+        // 先预热一块，排除首次进入记录路径的惰性初始化。
+        夹具.engine.capture.process(&input);
+        夹具.engine.render.process(&mut out);
+        assert_eq!(
+            count_allocations(|| {
+                夹具.engine.capture.process(&input);
+            }),
+            0,
+            "采集试听写入不得分配"
+        );
+
+        夹具.preview.stop();
+        let runtime = 夹具.runtime.clone();
+        runtime.request_enable();
+        for _ in 0..40 {
+            夹具.engine.capture.process(&input);
+            夹具.engine.render.process(&mut out);
+            if runtime.phase() == VoicePhase::Wet {
+                break;
+            }
+        }
+        assert_eq!(runtime.phase(), VoicePhase::Wet);
+        for _ in 0..8 {
+            夹具.engine.capture.process(&input);
+            夹具.engine.render.process(&mut out);
+        }
+        夹具.preview.start().expect("湿声阶段应开始渲染侧试听");
+        assert_eq!(
+            count_allocations(|| {
+                夹具.engine.render.process(&mut out);
+            }),
+            0,
+            "渲染试听写入不得分配"
         );
     }
 

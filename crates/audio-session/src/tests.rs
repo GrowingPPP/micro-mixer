@@ -3,7 +3,7 @@
 
 use super::*;
 use audio_core::device::{AudioStream, CaptureCallback, DeviceInfo, RenderCallback};
-use audio_core::voice::VoicePhase;
+use audio_core::voice::{VoicePhase, VoicePreviewSource};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::thread::ThreadId;
@@ -1075,6 +1075,84 @@ fn 关闭变声的会话保留人声链但转发干声() {
         "启用后必须输出后端湿声，实际 {:?}",
         &wet[..wet.len().min(8)]
     );
+}
+
+#[test]
+fn 试听控制随变声配置创建() {
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let plain = Session::open_with_backend(
+        options(false),
+        FakeBackend::primary(&state),
+        FakeBackend::monitor(&state),
+    )
+    .unwrap();
+    assert!(
+        plain.voice_preview_control().is_none(),
+        "没有变声配置的会话不得提供试听控制"
+    );
+    drop(plain);
+
+    let session = 打开变声会话(
+        &state,
+        false,
+        变声选项(false, VoiceParams::neutral(), 测试变声后端(1.0, 0)),
+    );
+    assert!(
+        session.voice_preview_control().is_some(),
+        "配置变声的会话应提供试听控制"
+    );
+    drop(session);
+    assert_streams_closed_on_owner(&state);
+}
+
+#[test]
+fn 重建会话后旧试听不能进入新记录区() {
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let session = 打开变声会话(
+        &state,
+        false,
+        变声选项(false, VoiceParams::neutral(), 测试变声后端(2.0, 0)),
+    );
+    session.playback.set_gains(0.0, -100.0);
+    let old = session
+        .voice_preview_control()
+        .expect("旧会话应提供试听控制");
+    old.start().expect("关闭状态应开始采集试听");
+    for _ in 0..12 {
+        送入并渲染(&state, 变声测试块, 0.1);
+    }
+    assert!(!old.is_finished(), "旧记录尚未写满");
+    drop(session);
+
+    let session = 打开变声会话(
+        &state,
+        false,
+        变声选项(false, VoiceParams::neutral(), 测试变声后端(3.0, 0)),
+    );
+    session.playback.set_gains(0.0, -100.0);
+    let fresh = session
+        .voice_preview_control()
+        .expect("新会话应提供试听控制");
+    assert!(fresh.take().is_none(), "新记录区初始应为空");
+
+    let start = fresh.start().expect("关闭状态应开始采集试听");
+    assert_eq!(start.source, VoicePreviewSource::Capture);
+    for _ in 0..320 {
+        送入并渲染(&state, 变声测试块, 0.1);
+        if fresh.is_finished() {
+            break;
+        }
+    }
+    assert!(fresh.is_finished(), "三秒后记录区应冻结");
+    let clip = fresh.take().expect("应取回新会话片段");
+    assert_eq!(clip.samples.len(), 48_000 * 3);
+    assert!(
+        clip.samples
+            .iter()
+            .all(|sample| (*sample - 0.3).abs() < 1e-4),
+        "新记录只能包含新会话后端处理的声音"
+    );
+    assert!(old.take().is_none(), "旧会话的未完成记录不得进入新记录区");
 }
 
 #[test]
