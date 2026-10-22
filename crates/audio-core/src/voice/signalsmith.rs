@@ -117,6 +117,7 @@ mod tests {
         let params = VoiceParams {
             pitch_semitones: 4.0,
             formant_semitones: -3.0,
+            ..VoiceParams::neutral()
         };
 
         assert_eq!(count_allocations(|| backend.set_params(params)), 0);
