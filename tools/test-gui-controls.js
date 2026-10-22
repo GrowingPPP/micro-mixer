@@ -7,6 +7,14 @@ const vm = require('node:vm');
 // Exercise the shipped main.js through DOM events and the Tauri IPC boundary.
 // Only the browser, clock and native command boundary are substituted.
 const root = path.join(__dirname, '../apps/mixer-gui/dist');
+// 静态源码只读一次；每个用例仍使用独立 DOM 与 VM 上下文。
+const sources = {
+  index: fs.readFileSync(path.join(root, 'index.html'), 'utf8'),
+  theme: fs.existsSync(path.join(root, 'theme.js'))
+    ? fs.readFileSync(path.join(root, 'theme.js'), 'utf8') : null,
+  library: fs.readFileSync(path.join(root, 'library-model.js'), 'utf8'),
+  main: fs.readFileSync(path.join(root, 'main.js'), 'utf8'),
+};
 const unescape = text => text.replace(/&(?:amp|lt|gt|quot);/g,
   token => ({ '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"' }[token]));
 
@@ -170,13 +178,18 @@ const voiceFixture = command => {
   if (command === 'voice_presets') return voicePresetList;
   return undefined;
 };
+const userPresetFixture = (patch = {}) => ({
+  id: 'user:live', name: '直播女声', builtin: false,
+  params: voiceParams({ pitch_semitones: 2 }),
+  ...patch,
+});
 
 async function boot({ running = false, initialLoop, onInvoke, now, dark = false, storedTheme, storageFailure } = {}) {
   const document = new Element('document', null);
   document.document = document;
   document.createElement = tag => new Element(tag, document);
   document.getElementById = id => document.querySelector('#' + id);
-  document.innerHTML = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
+  document.innerHTML = sources.index;
   document.documentElement = document.querySelector('html');
   if (initialLoop !== undefined) document.getElementById('inLoop').checked = initialLoop;
   const calls = [];
@@ -225,9 +238,9 @@ async function boot({ running = false, initialLoop, onInvoke, now, dark = false,
     clearTimeout(id) { timers.delete(id); },
     setInterval(callback, delay) { const id = nextTimer++; intervals.set(id, { callback, delay }); return id; },
   });
-  if (fs.existsSync(path.join(root, 'theme.js'))) vm.runInContext(fs.readFileSync(path.join(root, 'theme.js'), 'utf8'), context);
-  vm.runInContext(fs.readFileSync(path.join(root, 'library-model.js'), 'utf8'), context);
-  vm.runInContext(fs.readFileSync(path.join(root, 'main.js'), 'utf8'), context);
+  if (sources.theme !== null) vm.runInContext(sources.theme, context);
+  vm.runInContext(sources.library, context);
+  vm.runInContext(sources.main, context);
   await flushBoot();
   assert.equal(document.querySelectorAll('.card').length, 2,
     'the shipped script must initialize and render the loaded library');
@@ -2011,4 +2024,364 @@ test('人声变声状态进入启动参数且配置保存不含变声字段', as
   const saved = app.calls.filter(call => call.command === 'save_config').at(-1);
   assert.ok(saved, '启动前应保存普通配置');
   assert.equal('voice' in saved.args, false, '全量配置保存不能包含变声字段');
+});
+
+// ── 人声效果完整面板 ─────────────────────────────────────────
+
+const hidden = element => element.classList.contains('hidden');
+const paramsCalls = app => app.calls.filter(call => call.command === 'voice_set_params');
+
+test('效果开关与数值分别发送', async () => {
+  const app = await boot({ onInvoke(command, args) {
+    const voice = voiceFixture(command);
+    if (voice !== undefined) return voice;
+    if (command === 'voice_set_params') {
+      return voiceSnapshot({ params: args.params, modified: true, generation: 2 });
+    }
+  } });
+  await app.document.getElementById('voiceEdit').emit('click');
+  const eqOn = app.document.getElementById('eqMidOn');
+  const eq = app.document.getElementById('eqMid');
+  const gateOn = app.document.getElementById('gateOn');
+  const gate = app.document.getElementById('gate');
+  assert.equal(eqOn.checked, false);
+  assert.equal(eq.value, '0');
+
+  // 数值保持 0 dB，仅开关状态不同，快照必须可区分。
+  eq.value = '0';
+  await eq.emit('input');
+  await app.advanceTimers(50);
+  await flushBoot();
+  eqOn.checked = true;
+  await eqOn.emit('change');
+  await app.advanceTimers(50);
+  await flushBoot();
+
+  gate.value = '-20';
+  await gate.emit('input');
+  gateOn.checked = true;
+  await gateOn.emit('change');
+  await app.advanceTimers(50);
+  await flushBoot();
+
+  const snapshots = paramsCalls(app);
+  assert.equal(snapshots.length, 3, '每组效果修改合并为一个完整快照');
+  assert.equal(snapshots[0].args.params.eq_mid_enabled, false);
+  assert.equal(snapshots[0].args.params.eq_mid_db, 0);
+  assert.equal(snapshots[1].args.params.eq_mid_enabled, true);
+  assert.equal(snapshots[1].args.params.eq_mid_db, 0);
+  assert.notDeepEqual(snapshots[0].args.params, snapshots[1].args.params,
+    '0 dB 启用与 0 dB 关闭不能发送相同参数');
+  assert.equal(snapshots[2].args.params.gate_enabled, true);
+  assert.equal(snapshots[2].args.params.gate_db, -20);
+  assert.equal(Object.keys(snapshots[0].args.params).length, Object.keys(voiceParams()).length);
+});
+
+test('另存为用户预设显示名称与当前状态', async () => {
+  let saved = false;
+  const userPreset = userPresetFixture();
+  const app = await boot({ onInvoke(command) {
+    if (command === 'voice_status') return voiceSnapshot();
+    if (command === 'voice_presets') {
+      return saved ? [...voicePresetList, userPreset] : voicePresetList;
+    }
+    if (command === 'voice_save_as_user_preset') {
+      saved = true;
+      return voiceSnapshot({ preset_id: 'user:live', preset_name: '直播女声',
+        params: userPreset.params, modified: false, generation: 2 });
+    }
+  } });
+  await app.document.getElementById('voiceEdit').emit('click');
+  await app.document.getElementById('voiceSaveAs').emit('click');
+  const editor = app.document.getElementById('voiceNameEditor');
+  assert.equal(hidden(editor), false, '另存前应显示名称输入');
+  const name = app.document.getElementById('voicePresetName');
+  name.value = '直播女声';
+  await app.document.getElementById('voiceNameConfirm').emit('click');
+  await flushBoot();
+
+  assert.deepEqual(app.calls.filter(call => call.command === 'voice_save_as_user_preset'), [
+    { command: 'voice_save_as_user_preset', args: { name: '直播女声' } },
+  ], '另存命令只传名称');
+  assert.equal(hidden(editor), true, '保存后收起名称输入');
+  assert.equal(app.document.getElementById('voicePreset').value, 'user:live');
+  assert.equal(app.document.getElementById('voiceCurrentPreset').textContent, '直播女声');
+  assert.match(app.document.getElementById('voiceState').textContent, /直播女声.*已关闭/);
+  assert.equal(app.document.getElementById('voicePreset').options
+    .some(option => option.value === 'user:live'), true, '保存后预设下拉应包含新预设');
+  assert.ok(app.calls.filter(call => call.command === 'voice_presets').length >= 3,
+    '保存成功后应刷新预设列表');
+});
+
+test('内置预设只显示另存操作', async () => {
+  const builtin = await boot({ onInvoke: voiceFixture });
+  await builtin.document.getElementById('voiceEdit').emit('click');
+  assert.equal(hidden(builtin.document.getElementById('voiceSaveAs')), false);
+  assert.equal(hidden(builtin.document.getElementById('voiceSaveChanges')), true);
+  assert.equal(hidden(builtin.document.getElementById('voiceRename')), true);
+  assert.equal(hidden(builtin.document.getElementById('voiceDelete')), true);
+
+  const userPreset = userPresetFixture();
+  const userSnapshot = voiceSnapshot({ enabled: true, preset_id: 'user:live',
+    preset_name: '直播女声', modified: true, params: userPreset.params });
+  const user = await boot({ onInvoke(command) {
+    if (command === 'voice_status') return userSnapshot;
+    if (command === 'voice_presets') return [...voicePresetList, userPreset];
+  } });
+  await user.document.getElementById('voiceEdit').emit('click');
+  for (const id of ['voiceSaveChanges', 'voiceRename', 'voiceDelete']) {
+    assert.equal(hidden(user.document.getElementById(id)), false, `${id} 应在用户预设下可用`);
+  }
+  assert.equal(user.document.getElementById('voiceSaveChanges').disabled, false);
+});
+
+test('用户预设保存修改与重命名发送对应命令', async () => {
+  const userPreset = userPresetFixture();
+  const app = await boot({ onInvoke(command, args) {
+    if (command === 'voice_status') {
+      return voiceSnapshot({ enabled: true, preset_id: 'user:live',
+        preset_name: userPreset.name, modified: true, params: userPreset.params });
+    }
+    if (command === 'voice_presets') return [...voicePresetList, userPreset];
+    if (command === 'voice_save_preset') {
+      return voiceSnapshot({ enabled: true, preset_id: 'user:live',
+        preset_name: userPreset.name, modified: false, params: userPreset.params,
+        generation: 2 });
+    }
+    if (command === 'voice_rename_preset') {
+      userPreset.name = args.name;
+      return voiceSnapshot({ enabled: true, preset_id: 'user:live',
+        preset_name: args.name, modified: false, params: userPreset.params,
+        generation: 3 });
+    }
+  } });
+  await app.document.getElementById('voiceEdit').emit('click');
+  await app.document.getElementById('voiceSaveChanges').emit('click');
+  await flushBoot();
+  assert.deepEqual(app.calls.filter(call => call.command === 'voice_save_preset'), [
+    { command: 'voice_save_preset', args: undefined },
+  ], '保存修改不能带入额外参数');
+  assert.equal(hidden(app.document.getElementById('dirtyBadge')), true,
+    '保存成功后应清除修改状态');
+
+  await app.document.getElementById('voiceRename').emit('click');
+  const editor = app.document.getElementById('voiceNameEditor');
+  assert.equal(hidden(editor), false);
+  app.document.getElementById('voicePresetName').value = '直播人声';
+  await app.document.getElementById('voiceNameConfirm').emit('click');
+  await flushBoot();
+  assert.deepEqual(app.calls.filter(call => call.command === 'voice_rename_preset'), [
+    { command: 'voice_rename_preset', args: { id: 'user:live', name: '直播人声' } },
+  ], '重命名只改名称，不改预设 ID');
+  assert.equal(app.document.getElementById('voiceCurrentPreset').textContent, '直播人声');
+  assert.equal(app.document.getElementById('voicePreset').value, 'user:live');
+});
+
+test('保存失败显示未保存并保留面板', async () => {
+  const userPreset = userPresetFixture();
+  const initial = voiceSnapshot({ enabled: true, preset_id: 'user:live',
+    preset_name: '直播女声', params: userPreset.params });
+  const failed = voiceSnapshot({ enabled: true, preset_id: 'user:live',
+    preset_name: '直播女声', modified: true, params: userPreset.params,
+    save_error: '保存变声配置失败: 磁盘已满', generation: 2 });
+  const app = await boot({ onInvoke(command) {
+    if (command === 'voice_status') return initial;
+    if (command === 'voice_presets') return [...voicePresetList, userPreset];
+    if (command === 'status') return playbackStatus({ voice: failed });
+  } });
+  const overlay = app.document.getElementById('voiceOverlay');
+  await app.document.getElementById('voiceEdit').emit('click');
+  assert.equal(hidden(overlay), false);
+  await app.pollStatus();
+
+  assert.equal(hidden(overlay), false, '保存失败不能关闭面板');
+  const saveState = app.document.getElementById('voiceSaveState');
+  assert.equal(hidden(saveState), false, '保存失败应显示未保存状态');
+  assert.match(saveState.textContent, /未保存/);
+  assert.match(saveState.textContent, /磁盘已满/);
+  assert.equal(hidden(app.document.getElementById('dirtyBadge')), false,
+    '保存失败后仍应显示修改状态');
+  assert.doesNotMatch(overlay.textContent, /已保存/, '保存失败不能显示已保存');
+});
+
+test('草稿入口在切换预设后出现并可恢复', async () => {
+  const app = await boot({ onInvoke(command) {
+    if (command === 'voice_status') return voiceSnapshot();
+    if (command === 'voice_presets') return voicePresetList;
+    if (command === 'voice_select_preset') {
+      return voiceSnapshot({ preset_id: 'builtin:male', preset_name: '男声',
+        params: voiceParams({ pitch_semitones: -4, formant_semitones: -2 }),
+        draft_available: true, generation: 2 });
+    }
+    if (command === 'voice_restore_draft') {
+      return voiceSnapshot({ preset_id: 'builtin:female', preset_name: '女声',
+        params: voiceParams({ pitch_semitones: 7, formant_semitones: 5 }),
+        modified: true, draft_available: false, generation: 3 });
+    }
+  } });
+  await app.document.getElementById('voiceEdit').emit('click');
+  const restore = app.document.getElementById('voiceRestoreDraft');
+  assert.equal(hidden(restore), true, '没有草稿时不显示恢复入口');
+
+  const preset = app.document.getElementById('voicePreset');
+  preset.value = 'builtin:male';
+  await preset.emit('change');
+  await flushBoot();
+  assert.equal(hidden(restore), false, '切换预设留下草稿后应显示恢复入口');
+  assert.equal(restore.textContent, '恢复未保存修改');
+
+  await restore.emit('click');
+  await flushBoot();
+  const restoreCalls = app.calls.filter(call => call.command === 'voice_restore_draft');
+  assert.equal(restoreCalls.length, 1, '恢复草稿应调用宿主命令');
+  assert.equal(restoreCalls[0].args, undefined);
+  assert.equal(app.document.getElementById('pitch').value, '7');
+  assert.equal(preset.value, 'builtin:female');
+  assert.equal(app.document.getElementById('voiceCurrentPreset').textContent, '女声');
+  assert.equal(hidden(restore), true, '恢复后草稿入口应消失');
+});
+
+test('外部切预设刷新面板但不覆盖拖动中的滑杆', async () => {
+  let externalVoice = null;
+  let holdStatus = false;
+  let releaseHeld;
+  const app = await boot({ onInvoke(command, args) {
+    if (command === 'voice_status') return externalVoice || voiceSnapshot();
+    if (command === 'voice_presets') return voicePresetList;
+    if (command === 'status') {
+      if (holdStatus) {
+        holdStatus = false;
+        return new Promise(resolve => { releaseHeld = resolve; });
+      }
+      return playbackStatus({ voice: externalVoice || voiceSnapshot() });
+    }
+    if (command === 'voice_set_params') {
+      return voiceSnapshot({ preset_id: 'builtin:male', preset_name: '男声',
+        params: args.params, modified: true, generation: 6 });
+    }
+  } });
+  await app.document.getElementById('voiceEdit').emit('click');
+  const pitch = app.document.getElementById('pitch');
+  const preset = app.document.getElementById('voicePreset');
+
+  holdStatus = true;
+  await app.pollStatus();
+  assert.equal(typeof releaseHeld, 'function', '应有一份旧状态回复仍在途中');
+
+  pitch.value = '9';
+  await pitch.emit('input');
+  externalVoice = voiceSnapshot({ preset_id: 'builtin:male', preset_name: '男声',
+    params: voiceParams({ pitch_semitones: -4, formant_semitones: -2,
+      eq_low_enabled: true, eq_low_db: 3 }),
+    generation: 5 });
+  await app.pollStatus();
+  assert.equal(preset.value, 'builtin:male', '外部切预设应刷新面板');
+  assert.match(app.document.getElementById('voiceCurrentPreset').textContent, /男声/);
+  assert.equal(pitch.value, '9', '拖动中的滑杆不能被外部快照覆盖');
+
+  releaseHeld(playbackStatus({ voice: voiceSnapshot({ generation: 1 }) }));
+  await flushBoot();
+  assert.equal(preset.value, 'builtin:male', '旧回复不得回退预设');
+  assert.equal(pitch.value, '9', '旧回复不得回退滑杆');
+
+  await app.advanceTimers(50);
+  await flushBoot();
+  const sent = paramsCalls(app).at(-1);
+  assert.ok(sent, '拖动结束后应发送参数');
+  assert.equal(sent.args.params.pitch_semitones, 9, '本地拖动值必须保留');
+  assert.equal(sent.args.params.formant_semitones, -2, '外部参数应合入完整快照');
+  assert.equal(sent.args.params.eq_low_enabled, true);
+});
+
+test('删除当前用户预设回退女声并关闭', async () => {
+  let deleted = false;
+  const userPreset = userPresetFixture();
+  const userSnapshot = voiceSnapshot({ enabled: true, preset_id: 'user:live',
+    preset_name: '直播女声', params: userPreset.params });
+  const app = await boot({ onInvoke(command) {
+    if (command === 'voice_presets') {
+      return deleted ? voicePresetList : [...voicePresetList, userPreset];
+    }
+    if (command === 'voice_status') return deleted
+      ? voiceSnapshot({ enabled: false, params: voiceParams(), generation: 2 })
+      : userSnapshot;
+    if (command === 'voice_delete_preset') {
+      deleted = true;
+      return voiceSnapshot({ enabled: false, preset_id: 'builtin:female',
+        preset_name: '女声', params: voiceParams(), generation: 2 });
+    }
+  } });
+  await app.document.getElementById('voiceEdit').emit('click');
+  await app.document.getElementById('voiceDelete').emit('click');
+  await flushBoot();
+
+  assert.deepEqual(app.calls.filter(call => call.command === 'voice_delete_preset'), [
+    { command: 'voice_delete_preset', args: { id: 'user:live' } },
+  ]);
+  assert.equal(app.document.getElementById('voiceEnabled').checked, false,
+    '删除当前预设后启用开关应关闭');
+  assert.equal(app.document.getElementById('voicePreset').value, 'builtin:female');
+  assert.equal(app.document.getElementById('voicePreset').options
+    .some(option => option.value === 'user:live'), false, '被删除的预设应从下拉移除');
+  assert.match(app.document.getElementById('voiceStatus').textContent, /女声.*已关闭/);
+  assert.match(app.document.getElementById('toast').textContent, /已删除/);
+  assert.match(app.document.getElementById('toast').textContent, /关闭/);
+});
+
+test('效果控件具备可访问名称与数值', async () => {
+  const app = await boot({ onInvoke: voiceFixture });
+  await app.document.getElementById('voiceEdit').emit('click');
+  const cases = [
+    ['gateOn', 'gate', 'gateOut', '噪声门', '噪声门阈值', '-60', '0'],
+    ['eqLowOn', 'eqLow', 'eqLowOut', '低频 EQ', '低频 EQ 增益', '-12', '12'],
+    ['eqMidOn', 'eqMid', 'eqMidOut', '中频 EQ', '中频 EQ 增益', '-12', '12'],
+    ['eqHighOn', 'eqHigh', 'eqHighOut', '高频 EQ', '高频 EQ 增益', '-12', '12'],
+    ['driveOn', 'drive', 'driveOut', '软削波', '软削波量', '0', '1'],
+    ['robotOn', 'robotHz', 'robotHzOut', '环形调制', '环形调制频率', '20', '1000'],
+  ];
+  for (const [toggleId, sliderId, outputId, label, sliderName, min, max] of cases) {
+    const toggle = app.document.getElementById(toggleId);
+    const slider = app.document.getElementById(sliderId);
+    const output = app.document.getElementById(outputId);
+    assert.equal(toggle.getAttribute('aria-label'), label);
+    assert.match(toggle.parentElement.textContent, new RegExp(label));
+    assert.equal(slider.getAttribute('aria-label'), sliderName);
+    assert.equal(slider.getAttribute('min'), min);
+    assert.equal(slider.getAttribute('max'), max);
+    assert.equal(slider.getAttribute('aria-describedby'), outputId);
+    assert.equal(output.tagName, 'OUTPUT');
+    assert.equal(output.getAttribute('for'), sliderId);
+    assert.ok(output.textContent.length > 0, `${outputId} 应显示只读数值`);
+  }
+  const mix = app.document.getElementById('robotMix');
+  assert.equal(mix.getAttribute('aria-label'), '环形调制混合');
+  assert.equal(mix.getAttribute('min'), '0');
+  assert.equal(mix.getAttribute('max'), '1');
+  assert.equal(app.document.getElementById('robotMixOut').textContent, '0.80');
+  assert.equal(app.document.getElementById('gateOut').textContent, '−45 dB');
+  assert.equal(app.document.getElementById('robotHzOut').textContent, '50 Hz');
+});
+
+test('窄窗口面板内部滚动且完成按钮可见', async () => {
+  const css = fs.readFileSync(path.join(root, 'style.css'), 'utf8');
+  assert.match(css, /\.dialog\s*\{[^}]*max-height:\s*100%[^}]*overflow-y:\s*auto/s,
+    '对话框应限制高度并在内部滚动');
+  assert.match(css, /\.voice-dialog \.dialog-footer\s*\{[^}]*position:\s*sticky[^}]*bottom:\s*0/s,
+    '完成按钮所在底部区域应固定可见');
+  assert.match(css, /\.effect-row\s*\{[^}]*minmax\(0,\s*1fr\)/s,
+    '效果行应允许滑杆收缩，避免横向溢出');
+  assert.match(css, /\.effect-row[^{]*\{[^}]*min-width:\s*0/s,
+    '效果控件应能收缩');
+
+  const app = await boot({ onInvoke: voiceFixture });
+  await app.document.getElementById('voiceEdit').emit('click');
+  assert.equal(hidden(app.document.getElementById('voiceOverlay')), false);
+  const done = app.document.getElementById('voiceDone');
+  const dialog = app.document.querySelector('.voice-dialog');
+  assert.ok(dialog, '人声面板应使用受限宽度的对话框');
+  assert.equal(done.textContent, '完成');
+  assert.equal(hidden(done), false);
+  // Node 替身没有布局引擎；上面的样式契约保证滚动与底部固定，这里确认按钮属于该底部区域。
+  const footer = done.closest('.dialog-footer');
+  assert.ok(footer && footer.parentElement === dialog, '完成按钮应位于对话框底部操作区');
 });

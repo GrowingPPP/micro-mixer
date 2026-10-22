@@ -155,6 +155,64 @@
       </div>
       <p class="hint">参数立即作用于当前人声；未保存的修改只在本次运行有效。</p>
     </section>
+    <section class="settings-section">
+      <h3>效果</h3>
+      <div class="param-list effect-list">
+        <div class="param-row effect-row">
+          <label class="effect-toggle"><input id="gateOn" type="checkbox" aria-label="噪声门">噪声门</label>
+          <input id="gate" type="range" min="-60" max="0" step="1" value="-45" aria-label="噪声门阈值" aria-describedby="gateOut">
+          <output id="gateOut" for="gate">−45 dB</output>
+        </div>
+        <div class="param-row effect-row">
+          <label class="effect-toggle"><input id="eqLowOn" type="checkbox" aria-label="低频 EQ">低频 EQ</label>
+          <input id="eqLow" type="range" min="-12" max="12" step="1" value="0" aria-label="低频 EQ 增益" aria-describedby="eqLowOut">
+          <output id="eqLowOut" for="eqLow">0 dB</output>
+        </div>
+        <div class="param-row effect-row">
+          <label class="effect-toggle"><input id="eqMidOn" type="checkbox" aria-label="中频 EQ">中频 EQ</label>
+          <input id="eqMid" type="range" min="-12" max="12" step="1" value="0" aria-label="中频 EQ 增益" aria-describedby="eqMidOut">
+          <output id="eqMidOut" for="eqMid">0 dB</output>
+        </div>
+        <div class="param-row effect-row">
+          <label class="effect-toggle"><input id="eqHighOn" type="checkbox" aria-label="高频 EQ">高频 EQ</label>
+          <input id="eqHigh" type="range" min="-12" max="12" step="1" value="0" aria-label="高频 EQ 增益" aria-describedby="eqHighOut">
+          <output id="eqHighOut" for="eqHigh">0 dB</output>
+        </div>
+        <div class="param-row effect-row">
+          <label class="effect-toggle"><input id="driveOn" type="checkbox" aria-label="软削波">软削波</label>
+          <input id="drive" type="range" min="0" max="1" step="0.05" value="0" aria-label="软削波量" aria-describedby="driveOut">
+          <output id="driveOut" for="drive">0.00</output>
+        </div>
+        <div class="param-row effect-row">
+          <label class="effect-toggle"><input id="robotOn" type="checkbox" aria-label="环形调制">环形调制</label>
+          <input id="robotHz" type="range" min="20" max="1000" step="1" value="50" aria-label="环形调制频率" aria-describedby="robotHzOut">
+          <output id="robotHzOut" for="robotHz">50 Hz</output>
+        </div>
+        <div class="param-row effect-row">
+          <label class="effect-sub-label" for="robotMix">混合</label>
+          <input id="robotMix" type="range" min="0" max="1" step="0.01" value="0.8" aria-label="环形调制混合" aria-describedby="robotMixOut">
+          <output id="robotMixOut" for="robotMix">0.80</output>
+        </div>
+      </div>
+      <p class="hint">开关与数值分别生效；关闭效果时保留当前数值，再次开启沿用。</p>
+    </section>
+    <section class="settings-section">
+      <h3>预设</h3>
+      <p id="voicePresetNote" class="hint">内置预设只读。修改后可另存为用户预设；当前修改只在本次运行有效。</p>
+      <div class="setting-actions preset-actions">
+        <button id="voiceSaveAs" class="primary">另存为用户预设</button>
+        <button id="voiceSaveChanges" class="ghost">保存修改</button>
+        <button id="voiceRename" class="ghost">重命名</button>
+        <button id="voiceDelete" class="quiet danger">删除</button>
+        <button id="voiceRestoreDraft" class="ghost hidden">恢复未保存修改</button>
+      </div>
+      <div id="voiceNameEditor" class="withbtn hidden">
+        <input id="voicePresetName" type="text" maxlength="40" placeholder="预设名称，例如：直播女声" aria-label="预设名称">
+        <button id="voiceNameConfirm" class="primary">保存</button>
+        <button id="voiceNameCancel" class="quiet">取消</button>
+      </div>
+      <p id="voiceSaveState" class="hint error hidden" role="status"></p>
+    </section>
     <div class="dialog-footer"><button id="voiceDone" class="primary">完成</button></div>
   </section>
 </div>

@@ -185,6 +185,16 @@ summary::-webkit-details-marker { display: none; }
 .param-row { display: grid; grid-template-columns: 64px minmax(0, 1fr) 72px; gap: 10px; align-items: center; }
 .param-row > label { color: var(--fg); font-size: 12px; }
 .param-row output { justify-self: end; font: 12px "SFMono-Regular", Consolas, monospace; color: var(--fg); white-space: nowrap; }
+.effect-list { --effect-check-size: 15px; --effect-check-gap: 6px; gap: 10px; }
+.effect-row { grid-template-columns: 92px minmax(0, 1fr) 68px; gap: 8px; }
+.effect-row input[type=range] { min-width: 0; }
+.effect-toggle { flex-direction: row; align-items: center; gap: var(--effect-check-gap); cursor: pointer; }
+.effect-toggle input { width: var(--effect-check-size); height: var(--effect-check-size); margin: 0; flex: 0 0 auto; }
+.effect-sub-label { padding-left: calc(var(--effect-check-size) + var(--effect-check-gap)); }
+#voicePresetNote { margin-top: 0; }
+.preset-actions button { font-size: 12px; }
+#voiceNameEditor { margin-top: 11px; }
+#voiceSaveState { margin-top: 11px; }
 .voice-status { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .transport { flex: 0 0 auto; border-top: 1px solid var(--line); background: var(--panel); }
@@ -326,6 +336,7 @@ a { color: var(--preview); overflow-wrap: anywhere; }
   .modal-overlay { padding: 12px; }
   .dialog { padding: 18px; }
   .param-row { grid-template-columns: 56px minmax(0, 1fr) 66px; gap: 7px; }
+  .effect-row { grid-template-columns: 78px minmax(0, 1fr) 60px; gap: 6px; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition: none !important; animation: none !important; }
