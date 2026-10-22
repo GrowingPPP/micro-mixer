@@ -1389,6 +1389,46 @@ mod command_thread_tests {
         }
     }
 
+    fn registered_commands() -> Vec<&'static str> {
+        include_str!("main.rs")
+            .split("tauri::generate_handler![")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .expect("找不到 generate_handler 列表")
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .collect()
+    }
+
+    /// 交付界面按字面名称调用的命令都必须已注册；漏注册时界面只会得到运行时错误。
+    #[test]
+    fn 界面调用的命令都已注册到命令处理器() {
+        let registered = registered_commands();
+        let script = include_str!("../dist/main.js");
+        let mut checked = 0;
+        for call in ["invoke('", "invokeAudio('"] {
+            for part in script.split(call).skip(1) {
+                let Some(name) = part.split('\'').next() else {
+                    continue;
+                };
+                if name.is_empty() || !name.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                    continue;
+                }
+                assert!(registered.contains(&name), "界面调用的命令 {name} 未注册");
+                checked += 1;
+            }
+        }
+        assert!(checked > 20, "应检查到界面调用的命令，实际 {checked}");
+        for name in ["voice_calibration_begin", "voice_calibration_end"] {
+            assert!(registered.contains(&name), "{name} 未注册");
+            assert!(
+                script.contains(&format!("invoke('{name}')")),
+                "界面没有调用 {name}"
+            );
+        }
+    }
+
     #[test]
     fn 阻塞命令都已注册到命令处理器() {
         let source = include_str!("main.rs");
