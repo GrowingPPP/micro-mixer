@@ -844,6 +844,9 @@ pub fn panic_hook_fired() -> bool {
     PANIC_DONE.load(Ordering::Relaxed)
 }
 
+/// 变声湿声路径的限幅上限（dBFS）：人声与音效在相加前各自独立限幅。
+const PATH_LIMITER_CEILING_DB: f32 = -3.0;
+
 pub struct RenderProcessor {
     ring: Consumer<f32>,
     cmd: Consumer<QueuedCommand>,
@@ -859,8 +862,12 @@ pub struct RenderProcessor {
     applied_looping_override: u32,
     /// 没有音效写入的连续帧数，用于确认限幅器内旧音效已经输出完毕。
     sfx_idle_frames: usize,
-    limiter: Limiter,
-    limiter_enabled: bool,
+    /// 湿声路径的人声限幅；仅存在变声会话时预分配，回调内不创建。
+    voice_limiter: Option<Limiter>,
+    /// 湿声路径的音效限幅；仅存在变声会话时预分配，回调内不创建。
+    sfx_limiter: Option<Limiter>,
+    /// 混音后的末端安全限幅；关闭变声时也是唯一一级。
+    safety_limiter: Limiter,
     ctl: Arc<PlaybackControl>,
     stats: Arc<EngineStats>,
     last_frame: [f32; 2],
@@ -1015,10 +1022,22 @@ impl RenderProcessor {
 
     fn process_block(&mut self, out: &mut [f32]) {
         self.apply_stop_epoch();
-        self.voice_phase = self
+        let phase = self
             .voice_runtime
             .as_ref()
             .map_or(VoicePhase::Off, |runtime| runtime.phase());
+        if phase != self.voice_phase
+            && (phase == VoicePhase::Wet || self.voice_phase == VoicePhase::Wet)
+        {
+            // 进出湿声链路时清空路径限幅的延迟线，避免旧会话尾音被新会话重新输出。
+            if let Some(limiter) = self.voice_limiter.as_mut() {
+                limiter.reset();
+            }
+            if let Some(limiter) = self.sfx_limiter.as_mut() {
+                limiter.reset();
+            }
+        }
+        self.voice_phase = phase;
         let dev_ch = self.out_channels.max(1);
         let frames = out.len() / dev_ch;
         let used = frames * 2; // 内部立体声：交错 L/R
@@ -1053,29 +1072,53 @@ impl RenderProcessor {
             .store(self.ring.slots(), Ordering::Relaxed);
 
         // 2. 单个音效已经按顺序完成淡出/淡入，不同槽位不会同时写入同一帧。
-        let sfx = &self.sfx[..used];
+        let sfx = &mut self.sfx[..used];
 
         // 3. 混音（增益在实时线程读取，无锁）
         let mg = db_to_lin(self.ctl.mic_gain_db.get());
         let sg = db_to_lin(self.ctl.sfx_gain_db.get());
-        for i in 0..used {
-            mic[i] = mic[i] * mg + sfx[i] * sg;
+        let path_active = self.voice_phase == VoicePhase::Wet;
+        if path_active {
+            // 湿声链路：人声与音效各自限幅后再相加，两路增益互不压制。
+            for sample in mic.iter_mut() {
+                *sample *= mg;
+            }
+            for sample in sfx.iter_mut() {
+                *sample *= sg;
+            }
+            if let (Some(voice_limiter), Some(sfx_limiter)) =
+                (self.voice_limiter.as_mut(), self.sfx_limiter.as_mut())
+            {
+                voice_limiter.process_in_place(mic);
+                sfx_limiter.process_in_place(sfx);
+            }
+            for i in 0..used {
+                mic[i] += sfx[i];
+            }
+        } else {
+            // 干声链路：沿用混音后单限幅，关闭变声时与既有引擎逐样本一致。
+            for i in 0..used {
+                mic[i] = mic[i] * mg + sfx[i] * sg;
+            }
         }
 
-        // 4. 限幅 —— 保证永不削波
-        if self.limiter_enabled {
-            self.limiter.process_in_place(mic);
-            self.stats.limiter_gain_db100.store(
-                ((self.limiter.current_gain_db() + LIMITER_DB_OFFSET).clamp(0.0, 120.0) * 100.0)
-                    as u32,
-                Ordering::Relaxed,
-            );
-        }
-        let tail_frames = if self.limiter_enabled {
-            self.limiter.latency_frames()
-        } else {
-            0
-        };
+        // 4. 末端安全限幅 —— 保证送往虚拟麦克风的信号永不削波
+        self.safety_limiter.process_in_place(mic);
+        self.stats.limiter_gain_db100.store(
+            ((self.safety_limiter.current_gain_db() + LIMITER_DB_OFFSET).clamp(0.0, 120.0) * 100.0)
+                as u32,
+            Ordering::Relaxed,
+        );
+        // 停止确认要等音效走完当前链路：湿声还多一级音效路径限幅；
+        // 人声不参与音效停止判定。
+        let tail_frames = self.safety_limiter.latency_frames()
+            + if path_active {
+                self.sfx_limiter
+                    .as_ref()
+                    .map_or(0, |limiter| limiter.latency_frames())
+            } else {
+                0
+            };
         if self.active_player.is_none()
             && self.pending_player.is_none()
             && self.sfx_idle_frames >= tail_frames
@@ -1240,6 +1283,21 @@ impl EngineParts {
             None => (None, Vec::new()),
         };
         let voice_runtime = voice_tee.as_ref().map(|tee| Arc::clone(&tee.runtime));
+        // 路径限幅只在存在变声会话时预分配；湿声以外的阶段完全跳过。
+        let (voice_limiter, sfx_limiter) = if voice_tee.is_some() {
+            let make_path_limiter = || {
+                Limiter::new_with_channels(
+                    output_format.sample_rate,
+                    2,
+                    PATH_LIMITER_CEILING_DB,
+                    2.0,
+                    80.0,
+                )
+            };
+            (Some(make_path_limiter()), Some(make_path_limiter()))
+        } else {
+            (None, None)
+        };
         let capture = CaptureProcessor {
             in_channels: input_format.ch(),
             mono: vec![0.0; capture_chunk_frames],
@@ -1273,8 +1331,9 @@ impl EngineParts {
             pending_player: None,
             applied_looping_override: 0,
             sfx_idle_frames: 0,
-            limiter: Limiter::with_channels(output_format.sample_rate, 2),
-            limiter_enabled: true,
+            voice_limiter,
+            sfx_limiter,
+            safety_limiter: Limiter::with_channels(output_format.sample_rate, 2),
             ctl: control.clone(),
             stats: stats.clone(),
             last_frame: [0.0, 0.0],
@@ -1559,7 +1618,7 @@ mod tests {
         let mut peak = 0f32;
         for _ in 0..buffers {
             e.render.process(&mut out);
-            peak = peak.max(out.iter().fold(0f32, |m, s| m.max(s.abs())));
+            peak = peak.max(取峰值(&out));
         }
         peak
     }
@@ -1583,7 +1642,7 @@ mod tests {
 
         let mut out = vec![0f32; 2048];
         e.render.process(&mut out);
-        let peak = out.iter().fold(0f32, |m, s| m.max(s.abs()));
+        let peak = 取峰值(&out);
         assert!((peak - 0.5).abs() < 0.05, "透传峰值应约 0.5，实际 {peak}");
         for f in out.as_chunks::<2>().0.iter().take(100) {
             assert!((f[0] - f[1]).abs() < 1e-6, "左右声道应一致（单声道兼容）");
@@ -1605,7 +1664,7 @@ mod tests {
         e.capture.process(&input);
         let mut out = vec![0f32; 1024];
         e.render.process(&mut out);
-        let peak = out.iter().fold(0f32, |m, s| m.max(s.abs()));
+        let peak = 取峰值(&out);
         assert!((peak - 0.25).abs() < 0.02, "下混峰值应约 0.25，实际 {peak}");
     }
 
@@ -2227,7 +2286,7 @@ mod tests {
         e.capture.process(&input);
         let mut out = vec![0f32; 8192];
         e.render.process(&mut out);
-        let peak = out.iter().fold(0f32, |m, s| m.max(s.abs()));
+        let peak = 取峰值(&out);
         assert!(peak <= 0.92, "限幅后峰值应 ≤ -1dBFS，实际 {peak}");
     }
 
@@ -2576,6 +2635,14 @@ mod tests {
     const 变声块毫秒: f32 = 10.0;
     const 变声块帧: usize = 480;
     const 变声延迟帧: usize = 480;
+    /// 湿声链路比干声多一级路径限幅，其前视延迟由限幅器参数决定。
+    fn 路径前视帧() -> usize {
+        Limiter::with_channels(48_000, 2).latency_frames()
+    }
+
+    fn 取峰值(buf: &[f32]) -> f32 {
+        buf.iter().fold(0f32, |m, s| m.max(s.abs()))
+    }
     const 变声缓冲毫秒: u32 = 100;
     const 小回调帧: usize = 128;
     /// 每个样本对应一个唯一的源序号，用来读出切换处的时间不连续。
@@ -2650,6 +2717,65 @@ mod tests {
             Some(setup),
         );
         (engine, runtime)
+    }
+
+    fn 构造带槽位变声引擎(slots: Vec<SfxSlot>) -> (EngineParts, Arc<VoiceRuntime>) {
+        let runtime = Arc::new(VoiceRuntime::new());
+        let setup = VoiceSetup::new(
+            VoiceParams::default(),
+            变声块毫秒,
+            runtime.clone(),
+            Box::new(DelayBackend::new(0)),
+        );
+        let engine = EngineParts::build_with_voice(
+            StreamFormat::new(48_000, 1),
+            StreamFormat::stereo(48_000),
+            slots,
+            变声缓冲毫秒,
+            Some(setup),
+        );
+        (engine, runtime)
+    }
+
+    /// 以静音预填并把渲染侧推进到湿声稳态；随后由调用方恢复增益与音效。
+    fn 静音进入湿声(e: &mut EngineParts, runtime: &VoiceRuntime) {
+        e.control.mic_gain_db.set(-100.0);
+        e.control.sfx_gain_db.set(-100.0);
+        let 静音 = vec![0.0f32; 变声块帧];
+        let mut out = vec![0.0f32; 变声块帧 * 2];
+        for _ in 0..10 {
+            e.capture.process(&静音);
+        }
+        runtime.request_enable();
+        for _ in 0..10 {
+            e.capture.process(&静音);
+            e.render.process(&mut out);
+            if e.render.voice_phase() == VoicePhase::Wet {
+                return;
+            }
+        }
+        panic!("静音预热后渲染侧应进入湿声");
+    }
+
+    fn 正弦块(频率: f32, 起始帧: usize, 帧数: usize) -> Vec<f32> {
+        (0..帧数)
+            .map(|i| {
+                let n = 起始帧 + i;
+                (std::f32::consts::TAU * 频率 * n as f32 / 48_000.0).sin() * 4.0
+            })
+            .collect()
+    }
+
+    /// 提交停止并逐帧渲染，返回确认完成所需的帧数。
+    fn 等待停止确认(e: &mut EngineParts, 单帧: &mut [f32]) -> usize {
+        assert!(e.control.stop_all());
+        let mut frames = 0usize;
+        while !e.control.stop_all_finished() {
+            e.render.process(单帧);
+            frames += 1;
+            assert!(frames < 10_000, "停止确认迟迟不完成");
+        }
+        frames
     }
 
     fn 斜坡块(起始: usize, 帧数: usize) -> Vec<f32> {
@@ -2744,6 +2870,223 @@ mod tests {
         }
         assert!(compared_frames > 0);
         assert_eq!(voiced.render.voice_phase(), VoicePhase::Off);
+    }
+
+    fn 路径限幅上限() -> f32 {
+        db_to_lin(PATH_LIMITER_CEILING_DB)
+    }
+
+    fn 末端限幅上限() -> f32 {
+        db_to_lin(-1.0)
+    }
+
+    #[test]
+    fn 人声峰值不改变音效增益() {
+        let 音效电平 = 0.1f32;
+        let 音效槽 = || vec![音效电平; 96_000];
+        let 静音槽 = || vec![0.0f32; 96_000];
+        let (mut 双路引擎, 双路运行时) =
+            构造带槽位变声引擎(vec![构造槽位(音效槽(), true)]);
+        let (mut 音效基准, 音效运行时) =
+            构造带槽位变声引擎(vec![构造槽位(音效槽(), true)]);
+        let (mut 人声基准, 人声运行时) =
+            构造带槽位变声引擎(vec![构造槽位(静音槽(), true)]);
+
+        静音进入湿声(&mut 双路引擎, &双路运行时);
+        静音进入湿声(&mut 音效基准, &音效运行时);
+        静音进入湿声(&mut 人声基准, &人声运行时);
+
+        for 引擎 in [&mut 双路引擎, &mut 音效基准, &mut 人声基准] {
+            引擎.control.mic_gain_db.set(0.0);
+            引擎.control.sfx_gain_db.set(0.0);
+            assert!(引擎.control.play(0));
+        }
+
+        let 人声峰值 = vec![4.0f32; 变声块帧];
+        let 静音输入 = vec![0.0f32; 变声块帧];
+        let mut 双路输出 = vec![0.0f32; 变声块帧 * 2];
+        let mut 音效输出 = vec![0.0f32; 变声块帧 * 2];
+        let mut 人声输出 = vec![0.0f32; 变声块帧 * 2];
+        for _ in 0..12 {
+            双路引擎.capture.process(&人声峰值);
+            音效基准.capture.process(&静音输入);
+            人声基准.capture.process(&人声峰值);
+            双路引擎.render.process(&mut 双路输出);
+            音效基准.render.process(&mut 音效输出);
+            人声基准.render.process(&mut 人声输出);
+        }
+
+        for i in 0..双路输出.len() {
+            let 独立合成 = 音效输出[i] + 人声输出[i];
+            assert!(
+                (双路输出[i] - 独立合成).abs() < 1e-6,
+                "人声峰值不得改变音效路输出：第 {i} 样本 {}，独立合成 {独立合成}",
+                双路输出[i]
+            );
+        }
+        let 音效峰值 = 取峰值(&音效输出);
+        assert!(
+            (音效峰值 - 音效电平).abs() < 1e-5,
+            "音效路应保持原电平 {音效电平}，实测峰值 {音效峰值}"
+        );
+        let 人声限幅峰值 = 取峰值(&人声输出);
+        assert!(
+            人声限幅峰值 <= 路径限幅上限() + 1e-5 && 人声限幅峰值 > 路径限幅上限() * 0.98,
+            "人声应被路径限幅压到 −3 dBFS，实测 {人声限幅峰值}"
+        );
+    }
+
+    #[test]
+    fn 音效峰值不改变人声增益() {
+        let 人声电平 = 0.1f32;
+        let 音效峰值槽 = || vec![4.0f32; 96_000];
+        let 静音槽 = || vec![0.0f32; 96_000];
+        let (mut 双路引擎, 双路运行时) =
+            构造带槽位变声引擎(vec![构造槽位(音效峰值槽(), true)]);
+        let (mut 人声基准, 人声运行时) =
+            构造带槽位变声引擎(vec![构造槽位(静音槽(), true)]);
+        let (mut 音效基准, 音效运行时) =
+            构造带槽位变声引擎(vec![构造槽位(音效峰值槽(), true)]);
+
+        静音进入湿声(&mut 双路引擎, &双路运行时);
+        静音进入湿声(&mut 人声基准, &人声运行时);
+        静音进入湿声(&mut 音效基准, &音效运行时);
+
+        for 引擎 in [&mut 双路引擎, &mut 人声基准, &mut 音效基准] {
+            引擎.control.mic_gain_db.set(0.0);
+            引擎.control.sfx_gain_db.set(0.0);
+            assert!(引擎.control.play(0));
+        }
+
+        let 人声输入 = vec![人声电平; 变声块帧];
+        let 静音输入 = vec![0.0f32; 变声块帧];
+        let mut 双路输出 = vec![0.0f32; 变声块帧 * 2];
+        let mut 人声输出 = vec![0.0f32; 变声块帧 * 2];
+        let mut 音效输出 = vec![0.0f32; 变声块帧 * 2];
+        for _ in 0..12 {
+            双路引擎.capture.process(&人声输入);
+            人声基准.capture.process(&人声输入);
+            音效基准.capture.process(&静音输入);
+            双路引擎.render.process(&mut 双路输出);
+            人声基准.render.process(&mut 人声输出);
+            音效基准.render.process(&mut 音效输出);
+        }
+
+        for i in 0..双路输出.len() {
+            let 独立合成 = 人声输出[i] + 音效输出[i];
+            assert!(
+                (双路输出[i] - 独立合成).abs() < 1e-6,
+                "音效峰值不得改变人声路输出：第 {i} 样本 {}，独立合成 {独立合成}",
+                双路输出[i]
+            );
+        }
+        let 人声峰值 = 取峰值(&人声输出);
+        assert!(
+            (人声峰值 - 人声电平).abs() < 1e-5,
+            "人声路应保持原电平 {人声电平}，实测峰值 {人声峰值}"
+        );
+        let 音效限幅峰值 = 取峰值(&音效输出);
+        assert!(
+            音效限幅峰值 <= 路径限幅上限() + 1e-5 && 音效限幅峰值 > 路径限幅上限() * 0.98,
+            "音效应被路径限幅压到 −3 dBFS，实测 {音效限幅峰值}"
+        );
+    }
+
+    #[test]
+    fn 两路同时过载触发末端安全限幅() {
+        let (mut e, runtime) =
+            构造带槽位变声引擎(vec![构造槽位(vec![4.0f32; 96_000], true)]);
+        静音进入湿声(&mut e, &runtime);
+        e.control.mic_gain_db.set(0.0);
+        e.control.sfx_gain_db.set(0.0);
+        assert!(e.control.play(0));
+
+        let mut out = vec![0.0f32; 变声块帧 * 2];
+        let mut 已喂帧 = 0usize;
+        for _ in 0..12 {
+            let mic = 正弦块(440.0, 已喂帧, 变声块帧);
+            已喂帧 += 变声块帧;
+            e.capture.process(&mic);
+            e.render.process(&mut out);
+        }
+        let mic = 正弦块(440.0, 已喂帧, 变声块帧);
+        e.capture.process(&mic);
+        e.render.process(&mut out);
+
+        let 峰值 = 取峰值(&out);
+        assert!(
+            峰值 <= 末端限幅上限() + 1e-5,
+            "两路过载后输出峰值 {峰值} 超过 −1 dBFS"
+        );
+        assert!(
+            峰值 > 末端限幅上限() * 0.98,
+            "末端安全限幅应真正参与，峰值仅 {峰值}"
+        );
+        assert!(out.iter().all(|s| s.abs() < 1.0), "输出不得进入硬削波");
+        let 平顶 = out
+            .iter()
+            .filter(|s| (s.abs() - 末端限幅上限()).abs() < 1e-5)
+            .count();
+        assert!(
+            平顶 as f32 / (out.len() as f32) < 0.05,
+            "过载应靠增益控制而非硬削波，平顶比例 {平顶}/{}",
+            out.len()
+        );
+        assert!(
+            e.stats.snapshot().limiter_gain_db < -3.0,
+            "末端限幅应显示明显增益衰减，实测 {} dB",
+            e.stats.snapshot().limiter_gain_db
+        );
+    }
+
+    #[test]
+    fn 停止尾部包含音效限幅与末端限幅() {
+        let 淡出帧 = (48_000.0 * FADE_MS / 1000.0).round() as usize;
+        let 槽 = || 构造槽位(vec![0.25f32; 96_000], true);
+
+        let (mut 湿声引擎, runtime) = 构造带槽位变声引擎(vec![槽()]);
+        静音进入湿声(&mut 湿声引擎, &runtime);
+        湿声引擎.control.mic_gain_db.set(-100.0);
+        湿声引擎.control.sfx_gain_db.set(0.0);
+        assert!(湿声引擎.control.play(0));
+        let mut 块 = vec![0.0f32; 变声块帧 * 2];
+        for _ in 0..10 {
+            湿声引擎.capture.process(&vec![0.0f32; 变声块帧]);
+            湿声引擎.render.process(&mut 块);
+        }
+        assert_eq!(湿声引擎.render.voice_phase(), VoicePhase::Wet);
+
+        let format = StreamFormat::stereo(48_000);
+        let mut 干声引擎 = EngineParts::build(format, format, vec![槽()], 变声缓冲毫秒);
+        干声引擎.control.mic_gain_db.set(-100.0);
+        干声引擎.control.sfx_gain_db.set(0.0);
+        assert!(干声引擎.control.play(0));
+        for _ in 0..10 {
+            干声引擎.render.process(&mut 块);
+        }
+        assert_eq!(干声引擎.render.voice_phase(), VoicePhase::Off);
+
+        let mut 单帧 = vec![0.0f32; 2];
+        let 湿声等待 = 等待停止确认(&mut 湿声引擎, &mut 单帧);
+        let 干声等待 = 等待停止确认(&mut 干声引擎, &mut 单帧);
+
+        assert!(
+            (淡出帧..淡出帧 + 2 * 路径前视帧()).contains(&干声等待),
+            "干声停止应只等末端限幅尾部，实测 {干声等待} 帧"
+        );
+        assert!(
+            湿声等待 > 淡出帧 + 路径前视帧(),
+            "湿声停止必须越过音效与末端两级尾部，实测 {湿声等待} 帧"
+        );
+        assert!(
+            湿声等待 < 淡出帧 + 3 * 路径前视帧(),
+            "人声限幅尾部不应计入停止确认，实测 {湿声等待} 帧"
+        );
+        assert_eq!(
+            湿声等待 - 干声等待,
+            路径前视帧(),
+            "湿声应比干声多等一级音效路径限幅：湿声 {湿声等待}，干声 {干声等待}"
+        );
     }
 
     #[test]
@@ -2892,7 +3235,7 @@ mod tests {
         assert_eq!(runtime.phase(), VoicePhase::Wet);
         let wet_offset = 变声偏移(&e, fed, out[out.len() - 2]);
         let repeated = wet_offset - dry_offset;
-        let latency = (变声延迟帧 + 变声块帧) as i64;
+        let latency = (变声延迟帧 + 变声块帧 + 路径前视帧()) as i64;
         assert!(
             repeated > 0,
             "启用后应测到干湿切换的重复，实测 {repeated} 样本"
@@ -2951,7 +3294,7 @@ mod tests {
         assert_eq!(runtime.phase(), VoicePhase::Off);
         let dry_offset = 变声偏移(&e, fed, out[out.len() - 2]);
         let skipped = wet_offset - dry_offset;
-        let latency = (变声延迟帧 + 变声块帧) as i64;
+        let latency = (变声延迟帧 + 变声块帧 + 路径前视帧()) as i64;
         assert!(
             skipped > 0,
             "关闭后应测到干湿切换的跳过，实测 {skipped} 样本"
