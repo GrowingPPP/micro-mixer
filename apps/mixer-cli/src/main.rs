@@ -8,7 +8,7 @@
 //! mixer play --file 笑.mp3 --file 警报.mp3 --hotkeys F1,F2     # 全局热键触发的麦克风混音助手
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
@@ -185,7 +185,7 @@ fn main() -> Result<()> {
             buffer_ms,
             duration,
         } => {
-            let cfg = Config::load();
+            let cfg = load_config_logged();
             run(
                 &backend,
                 RunOptions {
@@ -222,7 +222,7 @@ fn main() -> Result<()> {
             remote,
             remote_bind,
         } => {
-            let cfg = Config::load();
+            let cfg = load_config_logged();
             // 运行期覆盖先于设备枚举与开流解析：互斥参数或未知预设不能触碰音频。
             let voice = play_voice_options(&cfg, voice_preset.as_deref(), voice_off)?;
 
@@ -260,21 +260,39 @@ fn main() -> Result<()> {
 
 // ─────────────────────────────────────────── config
 
+/// 宽松读取配置并把读取问题写进日志（stderr）。
+///
+/// 无效 TOML 或被拒绝的变声条目不会让播放、体检等命令失败，按能读出的设置继续；
+/// 只有会写回配置的 `config set` 使用严格读取，并在文件有问题时拒绝覆盖。
+fn load_config_logged() -> Config {
+    let report = Config::load_report();
+    for notice in &report.notices {
+        log::warn!("配置: {notice}");
+    }
+    report.config
+}
+
 /// CLI 每次调用独立读取、修改并原子保存配置。
 ///
 /// 与运行中的 GUI 并发写同一文件时没有跨进程锁，以最后写入的完整快照为准；
 /// 因此这里只写用户显式执行的 `config set`，播放参数不能隐式落盘。
 fn cmd_config(args: &[String]) -> Result<()> {
-    let path = Config::path();
+    cmd_config_at(&Config::path(), args)
+}
+
+fn cmd_config_at(path: &Path, args: &[String]) -> Result<()> {
     match args.first().map(|s| s.as_str()) {
         None => {
-            let c = Config::load();
+            let report = Config::load_report_from(path);
             println!("\n配置文件: {}", path.display());
             if !path.exists() {
                 println!("（尚未创建 —— 用 `mixer config set <项> <值>` 创建）");
             }
+            for notice in &report.notices {
+                println!("\n  ⚠ {notice}");
+            }
             println!("\n当前配置:");
-            let text = c.to_text();
+            let text = report.config.to_text();
             let body: Vec<&str> = text
                 .lines()
                 .filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
@@ -304,9 +322,12 @@ fn cmd_config(args: &[String]) -> Result<()> {
             if args.len() != 2 {
                 anyhow::bail!("用法: mixer config get <项>");
             }
-            let c = Config::load();
+            let report = Config::load_report_from(path);
+            for notice in &report.notices {
+                log::warn!("配置: {notice}");
+            }
             // 先解析再输出：未知项必须报错，不能用空行伪装成功。
-            println!("{}", c.get(&args[1])?);
+            println!("{}", report.config.get(&args[1])?);
             Ok(())
         }
         Some("set") => {
@@ -314,10 +335,12 @@ fn cmd_config(args: &[String]) -> Result<()> {
             if args.len() < 3 {
                 anyhow::bail!("用法: mixer config set <项> <值>");
             }
-            let mut c = Config::load();
+            // 严格读取：配置文件无法解析或含被拒绝的变声条目时直接报错，
+            // 不能用默认值或残缺内容覆盖用户的音效库与预设。
+            let mut c = Config::load_for_write_from(path)?;
             c.set(&args[1], &args[2..].join(" "))?;
-            let p = c.save()?;
-            println!("✅ 已写入 {}", p.display());
+            c.save_to(path)?;
+            println!("✅ 已写入 {}", path.display());
             Ok(())
         }
         Some(other) => {
@@ -329,7 +352,7 @@ fn cmd_config(args: &[String]) -> Result<()> {
 // ─────────────────────────────────────────── hotkey test
 
 fn hotkey_test(keys: Option<String>) -> Result<()> {
-    let cfg = Config::load();
+    let cfg = load_config_logged();
     let specs: Vec<String> = match keys {
         Some(s) => s
             .split(',')
@@ -418,8 +441,14 @@ fn hotkey_test(keys: Option<String>) -> Result<()> {
 fn cmd_doctor(backend: &CpalBackend) -> Result<()> {
     use audio_core::device::is_virtual_name;
 
-    let cfg = app_config::Config::load();
-    let mut problems: Vec<String> = Vec::new();
+    let report = app_config::Config::load_report();
+    let cfg = report.config;
+    // 配置读取问题直接计入体检结论：无效 TOML 或被拒绝的预设会让保存失败。
+    let mut problems: Vec<String> = report
+        .notices
+        .iter()
+        .map(|notice| format!("配置: {notice}"))
+        .collect();
 
     println!("\n  ═══ 环境体检 ═══\n");
 
@@ -1658,6 +1687,127 @@ mod tests {
         assert!(
             format!("{error:#}").contains("user:missing"),
             "错误应指出未知预设：{error:#}"
+        );
+    }
+
+    /// 音效库、变声节与用户预设俱全，只有一处非法反斜杠转义。
+    const INVALID_TOML_LIBRARY: &str = concat!(
+        "[[sounds]]\n",
+        "id = \"s1\"\n",
+        "path = \"C:\\Users\\Doe\\a.wav\"\n",
+        "name = \"笑声\"\n",
+        "\n",
+        "[[voice_presets]]\n",
+        "id = \"user:mine-abc123\"\n",
+        "name = \"我的声音\"\n",
+    );
+
+    struct ConfigFile(PathBuf);
+
+    impl ConfigFile {
+        fn new(text: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "mixer-cli-config-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("config.toml");
+            std::fs::write(&path, text).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for ConfigFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0.parent().unwrap());
+        }
+    }
+
+    fn args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_owned()).collect()
+    }
+
+    #[test]
+    fn 配置_set_遇到无效_toml_报错且不改文件() {
+        let file = ConfigFile::new(INVALID_TOML_LIBRARY);
+
+        let error = cmd_config_at(&file.0, &args(&["set", "buffer_ms", "40"])).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("不是有效 TOML"), "{message}");
+        assert!(message.contains("拒绝写入"), "{message}");
+        assert_eq!(
+            std::fs::read_to_string(&file.0).unwrap(),
+            INVALID_TOML_LIBRARY,
+            "音效库与用户预设不能被默认值或注释覆盖"
+        );
+    }
+
+    #[test]
+    fn 配置_set_读取失败报错且不改文件() {
+        let file = ConfigFile::new("");
+        let bytes = vec![0xff, 0xfe, 0x00, b'['];
+        std::fs::write(&file.0, &bytes).unwrap();
+
+        let error = cmd_config_at(&file.0, &args(&["set", "buffer_ms", "40"])).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("读取配置文件失败"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&file.0).unwrap(), bytes);
+    }
+
+    #[test]
+    fn 配置_set_遇到被拒绝的预设报错且不改文件() {
+        let text = "[[voice_presets]]\nid = \"handwritten\"\nname = \"手写\"\n";
+        let file = ConfigFile::new(text);
+
+        let error = cmd_config_at(&file.0, &args(&["set", "voice.enabled", "true"])).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("handwritten") && message.contains("拒绝写入"),
+            "{message}"
+        );
+        assert_eq!(std::fs::read_to_string(&file.0).unwrap(), text);
+    }
+
+    #[test]
+    fn 配置_set_配置文件不存在时创建默认配置并写入() {
+        let file = ConfigFile::new("");
+        std::fs::remove_file(&file.0).unwrap();
+
+        cmd_config_at(&file.0, &args(&["set", "buffer_ms", "40"])).unwrap();
+        let saved = Config::load_for_write_from(&file.0).unwrap();
+        assert_eq!(saved.buffer_ms, Some(40));
+    }
+
+    #[test]
+    fn 配置_set_正常文件保留音效库与用户预设() {
+        let text = concat!(
+            "[[sounds]]\nid = \"s1\"\npath = \"/a.wav\"\nname = \"笑声\"\n\n",
+            "[[voice_presets]]\nid = \"user:mine-abc123\"\nname = \"我的声音\"\n",
+            "pitch_semitones = 3.0\n",
+        );
+        let file = ConfigFile::new(text);
+
+        cmd_config_at(&file.0, &args(&["set", "voice.enabled", "false"])).unwrap();
+        let saved = Config::load_for_write_from(&file.0).unwrap();
+        assert_eq!(saved.sound_entries().len(), 1);
+        assert_eq!(saved.voice_presets.len(), 1);
+        assert_eq!(saved.voice_presets[0].params.pitch_semitones, 3.0);
+    }
+
+    #[test]
+    fn 配置_get_与查看读取有问题的文件时不写盘() {
+        let file = ConfigFile::new(INVALID_TOML_LIBRARY);
+
+        cmd_config_at(&file.0, &args(&["get", "buffer_ms"])).unwrap();
+        cmd_config_at(&file.0, &[]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&file.0).unwrap(),
+            INVALID_TOML_LIBRARY,
+            "只读命令不能改动文件"
         );
     }
 

@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 
 mod voice;
+use voice::VoiceLoadNotes;
 pub use voice::{builtin_voice_presets, VoiceConfig, VoiceParamsConfig, VoicePreset};
 
 /// 音效库里的一个条目。
@@ -75,6 +76,11 @@ pub struct Config {
     pub voice_presets: Vec<VoicePreset>,
     /// 加载变声配置时产生的非阻断警告（越界钳制、条目丢弃、预设回退）。
     pub voice_warnings: Vec<String>,
+    /// `voice_warnings` 中会在重写配置时被永久删除的内容（被拒绝的预设条目、
+    /// 类型错误的字段、被整体忽略的配置节）。
+    ///
+    /// 非空时 [`Config::load_for_write_from`] 拒绝写入：保存一次就会把这些手写内容带走。
+    pub voice_rejected: Vec<String>,
 
     /// 解析时不认识的行，原样留着。
     ///
@@ -110,9 +116,21 @@ impl Default for Config {
             voice: VoiceConfig::default(),
             voice_presets: Vec::new(),
             voice_warnings: Vec::new(),
+            voice_rejected: Vec::new(),
             unknown_lines: Vec::new(),
         }
     }
+}
+
+/// 一次宽松读取的结果：配置本身，加上需要告知用户的问题。
+#[derive(Debug, Clone)]
+pub struct LoadReport {
+    pub config: Config,
+    /// 面向用户的中文说明；调用方应写入日志并在界面或终端显示。
+    pub notices: Vec<String>,
+    /// 为 true 时 [`Config::load_for_write_from`] 会拒绝同一文件：保存将失败，
+    /// 直到用户修复文件。
+    pub write_blocked: bool,
 }
 
 /// 目标平台。
@@ -218,7 +236,11 @@ impl Config {
         base_dir().join("mixer").join("config.toml")
     }
 
-    /// 读取配置。文件不存在时返回默认值（不是错误）。
+    /// 宽松读取配置，只用于展示与启动参数。文件不存在或无法读取时返回默认值。
+    ///
+    /// 读出的配置**不能**直接改完再写回：无效 TOML 与读取失败会退化成部分内容或默认值，
+    /// 保存后原文件里的音效库与用户预设随之丢失。会写回的流程使用
+    /// [`Config::load_for_write`]。需要告知用户读取问题时使用 [`Config::load_report`]。
     pub fn load() -> Self {
         Self::load_from(&Self::path())
     }
@@ -228,6 +250,108 @@ impl Config {
             Ok(text) => Self::parse(&text),
             Err(_) => Self::default(),
         }
+    }
+
+    /// 读取配置并返回需要告知用户的问题。读取本身与 [`Config::load`] 一样宽松。
+    pub fn load_report() -> LoadReport {
+        Self::load_report_from(&Self::path())
+    }
+
+    pub fn load_report_from(path: &Path) -> LoadReport {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return LoadReport {
+                    config: Self::default(),
+                    notices: Vec::new(),
+                    write_blocked: false,
+                };
+            }
+            Err(error) => {
+                return LoadReport {
+                    config: Self::default(),
+                    notices: vec![format!(
+                        "读取配置文件失败（{}）：{error}。本次按默认设置运行；\
+                         修复前保存配置会被拒绝，原文件不会被覆盖",
+                        path.display()
+                    )],
+                    write_blocked: true,
+                };
+            }
+        };
+        match text.parse::<toml::Table>() {
+            Ok(table) => {
+                let config = Self::from_table(table);
+                let mut notices = config.voice_warnings.clone();
+                let write_blocked = !config.voice_rejected.is_empty();
+                if write_blocked {
+                    notices.push(format!(
+                        "配置文件 {} 中被丢弃的变声条目仍保留在文件里；\
+                         手动修复它们之前，保存配置会被拒绝，避免把它们永久删除",
+                        path.display()
+                    ));
+                }
+                LoadReport {
+                    config,
+                    notices,
+                    write_blocked,
+                }
+            }
+            Err(error) => LoadReport {
+                config: Self::parse(&text),
+                notices: vec![format!(
+                    "配置文件 {} 不是有效 TOML（{}）。只读取了能识别的设置；\
+                     修复前保存配置会被拒绝，原文件不会被覆盖",
+                    path.display(),
+                    describe_toml_error(&text, &error)
+                )],
+                write_blocked: true,
+            },
+        }
+    }
+
+    /// 写入前的严格读取：读出的配置可以改完直接 [`Config::save_to`]。
+    ///
+    /// 只有文件不存在才使用默认值。以下情况返回错误，调用方应原样报告并放弃写入，
+    /// 磁盘上的文件保持不动：
+    /// - 读取失败（权限、编码等）；
+    /// - 不是有效 TOML：宽松回退只认旧版扁平键，重写会把 `[[sounds]]`、`[voice]`、
+    ///   `[[voice_presets]]` 降级成注释；
+    /// - 含有加载时被拒绝的变声条目（见 [`Config::voice_rejected`]）：它们不进内存，
+    ///   写回就等于永久删除。
+    ///
+    /// 钳制与激活预设回退只是规范化数值，条目仍在，不阻止写入。
+    pub fn load_for_write() -> Result<Self> {
+        Self::load_for_write_from(&Self::path())
+    }
+
+    pub fn load_for_write_from(path: &Path) -> Result<Self> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("读取配置文件失败: {}", path.display()));
+            }
+        };
+        let table = text.parse::<toml::Table>().map_err(|error| {
+            anyhow::anyhow!(
+                "配置文件 {} 不是有效 TOML（{}），已拒绝写入以免覆盖原内容；请先修复该文件",
+                path.display(),
+                describe_toml_error(&text, &error)
+            )
+        })?;
+        let config = Self::from_table(table);
+        if !config.voice_rejected.is_empty() {
+            anyhow::bail!(
+                "配置文件 {} 含有无法保留的变声条目，保存会把它们永久删除，已拒绝写入：{}。\
+                 请先在文件中修复这些条目",
+                path.display(),
+                config.voice_rejected.join("；")
+            );
+        }
+        Ok(config)
     }
 
     pub fn save(&self) -> Result<PathBuf> {
@@ -302,14 +426,14 @@ impl Config {
     }
 
     fn from_table(mut t: toml::Table) -> Self {
-        let mut voice_warnings = Vec::new();
-        let voice = voice::parse_voice(t.remove("voice"), &mut voice_warnings);
-        let voice_presets =
-            voice::parse_voice_presets(t.remove("voice_presets"), &mut voice_warnings);
+        let mut notes = VoiceLoadNotes::default();
+        let voice = voice::parse_voice(t.remove("voice"), &mut notes);
+        let voice_presets = voice::parse_voice_presets(t.remove("voice_presets"), &mut notes);
         let mut c = Self {
             voice,
             voice_presets,
-            voice_warnings,
+            voice_warnings: notes.warnings,
+            voice_rejected: notes.rejected,
             input_device: take_string(&mut t, "input_device"),
             output_device: take_string(&mut t, "output_device"),
             monitor_device: take_string(&mut t, "monitor_device"),
@@ -818,6 +942,22 @@ impl ConfigKey {
             "voice.prev_preset_hotkey" => Self::VoicePrevPresetHotkey,
             other => anyhow::bail!("未知配置项「{other}」。可用：{CONFIG_KEY_LIST}"),
         })
+    }
+}
+
+/// 把 TOML 解析错误整理成「第 N 行：原因」，避免带出多行源码片段。
+fn describe_toml_error(text: &str, error: &toml::de::Error) -> String {
+    match error.span() {
+        Some(span) => {
+            let upto = span.start.min(text.len());
+            let line = text.as_bytes()[..upto]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count()
+                + 1;
+            format!("第 {line} 行：{}", error.message())
+        }
+        None => error.message().to_owned(),
     }
 }
 
@@ -1373,6 +1513,7 @@ sfx_gain_db = -9
             voice: VoiceConfig::default(),
             voice_presets: Vec::new(),
             voice_warnings: Vec::new(),
+            voice_rejected: Vec::new(),
             unknown_lines: Vec::new(),
         };
         let round = Config::parse(&c.to_text());
@@ -2131,6 +2272,282 @@ robot_mix = -1.0
             std::fs::read_to_string(&old_path).unwrap(),
             OLD,
             "保存失败不能改动旧文件"
+        );
+    }
+
+    // ── 写入前的严格读取
+
+    /// 音效库、变声节与用户预设俱全，只有 Windows 路径里的一处非法反斜杠转义。
+    const INVALID_TOML_WITH_LIBRARY_AND_VOICE: &str = concat!(
+        "[[sounds]]\n",
+        "id = \"s1\"\n",
+        "path = \"C:\\Users\\Doe\\a.wav\"\n",
+        "name = \"笑声\"\n",
+        "\n",
+        "[voice]\n",
+        "enabled = true\n",
+        "active_preset = \"user:mine-abc123\"\n",
+        "\n",
+        "[[voice_presets]]\n",
+        "id = \"user:mine-abc123\"\n",
+        "name = \"我的声音\"\n",
+        "pitch_semitones = 3.0\n",
+    );
+
+    fn write_config(dir: &TemporaryDirectory, text: &str) -> PathBuf {
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    #[test]
+    fn 写入前读取遇到无效_TOML_拒绝且保留原文件() {
+        let dir = TemporaryDirectory::new("strict-invalid");
+        let path = write_config(&dir, INVALID_TOML_WITH_LIBRARY_AND_VOICE);
+
+        let error = Config::load_for_write_from(&path).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("不是有效 TOML"), "{message}");
+        assert!(message.contains("第 3 行"), "应指出出错行：{message}");
+        assert!(message.contains("拒绝写入"), "{message}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            INVALID_TOML_WITH_LIBRARY_AND_VOICE,
+            "拒绝写入时磁盘上的文件必须保持原样"
+        );
+    }
+
+    #[test]
+    fn 写入前读取文件不存在时使用默认配置() {
+        let dir = TemporaryDirectory::new("strict-missing");
+        let path = dir.path().join("尚未创建").join("config.toml");
+
+        let config = Config::load_for_write_from(&path).unwrap();
+        assert_eq!(config, Config::default());
+        assert!(!path.exists(), "读取不应创建文件");
+    }
+
+    #[test]
+    fn 写入前读取无法读取时报错() {
+        let dir = TemporaryDirectory::new("strict-unreadable");
+        // 目录无法按文件读取：这类错误不能被当成「没有配置」。
+        let error = Config::load_for_write_from(dir.path()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("读取配置文件失败"),
+            "{error:#}"
+        );
+
+        let bytes = vec![0xff, 0xfe, 0x00, b'['];
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, &bytes).unwrap();
+        let error = Config::load_for_write_from(&path).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("读取配置文件失败"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn 写入前读取遇到被拒绝的变声条目拒绝写入() {
+        let cases = [
+            (
+                "缺少 user: 前缀",
+                "[[voice_presets]]\nid = \"mine\"\nname = \"甲\"\n",
+                "缺少 user: 前缀",
+            ),
+            (
+                "名称为空",
+                "[[voice_presets]]\nid = \"user:a\"\nname = \"  \"\n",
+                "名称为空",
+            ),
+            (
+                "重复 ID",
+                "[[voice_presets]]\nid = \"user:a\"\nname = \"甲\"\n\
+                 [[voice_presets]]\nid = \"user:a\"\nname = \"乙\"\n",
+                "重复",
+            ),
+            ("条目不是表格", "voice_presets = [1]\n", "不是表格"),
+            ("预设列表不是数组", "voice_presets = \"x\"\n", "不是数组"),
+            ("voice 节不是表格", "voice = 3\n", "[voice]"),
+            (
+                "启用值类型错误",
+                "[voice]\nenabled = \"yes\"\n",
+                "voice.enabled",
+            ),
+            (
+                "热键类型错误",
+                "[voice]\nbypass_hotkey = 7\n",
+                "voice.bypass_hotkey",
+            ),
+            (
+                "预设数值字段类型错误",
+                "[[voice_presets]]\nid = \"user:a\"\nname = \"甲\"\npitch_semitones = [1]\n",
+                "pitch_semitones",
+            ),
+            (
+                "预设开关字段类型错误",
+                "[[voice_presets]]\nid = \"user:a\"\nname = \"甲\"\ngate_enabled = \"on\"\n",
+                "gate_enabled",
+            ),
+        ];
+        for (label, voice_text, reason) in cases {
+            let dir = TemporaryDirectory::new("strict-rejected");
+            // 顶层键必须出现在任何表头之前，否则会被归入前一个表。
+            let text = format!("buffer_ms = 40\n{voice_text}\n[[sounds]]\npath = \"/a.wav\"\n");
+            let path = write_config(&dir, &text);
+
+            let error = Config::load_for_write_from(&path).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("拒绝写入"), "{label}：{message}");
+            assert!(message.contains(reason), "{label} 应说明原因：{message}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                text,
+                "{label}：拒绝写入时不得改动文件"
+            );
+
+            let report = Config::load_report_from(&path);
+            assert!(report.write_blocked, "{label}");
+            assert!(
+                report.notices.iter().any(|notice| notice.contains(reason)),
+                "{label} 的提示应包含原因：{:?}",
+                report.notices
+            );
+            assert_eq!(
+                report.config.sound_entries().len(),
+                1,
+                "{label}：读取仍应保留其余配置"
+            );
+        }
+    }
+
+    #[test]
+    fn 写入前读取接受仅钳制或回退的警告() {
+        let dir = TemporaryDirectory::new("strict-normalized");
+        let path = write_config(
+            &dir,
+            "[voice]\nenabled = true\nactive_preset = \"user:gone\"\n\n\
+             [[voice_presets]]\nid = \"user:hot\"\nname = \"越界\"\npitch_semitones = 99.0\n",
+        );
+
+        let config = Config::load_for_write_from(&path).unwrap();
+        assert!(config.voice_rejected.is_empty());
+        assert!(
+            config.voice_warnings.len() >= 2,
+            "钳制与回退仍应留下警告：{:?}",
+            config.voice_warnings
+        );
+        assert_eq!(config.voice_presets[0].params.pitch_semitones, 24.0);
+        assert_eq!(config.voice.active_preset, "builtin:female");
+        assert!(!config.voice.enabled);
+
+        let report = Config::load_report_from(&path);
+        assert!(!report.write_blocked, "规范化数值不应阻止保存");
+        assert_eq!(report.notices, config.voice_warnings);
+    }
+
+    #[test]
+    fn 写入前读取成功后保存保留音效库用户预设与未知键() {
+        let dir = TemporaryDirectory::new("strict-roundtrip");
+        let path = write_config(
+            &dir,
+            r#"
+future_scalar = "keep,me"
+
+[[sounds]]
+id = "s1"
+path = "C:\\Users\\Doe\\a.wav"
+name = "笑声"
+hotkey = "F1"
+
+[voice]
+enabled = true
+active_preset = "user:mine-abc123"
+
+[[voice_presets]]
+id = "user:mine-abc123"
+name = "我的声音"
+pitch_semitones = 3.0
+"#,
+        );
+
+        let mut config = Config::load_for_write_from(&path).unwrap();
+        config.voice.enabled = false;
+        config.save_to(&path).unwrap();
+
+        let saved = Config::load_for_write_from(&path).unwrap();
+        assert!(!saved.voice.enabled);
+        assert_eq!(saved.sound_entries(), config.sound_entries());
+        assert_eq!(saved.voice_presets, config.voice_presets);
+        assert_eq!(saved.voice_presets[0].params.pitch_semitones, 3.0);
+        assert!(saved
+            .unknown_lines
+            .iter()
+            .any(|line| line.contains("future_scalar")));
+    }
+
+    #[test]
+    fn 加载报告在无效_TOML_时提示并阻止写入() {
+        let dir = TemporaryDirectory::new("report-invalid");
+        let text = format!("buffer_ms = 40\n{INVALID_TOML_WITH_LIBRARY_AND_VOICE}");
+        let path = write_config(&dir, &text);
+
+        let report = Config::load_report_from(&path);
+        assert!(report.write_blocked);
+        assert_eq!(report.notices.len(), 1, "{:?}", report.notices);
+        assert!(report.notices[0].contains("不是有效 TOML"));
+        assert!(report.notices[0].contains(&path.display().to_string()));
+        assert_eq!(
+            report.config.buffer_ms,
+            Some(40),
+            "宽松读取仍应保留能识别的设置"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn 加载报告在读取失败时用默认值并阻止写入() {
+        let dir = TemporaryDirectory::new("report-unreadable");
+        let report = Config::load_report_from(dir.path());
+        assert!(report.write_blocked);
+        assert_eq!(report.config, Config::default());
+        assert!(report.notices[0].contains("读取配置文件失败"));
+    }
+
+    #[test]
+    fn 加载报告在配置正常或缺失时没有提示() {
+        let dir = TemporaryDirectory::new("report-clean");
+        let missing = Config::load_report_from(&dir.path().join("config.toml"));
+        assert!(missing.notices.is_empty() && !missing.write_blocked);
+
+        let path = write_config(&dir, "buffer_ms = 40\n[voice]\nenabled = false\n");
+        let report = Config::load_report_from(&path);
+        assert!(report.notices.is_empty() && !report.write_blocked);
+        assert_eq!(report.config.buffer_ms, Some(40));
+    }
+
+    #[test]
+    fn 被拒绝的变声条目进入警告列表且被拒绝列表是其子集() {
+        let config = Config::try_parse(
+            "[[voice_presets]]\nid = \"user:a\"\nname = \"\"\n\n\
+             [[voice_presets]]\nid = \"user:b\"\nname = \"越界\"\npitch_semitones = 99.0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.voice_rejected.len(),
+            1,
+            "{:?}",
+            config.voice_rejected
+        );
+        assert!(config
+            .voice_rejected
+            .iter()
+            .all(|item| config.voice_warnings.contains(item)));
+        assert_eq!(
+            config.voice_warnings.len(),
+            2,
+            "被拒绝与被钳制的条目都应有提示"
         );
     }
 }

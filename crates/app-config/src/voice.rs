@@ -30,6 +30,30 @@ const ROBOT_HZ_RANGE: (f32, f32) = (20.0, 1000.0);
 const ROBOT_MIX_DEFAULT: f32 = 0.8;
 const ROBOT_MIX_RANGE: (f32, f32) = (0.0, 1.0);
 
+/// 加载变声配置时收集的提示。
+///
+/// `warnings` 记录全部非阻断提示；`rejected` 是其中会在重写配置时被永久删除的内容
+/// （被拒绝的预设条目、类型错误的字段、被整体忽略的配置节）。`Config::load_for_write_from`
+/// 据此拒绝写入，避免保存一次就把用户手写的条目带走。
+#[derive(Debug, Default)]
+pub(crate) struct VoiceLoadNotes {
+    pub(crate) warnings: Vec<String>,
+    pub(crate) rejected: Vec<String>,
+}
+
+impl VoiceLoadNotes {
+    /// 值被钳制或回退，原条目仍在：只提示，不阻止写入。
+    fn warn(&mut self, message: String) {
+        self.warnings.push(message);
+    }
+
+    /// 内容无法在内存里保留：既是提示，也是拒绝写入的依据。
+    fn reject(&mut self, message: String) {
+        self.warnings.push(message.clone());
+        self.rejected.push(message);
+    }
+}
+
 /// 持久化的变声参数。
 ///
 /// 字段与 `audio-core::VoiceParams` 一一对应；开关与数值分开保存，
@@ -350,19 +374,19 @@ fn next_user_suffix() -> String {
     format!("{value:06x}")
 }
 
-pub(crate) fn parse_voice(value: Option<toml::Value>, warnings: &mut Vec<String>) -> VoiceConfig {
+pub(crate) fn parse_voice(value: Option<toml::Value>, notes: &mut VoiceLoadNotes) -> VoiceConfig {
     let mut config = VoiceConfig::default();
     let Some(value) = value else {
         return config;
     };
     let toml::Value::Table(mut table) = value else {
-        warnings.push("变声配置节格式无效，已忽略".to_owned());
+        notes.reject("变声配置节 [voice] 格式无效，已忽略".to_owned());
         return config;
     };
 
     match table.remove("enabled") {
         Some(toml::Value::Boolean(enabled)) => config.enabled = enabled,
-        Some(_) => warnings.push("voice.enabled 不是布尔值，已按关闭处理".to_owned()),
+        Some(_) => notes.reject("voice.enabled 不是布尔值，已按关闭处理".to_owned()),
         None => {}
     }
     match table.remove("active_preset") {
@@ -370,9 +394,9 @@ pub(crate) fn parse_voice(value: Option<toml::Value>, warnings: &mut Vec<String>
             config.active_preset = id;
         }
         Some(toml::Value::String(_)) => {
-            warnings.push("voice.active_preset 为空，已使用默认预设".to_owned());
+            notes.warn("voice.active_preset 为空，已使用默认预设".to_owned());
         }
-        Some(_) => warnings.push("voice.active_preset 不是字符串，已使用默认预设".to_owned()),
+        Some(_) => notes.reject("voice.active_preset 不是字符串，已使用默认预设".to_owned()),
         None => {}
     }
     for (key, slot) in [
@@ -382,7 +406,7 @@ pub(crate) fn parse_voice(value: Option<toml::Value>, warnings: &mut Vec<String>
     ] {
         match table.remove(key) {
             Some(toml::Value::String(value)) => *slot = value,
-            Some(_) => warnings.push(format!("voice.{key} 不是字符串，已忽略")),
+            Some(_) => notes.reject(format!("voice.{key} 不是字符串，已忽略")),
             None => {}
         }
     }
@@ -393,20 +417,20 @@ pub(crate) fn parse_voice(value: Option<toml::Value>, warnings: &mut Vec<String>
 
 pub(crate) fn parse_voice_presets(
     value: Option<toml::Value>,
-    warnings: &mut Vec<String>,
+    notes: &mut VoiceLoadNotes,
 ) -> Vec<VoicePreset> {
     let Some(value) = value else {
         return Vec::new();
     };
     let toml::Value::Array(rows) = value else {
-        warnings.push("voice_presets 不是数组，已忽略".to_owned());
+        notes.reject("voice_presets 不是数组，已忽略".to_owned());
         return Vec::new();
     };
 
     let mut presets: Vec<VoicePreset> = Vec::new();
     for (index, row) in rows.into_iter().enumerate() {
         let Some(mut row) = row.as_table().cloned() else {
-            warnings.push(format!("第 {} 条变声预设不是表格，已丢弃", index + 1));
+            notes.reject(format!("第 {} 条变声预设不是表格，已丢弃", index + 1));
             continue;
         };
         let id = row
@@ -419,68 +443,56 @@ pub(crate) fn parse_voice_presets(
             .unwrap_or_default();
 
         if !id.starts_with("user:") {
-            warnings.push(format!("变声预设 ID「{id}」缺少 user: 前缀，已丢弃"));
+            notes.reject(format!("变声预设 ID「{id}」缺少 user: 前缀，已丢弃"));
             continue;
         }
         if name.trim().is_empty() {
-            warnings.push(format!("用户预设「{id}」名称为空，已丢弃"));
+            notes.reject(format!("用户预设「{id}」名称为空，已丢弃"));
             continue;
         }
         if presets.iter().any(|preset| preset.id == id) {
-            warnings.push(format!("用户预设 ID「{id}」重复，已丢弃后出现的条目"));
+            notes.reject(format!("用户预设 ID「{id}」重复，已丢弃后出现的条目"));
             continue;
         }
 
         let mut params = VoiceParamsConfig::neutral();
-        if let Some(value) = take_number(&mut row, "pitch_semitones") {
-            params.pitch_semitones = value;
+        let numbers: [(&str, &mut f32); 9] = [
+            ("pitch_semitones", &mut params.pitch_semitones),
+            ("formant_semitones", &mut params.formant_semitones),
+            ("gate_db", &mut params.gate_db),
+            ("eq_low_db", &mut params.eq_low_db),
+            ("eq_mid_db", &mut params.eq_mid_db),
+            ("eq_high_db", &mut params.eq_high_db),
+            ("drive", &mut params.drive),
+            ("robot_hz", &mut params.robot_hz),
+            ("robot_mix", &mut params.robot_mix),
+        ];
+        for (key, slot) in numbers {
+            match take_number(&mut row, key) {
+                Field::Value(value) => *slot = value,
+                Field::Invalid => notes.reject(invalid_field(&name, key)),
+                Field::Absent => {}
+            }
         }
-        if let Some(value) = take_number(&mut row, "formant_semitones") {
-            params.formant_semitones = value;
-        }
-        if let Some(value) = take_bool(&mut row, "gate_enabled") {
-            params.gate_enabled = value;
-        }
-        if let Some(value) = take_number(&mut row, "gate_db") {
-            params.gate_db = value;
-        }
-        if let Some(value) = take_bool(&mut row, "eq_low_enabled") {
-            params.eq_low_enabled = value;
-        }
-        if let Some(value) = take_number(&mut row, "eq_low_db") {
-            params.eq_low_db = value;
-        }
-        if let Some(value) = take_bool(&mut row, "eq_mid_enabled") {
-            params.eq_mid_enabled = value;
-        }
-        if let Some(value) = take_number(&mut row, "eq_mid_db") {
-            params.eq_mid_db = value;
-        }
-        if let Some(value) = take_bool(&mut row, "eq_high_enabled") {
-            params.eq_high_enabled = value;
-        }
-        if let Some(value) = take_number(&mut row, "eq_high_db") {
-            params.eq_high_db = value;
-        }
-        if let Some(value) = take_bool(&mut row, "drive_enabled") {
-            params.drive_enabled = value;
-        }
-        if let Some(value) = take_number(&mut row, "drive") {
-            params.drive = value;
-        }
-        if let Some(value) = take_bool(&mut row, "robot_enabled") {
-            params.robot_enabled = value;
-        }
-        if let Some(value) = take_number(&mut row, "robot_hz") {
-            params.robot_hz = value;
-        }
-        if let Some(value) = take_number(&mut row, "robot_mix") {
-            params.robot_mix = value;
+        let switches: [(&str, &mut bool); 6] = [
+            ("gate_enabled", &mut params.gate_enabled),
+            ("eq_low_enabled", &mut params.eq_low_enabled),
+            ("eq_mid_enabled", &mut params.eq_mid_enabled),
+            ("eq_high_enabled", &mut params.eq_high_enabled),
+            ("drive_enabled", &mut params.drive_enabled),
+            ("robot_enabled", &mut params.robot_enabled),
+        ];
+        for (key, slot) in switches {
+            match take_bool(&mut row, key) {
+                Field::Value(value) => *slot = value,
+                Field::Invalid => notes.reject(invalid_field(&name, key)),
+                Field::Absent => {}
+            }
         }
 
         let issues = params.validate();
         if !issues.is_empty() {
-            warnings.push(format!(
+            notes.warn(format!(
                 "用户预设「{name}」参数越界，已钳制：{}",
                 issues.join("；")
             ));
@@ -564,17 +576,33 @@ fn preset_to_table(preset: &VoicePreset) -> toml::Value {
     toml::Value::Table(row)
 }
 
-fn take_number(table: &mut toml::Table, key: &str) -> Option<f32> {
-    match table.remove(key)? {
-        toml::Value::Float(value) => Some(value as f32),
-        toml::Value::Integer(value) => Some(value as f32),
-        toml::Value::String(value) => value.parse().ok(),
-        _ => None,
+/// 预设条目里一个字段的读取结果；类型错误与缺失是两回事，前者要告知用户。
+enum Field<T> {
+    Absent,
+    Value(T),
+    Invalid,
+}
+
+fn take_number(table: &mut toml::Table, key: &str) -> Field<f32> {
+    match table.remove(key) {
+        None => Field::Absent,
+        Some(toml::Value::Float(value)) => Field::Value(value as f32),
+        Some(toml::Value::Integer(value)) => Field::Value(value as f32),
+        Some(toml::Value::String(value)) => value.parse().map_or(Field::Invalid, Field::Value),
+        Some(_) => Field::Invalid,
     }
 }
 
-fn take_bool(table: &mut toml::Table, key: &str) -> Option<bool> {
-    table.remove(key).and_then(|value| value.as_bool())
+fn take_bool(table: &mut toml::Table, key: &str) -> Field<bool> {
+    match table.remove(key) {
+        None => Field::Absent,
+        Some(toml::Value::Boolean(value)) => Field::Value(value),
+        Some(_) => Field::Invalid,
+    }
+}
+
+fn invalid_field(preset: &str, key: &str) -> String {
+    format!("用户预设「{preset}」的字段 {key} 类型无效，已使用默认值")
 }
 
 fn toml_lines(table: toml::Table) -> Vec<String> {
