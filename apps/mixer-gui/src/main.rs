@@ -11,6 +11,7 @@ mod host;
 #[cfg(target_os = "macos")]
 mod macos_audio;
 mod smoke;
+mod voice;
 mod window_lifecycle;
 
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ use host::{AudioHost, DeviceDto, StartConfig, StatusDto};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, State};
+use voice::{VoiceParamsDto, VoicePresetDto, VoiceStatusDto};
 use window_lifecycle::MainWindowEvent;
 
 type Res<T> = Result<T, String>;
@@ -570,6 +572,38 @@ fn status(host: State<'_, AudioHost>) -> StatusDto {
     host.status()
 }
 
+// ─────────────────────────────────────────── 变声
+
+#[tauri::command]
+fn voice_status(host: State<'_, AudioHost>) -> VoiceStatusDto {
+    host.voice_status()
+}
+
+#[tauri::command]
+fn voice_presets(host: State<'_, AudioHost>) -> Vec<VoicePresetDto> {
+    host.voice_presets()
+}
+
+#[tauri::command]
+fn voice_set_enabled(host: State<'_, AudioHost>, enabled: bool) -> Res<VoiceStatusDto> {
+    host.voice_set_enabled(enabled).map_err(err)
+}
+
+#[tauri::command]
+fn voice_set_bypass(host: State<'_, AudioHost>, bypass: bool) -> Res<VoiceStatusDto> {
+    host.voice_set_bypass(bypass).map_err(err)
+}
+
+#[tauri::command]
+fn voice_set_params(host: State<'_, AudioHost>, params: VoiceParamsDto) -> Res<VoiceStatusDto> {
+    host.voice_set_params(params).map_err(err)
+}
+
+#[tauri::command]
+fn voice_select_preset(host: State<'_, AudioHost>, id: String) -> Res<VoiceStatusDto> {
+    host.voice_select_preset(&id).map_err(err)
+}
+
 /// 前端加载完成后主动上报 —— 用来证明 WebView 真的渲染并执行了 JS。
 /// `--probe` 模式下会把它打印出来，供自动化验证。
 fn sound_item_dto(item: &app_config::SoundEntry) -> serde_json::Value {
@@ -694,35 +728,70 @@ fn save_config(
     sfx_gain_db: f32,
     hotkeys: String,
 ) -> Result<(), String> {
-    let mut c = Config::load();
-    c.sound_dirs = if dir.trim().is_empty() {
-        Vec::new()
-    } else {
-        vec![PathBuf::from(dir)]
-    };
-    c.set("monitor", if monitor { "true" } else { "false" })
-        .map_err(err)?;
-    if let Some(looping) = looping {
-        c.set("looping", if looping { "true" } else { "false" })
-            .map_err(err)?;
-    }
-    c.set("monitor_device", monitor_device.as_deref().unwrap_or(""))
-        .map_err(err)?;
+    save_config_at(
+        &Config::path(),
+        items,
+        monitor,
+        looping,
+        monitor_device,
+        dir,
+        input_device,
+        output_device,
+        buffer_ms,
+        mic_gain_db,
+        sfx_gain_db,
+        hotkeys,
+    )
+}
 
-    // 音效库：整组覆盖（路径/音量/名字/标签），保持并行数组一一对应
-    let parsed = parse_sound_items(&items);
-    c.set_sound_entries(&parsed);
-    c.set("input_device", input_device.as_deref().unwrap_or("none"))
-        .map_err(err)?;
-    c.set("output_device", output_device.as_deref().unwrap_or("none"))
-        .map_err(err)?;
-    c.set("buffer_ms", &buffer_ms.to_string()).map_err(err)?;
-    c.set("mic_gain_db", &mic_gain_db.to_string())
-        .map_err(err)?;
-    c.set("sfx_gain_db", &sfx_gain_db.to_string())
-        .map_err(err)?;
-    c.set("hotkeys", &hotkeys).map_err(err)?;
-    c.save().map(|_| ()).map_err(err)
+/// 完整配置保存只覆盖界面拥有的字段。重读磁盘后再写，变声节与用户预设
+/// 原样保留；与变声持久化共用写入门，避免两份整配置互相覆盖。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn save_config_at(
+    path: &std::path::Path,
+    items: Vec<serde_json::Value>,
+    monitor: bool,
+    looping: Option<bool>,
+    monitor_device: Option<String>,
+    dir: String,
+    input_device: Option<String>,
+    output_device: Option<String>,
+    buffer_ms: u32,
+    mic_gain_db: f32,
+    sfx_gain_db: f32,
+    hotkeys: String,
+) -> Result<(), String> {
+    crate::host::with_config_write(|| {
+        let mut c = Config::load_from(path);
+        c.sound_dirs = if dir.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![PathBuf::from(dir)]
+        };
+        c.set("monitor", if monitor { "true" } else { "false" })
+            .map_err(err)?;
+        if let Some(looping) = looping {
+            c.set("looping", if looping { "true" } else { "false" })
+                .map_err(err)?;
+        }
+        c.set("monitor_device", monitor_device.as_deref().unwrap_or(""))
+            .map_err(err)?;
+
+        // 音效库：整组覆盖（路径/音量/名字/标签），保持并行数组一一对应
+        let parsed = parse_sound_items(&items);
+        c.set_sound_entries(&parsed);
+        c.set("input_device", input_device.as_deref().unwrap_or("none"))
+            .map_err(err)?;
+        c.set("output_device", output_device.as_deref().unwrap_or("none"))
+            .map_err(err)?;
+        c.set("buffer_ms", &buffer_ms.to_string()).map_err(err)?;
+        c.set("mic_gain_db", &mic_gain_db.to_string())
+            .map_err(err)?;
+        c.set("sfx_gain_db", &sfx_gain_db.to_string())
+            .map_err(err)?;
+        c.set("hotkeys", &hotkeys).map_err(err)?;
+        c.save_to(path).map_err(err)
+    })
 }
 
 #[tauri::command]
@@ -1129,6 +1198,12 @@ fn main() {
             js_error,
             open_url,
             status,
+            voice_status,
+            voice_presets,
+            voice_set_enabled,
+            voice_set_bypass,
+            voice_set_params,
+            voice_select_preset,
             frontend_ready,
             load_config,
             save_config,

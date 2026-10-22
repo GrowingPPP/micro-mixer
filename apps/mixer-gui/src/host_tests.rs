@@ -3,11 +3,17 @@ use audio_core::device::{AudioStream, CaptureCallback, DeviceInfo, RenderCallbac
 use audio_core::engine::SfxSlot;
 use std::sync::atomic::AtomicUsize;
 
+#[cfg(feature = "voice")]
+use crate::voice::{VoiceParamsDto, VoiceService, VoiceStartConfig};
+#[cfg(feature = "voice")]
+use audio_core::voice::{VoiceBackend, VoiceParams, VoicePhase};
+
 type CloseBarrier = (mpsc::Sender<()>, Arc<Mutex<mpsc::Receiver<()>>>);
 
 #[derive(Clone, Default)]
 struct FakeBackend {
     outputs: Arc<Mutex<Vec<RenderCallback>>>,
+    captures: Arc<Mutex<Vec<CaptureCallback>>>,
     opened: Arc<Mutex<Option<mpsc::Sender<()>>>>,
     close_barrier: Arc<Mutex<Option<CloseBarrier>>>,
     closed: Arc<Mutex<Option<mpsc::Sender<()>>>>,
@@ -59,8 +65,9 @@ impl AudioBackend for FakeBackend {
         &self,
         _: &DeviceId,
         format: Option<StreamFormat>,
-        _: CaptureCallback,
+        callback: CaptureCallback,
     ) -> Result<Box<dyn AudioStream>> {
+        self.captures.lock().unwrap().push(callback);
         Ok(Box::new(FakeStream(format.unwrap(), None, None)))
     }
     fn open_output(
@@ -98,6 +105,7 @@ fn config() -> StartConfig {
         monitor: true,
         monitor_device: Some("fake monitor".into()),
         remote_port: Some(8765),
+        voice: None,
     }
 }
 // 既有 PCM 场景使用单位增益，产品默认增益在专门的回归中验证。
@@ -183,6 +191,116 @@ fn fixture() -> (AudioHost, FakeBackend) {
     (host, backend)
 }
 
+#[cfg(feature = "voice")]
+struct FakeVoiceBackend;
+
+#[cfg(feature = "voice")]
+impl VoiceBackend for FakeVoiceBackend {
+    fn process(&mut self, input: &[f32], output: &mut [f32]) -> usize {
+        let frames = input.len().min(output.len());
+        output[..frames].copy_from_slice(&input[..frames]);
+        frames
+    }
+
+    fn latency_frames(&self) -> usize {
+        0
+    }
+
+    fn reset(&mut self) {}
+
+    fn set_params(&mut self, _: VoiceParams) {}
+}
+
+#[cfg(feature = "voice")]
+fn voice_fixture(enabled: bool) -> (AudioHost, FakeBackend, TemporaryDir) {
+    let cfg = config();
+    let backend = FakeBackend::default();
+    let format = StreamFormat::stereo(44_100);
+    let slot = SfxSlot {
+        name: "Good".into(),
+        samples: Arc::new(vec![0.2; 88_200]),
+        looping: false,
+        gain_db: 0.0,
+    };
+    let dir = TemporaryDir::new();
+    let mut host = preview_test_host();
+    host.voice =
+        VoiceService::new_with_path(&app_config::Config::default(), dir.0.join("config.toml"));
+    let params = VoiceParams {
+        pitch_semitones: 4.0,
+        ..VoiceParams::neutral()
+    };
+    host.voice
+        .apply_start_config(&VoiceStartConfig {
+            enabled,
+            params: Some(params.into()),
+            block_ms: Some(crate::voice::DEFAULT_VOICE_BLOCK_MS),
+        })
+        .unwrap();
+    let session = Session::open_with_backend(
+        SessionOptions {
+            input: DeviceId::new("fake input"),
+            output: DeviceId::new("fake output"),
+            input_format: format,
+            output_format: format,
+            buffer_ms: cfg.buffer_ms,
+            slots: vec![slot.clone()],
+            mic_gain_db: 0.0,
+            sfx_gain_db: 0.0,
+            monitor: Some(MonitorOptions {
+                device: DeviceId::new("fake monitor"),
+                format,
+                slots: vec![slot],
+            }),
+            voice: Some(audio_session::VoiceOptions {
+                enabled,
+                params,
+                block_ms: crate::voice::DEFAULT_VOICE_BLOCK_MS,
+                backend: Box::new(|_| Ok(Box::new(FakeVoiceBackend))),
+            }),
+        },
+        backend.clone(),
+        backend.clone(),
+    )
+    .unwrap();
+    let control = session.voice_control();
+    let playback = session.playback.clone();
+    host.next_generation.store(1, Ordering::Relaxed);
+    host.audio_requests.register_session(1);
+    *host.running.lock().unwrap() = Some(Running {
+        generation: 1,
+        stats: session.stats.clone(),
+        playback,
+        session,
+        shutdown: Arc::new(AtomicBool::new(false)),
+        hotkey_thread: None,
+        slots_meta: vec![SlotDto {
+            index: 0,
+            source_index: 0,
+            id: "good-id".into(),
+            name: "Good".into(),
+            file: "good.wav".into(),
+            duration: 1.0,
+            peak_db: -14.0,
+            hotkey: String::new(),
+            gain_db: 0.0,
+        }],
+        out_device: "fake output".into(),
+        in_device: "fake input".into(),
+        input_id: DeviceId::new("fake input"),
+        output_id: DeviceId::new("fake output"),
+        monitor_error: Mutex::new(None),
+        started_at: std::time::Instant::now(),
+        skipped_notes: Vec::new(),
+        hotkeys: Arc::new(Mutex::new(None)),
+        poller: Arc::new(Mutex::new(None)),
+        cfg_key: cfg_fingerprint(&cfg),
+        cfg,
+    });
+    host.attach_voice_control(control);
+    (host, backend, dir)
+}
+
 #[test]
 fn every_start_setting_changes_the_fingerprint() {
     let baseline = config();
@@ -216,6 +334,166 @@ fn every_start_setting_changes_the_fingerprint() {
             "changed {name} must rebuild the session"
         );
     }
+}
+
+#[test]
+fn 变声字段不参与启动指纹() {
+    let mut cfg = config();
+    let key = cfg_fingerprint(&cfg);
+    cfg.voice = Some(crate::voice::VoiceStartConfig {
+        enabled: true,
+        params: Some(crate::voice::VoiceParamsDto {
+            pitch_semitones: 12.0,
+            ..crate::voice::VoiceParamsDto::default()
+        }),
+        block_ms: Some(20.0),
+    });
+    assert_eq!(
+        key,
+        cfg_fingerprint(&cfg),
+        "变声参数只能作用于运行控制，不能触发音频会话重启"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 变声参数变化不重启音频会话() {
+    let (host, backend, _dir) = voice_fixture(true);
+    let before_generation = host.audio_progress().0;
+    let before_key = host.running_cfg_key().unwrap();
+    let before_outputs = backend.outputs.lock().unwrap().len();
+
+    let status = host
+        .voice_set_params(VoiceParamsDto {
+            pitch_semitones: 9.0,
+            formant_semitones: -3.0,
+            ..VoiceParamsDto::default()
+        })
+        .unwrap();
+
+    assert_eq!(status.params.pitch_semitones, 9.0);
+    assert_eq!(status.params.formant_semitones, -3.0);
+    assert_eq!(host.audio_progress().0, before_generation);
+    assert_eq!(host.running_cfg_key().unwrap(), before_key);
+    assert_eq!(backend.outputs.lock().unwrap().len(), before_outputs);
+    let control = host.voice_control.lock().unwrap().clone().unwrap();
+    assert_eq!(control.params().pitch_semitones, 9.0);
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 变声待机保留变声控制() {
+    let (host, _backend, _dir) = voice_fixture(true);
+    let before = host.status().voice.expect("运行时应带变声状态");
+
+    host.stop();
+
+    let status = host.status();
+    assert!(!status.running);
+    assert!(status.passthrough);
+    assert!(
+        host.voice_control.lock().unwrap().is_some(),
+        "待机只关闭音效，变声控制句柄必须保留"
+    );
+    let voice = status.voice.expect("待机仍应报告变声状态");
+    assert!(voice.enabled);
+    assert_eq!(voice.phase, before.phase);
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 变声释放后重建使用最新配置() {
+    let (host, _backend, dir) = voice_fixture(false);
+    host.release();
+    assert!(host.voice_control.lock().unwrap().is_none());
+
+    host.voice_set_params(VoiceParamsDto {
+        pitch_semitones: 9.0,
+        ..VoiceParamsDto::default()
+    })
+    .unwrap();
+    host.voice_set_enabled(true).unwrap();
+
+    let options = host
+        .voice
+        .prepare_options(crate::voice::DEFAULT_VOICE_BLOCK_MS)
+        .unwrap();
+    assert!(options.enabled, "重建会话必须采用最新启用状态");
+    assert_eq!(options.params.pitch_semitones, 9.0);
+
+    let control = VoiceControl::new(options.params);
+    if options.enabled {
+        control.request_enable();
+    }
+    host.attach_voice_control(Some(control.clone()));
+    assert_eq!(control.phase(), VoicePhase::Warmup);
+    assert_eq!(control.params().pitch_semitones, 9.0);
+    host.voice.flush_saves();
+    let saved = app_config::Config::load_from(&dir.0.join("config.toml"));
+    assert!(saved.voice.enabled);
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 变声自检与校准期间临时旁路并在结束后恢复() {
+    let dir = TemporaryDir::new();
+    let mut host = preview_test_host();
+    host.voice =
+        VoiceService::new_with_path(&app_config::Config::default(), dir.0.join("config.toml"));
+    let control = VoiceControl::new(VoiceParams::neutral());
+    host.attach_voice_control(Some(control.clone()));
+    host.voice_set_enabled(true).unwrap();
+
+    host.with_suspended(None, || {
+        let status = host.voice_status();
+        assert!(status.bypassed, "自检期间必须临时旁路人声链");
+        assert_eq!(status.phase, "off", "旁路期间输出干声");
+        Ok(())
+    })
+    .unwrap();
+
+    let status = host.voice_status();
+    assert!(status.enabled);
+    assert!(!status.bypassed);
+    assert_eq!(control.phase(), VoicePhase::Warmup);
+    host.voice.flush_saves();
+    assert!(
+        app_config::Config::load_from(&dir.0.join("config.toml"))
+            .voice
+            .enabled,
+        "自检暂停与恢复不得改写启用配置"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 变声监听路径不接受人声() {
+    let (host, backend, _dir) = voice_fixture(true);
+    host.set_gains(0.0, 0.0);
+    let mut primary_tail = 0.0;
+    for _ in 0..400 {
+        for callback in backend.captures.lock().unwrap().iter_mut() {
+            callback(&vec![0.3; 4_410]);
+        }
+        let mut outputs = backend.outputs.lock().unwrap();
+        let mut primary = vec![0.0; 4_410 * 2];
+        outputs[0](&mut primary);
+        let mut monitor = vec![0.0; 4_410 * 2];
+        outputs[1](&mut monitor);
+        primary_tail = primary[primary.len() - 2_000..]
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+        assert!(
+            monitor.iter().all(|sample| sample.abs() < 1e-6),
+            "监听路径只能播放音效，不能混入人声"
+        );
+    }
+    assert!(primary_tail > 0.1, "主输出应收到人声，实际 {primary_tail}");
+    assert_eq!(
+        host.status().voice.unwrap().phase,
+        "wet",
+        "驱动采集与渲染后应进入湿声"
+    );
 }
 
 #[test]

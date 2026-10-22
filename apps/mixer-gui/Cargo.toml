@@ -25,5 +25,9 @@ serde_json = "1"
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 rfd = "0.15"
 
+[features]
+default = []
+voice = ["audio-session/voice"]
+
 [lints]
 workspace = true

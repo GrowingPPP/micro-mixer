@@ -26,6 +26,12 @@ use audio_core::limiter::Limiter;
 use backend_cpal::CpalBackend;
 use hotkeys::Hotkeys;
 
+use crate::voice::{VoiceParamsDto, VoicePresetDto, VoiceStartConfig, VoiceStatusDto};
+#[cfg(feature = "voice")]
+use crate::voice::{VoiceService, DEFAULT_VOICE_BLOCK_MS};
+#[cfg(feature = "voice")]
+use audio_core::voice::VoiceControl;
+
 // ─────────────────────────────────────────── DTO
 
 #[derive(Debug, Clone, Serialize)]
@@ -84,6 +90,10 @@ pub struct StartConfig {
     /// 手机遥控端口；None 表示不开启
     #[serde(default)]
     pub remote_port: Option<u16>,
+    /// 会话初始变声值；不参与启动指纹，缺省时沿用宿主当前配置。
+    #[serde(default, skip_serializing)]
+    #[cfg_attr(not(feature = "voice"), allow(dead_code))]
+    pub voice: Option<VoiceStartConfig>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -128,6 +138,8 @@ pub struct StatusDto {
     ///
     /// `running=false, passthrough=true` = **待机**：对方仍听得到你说话，但音效不响应。
     pub passthrough: bool,
+    /// 变声状态；未编译变声后端时为 `None`。
+    pub voice: Option<VoiceStatusDto>,
 }
 
 impl StatusDto {
@@ -162,6 +174,7 @@ impl StatusDto {
             device_lost: None,
             last_panic: None,
             audio_stalled: None,
+            voice: None,
         }
     }
 }
@@ -188,6 +201,21 @@ pub fn scan_dir(dir: &Path) -> Result<Vec<PathBuf>> {
         .collect();
     out.sort();
     Ok(out)
+}
+
+// ─────────────────────────────────────────── 配置写入
+
+/// 完整配置保存与变声持久化共用这一把进程内门，防止两者各自读到旧文件后
+/// 用整份快照互相覆盖。持门期间只做配置读写，不等待音频或界面线程。
+static CONFIG_WRITE_GATE: Mutex<()> = Mutex::new(());
+
+pub(crate) fn with_config_write<T, E>(
+    action: impl FnOnce() -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
+    let _guard = CONFIG_WRITE_GATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    action()
 }
 
 // ─────────────────────────────────────────── 宿主
@@ -397,6 +425,12 @@ pub struct AudioHost {
     ///
     /// 只在**第一次启动音频之前**记录：之后我们再改默认设备也不会污染这个基准。
     original_default_input: Mutex<Option<(u32, String)>>,
+    /// 变声状态与持久化；命令和状态轮询都从这里取快照。
+    #[cfg(feature = "voice")]
+    voice: VoiceService,
+    /// 当前会话的控制句柄；待机保留，释放时丢弃。
+    #[cfg(feature = "voice")]
+    voice_control: Mutex<Option<VoiceControl>>,
 }
 
 /// Only request publication and session registration use this short gate. It is
@@ -532,6 +566,11 @@ impl AudioHost {
     pub fn status(&self) -> StatusDto {
         let (preview_sound_id, preview_playing, preview_playhead_secs, preview_duration_secs) =
             self.preview_status();
+        // 变声状态来自宿主的控制侧快照，不读取音频线程内部状态。
+        #[cfg(feature = "voice")]
+        let voice = Some(self.voice.status());
+        #[cfg(not(feature = "voice"))]
+        let voice: Option<VoiceStatusDto> = None;
         let guard = self.running.lock().unwrap_or_else(|e| e.into_inner());
         let Some(r) = guard.as_ref() else {
             let mut s = StatusDto::stopped();
@@ -559,6 +598,7 @@ impl AudioHost {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
+            s.voice = voice;
             return s;
         };
         let st = r.stats.snapshot();
@@ -621,6 +661,7 @@ impl AudioHost {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
+            voice,
         }
     }
 
@@ -696,6 +737,12 @@ impl AudioHost {
         if !self.prepare_start_gains(&mut cfg, ticket)? {
             return Ok(());
         }
+        // StartConfig 只提供本次会话的初始值；之后的重建都使用宿主最新状态。
+        #[cfg(feature = "voice")]
+        let voice_block_ms = match cfg.voice.take() {
+            Some(start) => self.voice.apply_start_config(&start)?,
+            None => DEFAULT_VOICE_BLOCK_MS,
+        };
         // 设备与音效列表都没变（典型情况：从「待机」点「开启音效」）→
         // **不重开音频流**，只把音效重新打开。瞬间生效，用户来回切毫无卡顿。
         if let Some(k) = self.running_cfg_key() {
@@ -872,6 +919,10 @@ impl AudioHost {
             .find(|d| d.id == in_id && d.direction == audio_core::device::Direction::Input)
             .map(|d| d.name.clone())
             .unwrap_or_else(|| in_id.to_string());
+        #[cfg(feature = "voice")]
+        let voice_options = Some(self.voice.prepare_options(voice_block_ms)?);
+        #[cfg(not(feature = "voice"))]
+        let voice_options: Option<audio_session::VoiceOptions> = None;
         let session = Session::open(SessionOptions {
             input: in_id.clone(),
             output: out_id.clone(),
@@ -882,8 +933,10 @@ impl AudioHost {
             mic_gain_db: cfg.mic_gain_db,
             sfx_gain_db: cfg.sfx_gain_db,
             monitor,
-            voice: None,
+            voice: voice_options,
         })?;
+        #[cfg(feature = "voice")]
+        let voice_control = session.voice_control();
         let playback = session.playback.clone();
         let control = playback.control.clone();
         let stats = session.stats.clone();
@@ -989,7 +1042,13 @@ impl AudioHost {
             cfg_key: cfg_fingerprint(&cfg),
             cfg,
         };
-        if let Some(unpublished) = self.publish_running(running, ticket) {
+        let unpublished = self.publish_running(running, ticket);
+        #[cfg(feature = "voice")]
+        if unpublished.is_none() {
+            // 只把已发布的会话句柄交给命令层；被拒绝的会话随后直接关闭。
+            self.attach_voice_control(voice_control);
+        }
+        if let Some(unpublished) = unpublished {
             if let Some(shared) = self
                 .remote
                 .lock()
@@ -1154,6 +1213,11 @@ impl AudioHost {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         self.audio_requests.register_session(0);
+        #[cfg(feature = "voice")]
+        if running.is_some() {
+            // 会话释放后旧句柄不能再影响新会话，下一次启动重新构建。
+            self.attach_voice_control(None);
+        }
         if let Some(r) = running {
             r.playback.standby();
             // A hotkey worker may be waiting for preview admission. Its captured
@@ -1280,6 +1344,9 @@ impl AudioHost {
         test: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
         let _operation = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        // 自检、校准与设备恢复期间不使用人声；只暂停运行状态，不改配置。
+        #[cfg(feature = "voice")]
+        let saved_voice = self.voice.suspend();
         let saved = self
             .running
             .lock()
@@ -1288,14 +1355,26 @@ impl AudioHost {
             .map(|r| (r.cfg.clone(), r.playback.active()));
         self.release_inner();
         let result = test();
-        if let Some((cfg, active)) = saved {
-            if let Err(e) = self.start_inner(cfg, app) {
-                self.record_error(format!("自检后恢复音频失败: {e:#}"));
-                anyhow::bail!("自检已结束，但恢复音频失败: {e:#}");
+        let restore_error = if let Some((cfg, active)) = saved {
+            match self.start_inner(cfg, app) {
+                Ok(()) => {
+                    if !active {
+                        self.stop_inner();
+                    }
+                    None
+                }
+                Err(e) => {
+                    self.record_error(format!("自检后恢复音频失败: {e:#}"));
+                    Some(anyhow::anyhow!("自检已结束，但恢复音频失败: {e:#}"))
+                }
             }
-            if !active {
-                self.stop_inner();
-            }
+        } else {
+            None
+        };
+        #[cfg(feature = "voice")]
+        self.voice.restore(saved_voice);
+        if let Some(error) = restore_error {
+            return Err(error);
         }
         result
     }
@@ -2053,6 +2132,91 @@ impl AudioHost {
             .take();
         if let Some(thread) = thread {
             let _ = thread.join();
+        }
+    }
+
+    // ─────────────────────────────────────── 变声命令
+
+    pub fn voice_status(&self) -> VoiceStatusDto {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.status()
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            VoiceStatusDto::disabled()
+        }
+    }
+
+    pub fn voice_presets(&self) -> Vec<VoicePresetDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.presets()
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            Vec::new()
+        }
+    }
+
+    pub fn voice_set_enabled(&self, enabled: bool) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.set_enabled(enabled)
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            let _ = enabled;
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    pub fn voice_set_bypass(&self, bypass: bool) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.set_bypass(bypass)
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            let _ = bypass;
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    pub fn voice_set_params(&self, params: VoiceParamsDto) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.set_params(params)
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            let _ = params;
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    pub fn voice_select_preset(&self, id: &str) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.select_preset(id)
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            let _ = id;
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    #[cfg(feature = "voice")]
+    fn attach_voice_control(&self, control: Option<VoiceControl>) {
+        let mut slot = self.voice_control.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::mem::replace(&mut *slot, control.clone());
+        drop(previous);
+        drop(slot);
+
+        match control {
+            Some(control) => self.voice.attach(control),
+            None => self.voice.detach(),
         }
     }
 
