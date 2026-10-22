@@ -5,11 +5,13 @@
 //! 写入线程落盘：连续操作只保留最新待写快照，旧保存结果不能覆盖新状态。
 
 #[cfg(feature = "voice")]
+use std::collections::HashSet;
+#[cfg(feature = "voice")]
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "voice")]
 use std::sync::{Arc, Condvar, Mutex};
 #[cfg(feature = "voice")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use audio_core::voice::VoiceParams;
 use serde::{Deserialize, Serialize};
@@ -347,9 +349,9 @@ struct PendingSaveRollback {
 
 /// 一次待落盘的完整变声状态。
 ///
-/// 用户预设以服务内的权威列表整体替换配置里的 `[[voice_presets]]`，
-/// 而 `[voice]` 只覆盖服务拥有的字段；写线程严格重读磁盘，
-/// 因此并发修改的热键与其他配置不会被旧快照抹掉。
+/// 服务认识的用户预设以内存中的权威列表为准（含重命名与删除）；磁盘上服务不认识的
+/// 预设原样保留。`[voice]` 只覆盖服务拥有的字段。写线程严格重读磁盘，
+/// 因此并发修改的热键、其他配置与手动修复的条目不会被旧快照抹掉。
 #[cfg(feature = "voice")]
 #[derive(Debug, Clone)]
 struct VoiceWrite {
@@ -359,6 +361,9 @@ struct VoiceWrite {
     saved_params: VoiceParams,
     rollback: Option<PendingSaveRollback>,
     user_presets: Vec<VoicePreset>,
+    /// 本服务见过的全部用户预设 ID（含已删除的）。磁盘上不在其中的预设来自程序之外
+    /// （手动修复被拒绝的条目、外部编辑），写入时原样保留而不是被整表替换删掉。
+    known_preset_ids: HashSet<String>,
 }
 
 #[cfg(feature = "voice")]
@@ -368,8 +373,13 @@ type VoiceSaveFn = dyn Fn(&Path, &VoiceWrite) -> Result<()> + Send + Sync;
 struct VoiceState {
     enabled: bool,
     bypassed: bool,
-    /// 自检、校准与设备恢复的嵌套暂停层数；只叠加，不覆盖用户状态。
+    /// 自检（`AudioHost::with_suspended`）的嵌套暂停层数；只叠加，不覆盖用户状态。
     suspended: u32,
+    /// 麦克风校准暂停层的租约截止时间；`None` 表示未在校准。
+    ///
+    /// 校准读取送往虚拟麦克风的电平，必须是原声。这一层与自检暂停、用户临时旁路相互
+    /// 独立，不重建会话；租约到期自动解除，界面刷新或崩溃后变声不会被永久停用。
+    calibration_until: Option<Instant>,
     preset_id: String,
     preset_name: String,
     /// 当前预设的保存基线；用户保存后立即前移，落盘失败时回滚。
@@ -380,6 +390,8 @@ struct VoiceState {
     next_preset_hotkey: String,
     prev_preset_hotkey: String,
     user_presets: Vec<VoicePreset>,
+    /// 见过的全部用户预设 ID，只增不减；见 [`VoiceWrite::known_preset_ids`]。
+    known_preset_ids: HashSet<String>,
     draft: Option<VoiceDraft>,
     pending_save_rollback: Option<PendingSaveRollback>,
     preview: VoicePreviewStatus,
@@ -400,13 +412,18 @@ struct VoiceState {
 
 #[cfg(feature = "voice")]
 impl VoiceState {
+    /// 自检暂停或校准暂停任一生效时，人声路径强制回到原声。
+    fn paused(&self) -> bool {
+        self.suspended > 0 || self.calibration_until.is_some()
+    }
+
     /// 暂停和临时旁路都只会让运行态更保守，不会改写保存的启用值。
     fn effective_enabled(&self) -> bool {
-        self.enabled && !self.bypassed && self.suspended == 0
+        self.enabled && !self.bypassed && !self.paused()
     }
 
     fn effective_bypassed(&self) -> bool {
-        self.bypassed || self.suspended > 0
+        self.bypassed || self.paused()
     }
 }
 
@@ -479,6 +496,7 @@ impl VoiceService {
                     enabled,
                     bypassed: false,
                     suspended: 0,
+                    calibration_until: None,
                     preset_id,
                     preset_name,
                     saved_params: params,
@@ -487,6 +505,11 @@ impl VoiceService {
                     next_preset_hotkey: config.voice.next_preset_hotkey.clone(),
                     prev_preset_hotkey: config.voice.prev_preset_hotkey.clone(),
                     user_presets: config.voice_presets.clone(),
+                    known_preset_ids: config
+                        .voice_presets
+                        .iter()
+                        .map(|preset| preset.id.clone())
+                        .collect(),
                     draft: None,
                     pending_save_rollback: None,
                     preview: VoicePreviewStatus::Idle,
@@ -760,7 +783,7 @@ impl VoiceService {
             prev.trim().to_owned(),
         ];
         crate::host::with_config_write(|| {
-            let mut config = crate::host::load_config_for_write(self.config_path())?;
+            let mut config = Config::load_for_write_from(self.config_path())?;
             config.voice.bypass_hotkey.clone_from(&values[0]);
             config.voice.next_preset_hotkey.clone_from(&values[1]);
             config.voice.prev_preset_hotkey.clone_from(&values[2]);
@@ -846,9 +869,14 @@ impl VoiceService {
     }
 
     /// 新会话发布后绑定控制句柄；会话重建会清除临时旁路。
+    ///
+    /// 自检暂停期间的重建是例外：这是同一次使用中的临时让出设备，结束后要回到用户原来的
+    /// 旁路状态，因此暂停层存在时保留临时旁路。
     pub(crate) fn attach(&self, control: VoiceControl) {
         let mut state = self.lock();
-        state.bypassed = false;
+        if state.suspended == 0 {
+            state.bypassed = false;
+        }
         state.control = Some(control.clone());
         control.set_params(state.params);
         if state.effective_enabled() {
@@ -860,14 +888,18 @@ impl VoiceService {
 
     /// 会话释放后丢弃旧句柄，旧控制不能再影响之后的命令。
     ///
-    /// 暂停计数属于调用方生命周期，不能随会话释放清掉；否则自检恢复后
-    /// 会在暂停尚未结束时提前启用人声。
+    /// 暂停层（自检计数与校准租约）属于调用方生命周期，不能随会话释放清掉；否则恢复后
+    /// 会在暂停尚未结束时提前启用人声。自检暂停期间释放会话也保留临时旁路，见 [`attach`]。
+    ///
+    /// [`attach`]: Self::attach
     pub(crate) fn detach(&self) {
         let mut state = self.lock();
         Self::cancel_preview(&self.shared.preview_epoch, &mut state);
         state.preview_control = None;
         state.control = None;
-        state.bypassed = false;
+        if state.suspended == 0 {
+            state.bypassed = false;
+        }
     }
 
     /// 构造会话启动选项；关闭状态下仍保留人声链，供后续启用与试听复用。
@@ -1019,6 +1051,7 @@ impl VoiceService {
             }
             .new_user_preset_id(name);
             let params = state.params;
+            state.known_preset_ids.insert(id.clone());
             state.user_presets.push(VoicePreset {
                 id: id.clone(),
                 name: name.to_owned(),
@@ -1172,10 +1205,11 @@ impl VoiceService {
         Ok(self.status())
     }
 
-    /// 自检、校准与设备恢复开始前叠加一层暂停；只改运行状态，不写配置。
+    /// 自检开始前叠加一层暂停；只改运行状态，不写配置。
     ///
     /// 暂停用计数而不是快照回写：暂停期间用户仍可启用、关闭或旁路变声，
-    /// 恢复时只解除这一层暂停，不能覆盖期间发生的命令。
+    /// 恢复时只解除这一层暂停，不能覆盖期间发生的命令。设备恢复与看门狗重启不经过暂停，
+    /// 它们是会话重启，按常规规则清除临时旁路。
     pub(crate) fn suspend(&self) {
         let mut state = self.lock();
         // 暂停会改变人声路径；进行中的试听不能跨阶段继续。
@@ -1191,6 +1225,44 @@ impl VoiceService {
         state.suspended = state.suspended.saturating_sub(1);
         state.operation = state.operation.wrapping_add(1);
         Self::apply_control(&state);
+    }
+
+    /// 开始麦克风校准暂停：人声路径回到原声，校准读到的才是真实人声电平。
+    ///
+    /// 这一层独立于临时旁路与自检暂停：不改 `enabled`、`bypassed` 与配置，不重建会话，
+    /// 结束时只解除自己，期间用户的开关、旁路与预设命令保持最新值。重复开始只刷新租约。
+    /// 租约到期后下一次访问自动解除，调用方崩溃也不会让变声被永久停用。
+    pub(crate) fn begin_calibration(&self, lease: Duration) {
+        let mut state = self.lock();
+        if state.calibration_until.is_none() {
+            // 暂停会改变人声路径；进行中的试听不能跨阶段继续。
+            Self::cancel_preview(&self.shared.preview_epoch, &mut state);
+        }
+        state.calibration_until = Some(Instant::now() + lease);
+        state.operation = state.operation.wrapping_add(1);
+        Self::apply_control(&state);
+    }
+
+    /// 解除校准暂停；没有在校准时无操作，因此重复结束是安全的。
+    pub(crate) fn end_calibration(&self) {
+        let mut state = self.lock();
+        if state.calibration_until.take().is_some() {
+            state.operation = state.operation.wrapping_add(1);
+            Self::apply_control(&state);
+        }
+    }
+
+    /// 租约到期时解除校准暂停；所有状态访问都经过 [`VoiceService::lock`]，不会读到过期租约。
+    fn lapse_calibration(state: &mut VoiceState) {
+        let expired = state
+            .calibration_until
+            .is_some_and(|until| Instant::now() >= until);
+        if expired {
+            state.calibration_until = None;
+            state.operation = state.operation.wrapping_add(1);
+            Self::apply_control(state);
+            log::warn!("麦克风校准暂停租约到期，已自动恢复变声");
+        }
     }
 
     fn apply_control(state: &VoiceState) {
@@ -1214,6 +1286,7 @@ impl VoiceService {
             saved_params: state.saved_params,
             rollback: state.pending_save_rollback.clone(),
             user_presets: state.user_presets.clone(),
+            known_preset_ids: state.known_preset_ids.clone(),
         });
         if state.writer_active {
             return;
@@ -1231,10 +1304,13 @@ impl VoiceService {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, VoiceState> {
-        self.shared
+        let mut state = self
+            .shared
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::lapse_calibration(&mut state);
+        state
     }
 
     /// 等待当前及已排队的状态写入完成；只用于回归测试。
@@ -1283,7 +1359,17 @@ fn run_writer(shared: Arc<VoiceShared>) {
                 }
             }
         };
-        let result = (shared.save)(&shared.config_path, &write);
+        // 保存里的 panic 必须就地转成错误：否则写线程在持有 `writer_active` 时退出，
+        // 之后的命令只会排队，再也没有线程落盘，界面也不会显示“未保存”。
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (shared.save)(&shared.config_path, &write)
+        }))
+        .unwrap_or_else(|payload| {
+            Err(anyhow::anyhow!(
+                "保存线程发生内部错误: {}",
+                panic_text(payload.as_ref())
+            ))
+        });
         let mut state = shared
             .state
             .lock()
@@ -1315,17 +1401,37 @@ fn run_writer(shared: Arc<VoiceShared>) {
     }
 }
 
+/// 取出 panic 载荷里的文字；非字符串载荷只能给出占位说明。
+#[cfg(feature = "voice")]
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "未知 panic".to_owned())
+}
+
 /// 在进程级写入门内严格重读磁盘配置，写入服务拥有的变声字段后原子保存。
 ///
-/// 用户预设以权威列表整体替换；`[voice]` 的热键与未知键仍来自磁盘，
-/// 因此并发的非变声配置修改不会被旧快照覆盖。读取失败时保留原文件并返回错误。
+/// 服务认识的用户预设以内存列表为准；磁盘上服务不认识的预设（用户手动修复了被拒绝的
+/// 条目，或在程序运行时另行添加）接在列表之后原样保留。`[voice]` 的热键与未知键仍来自
+/// 磁盘，因此并发的非变声配置修改不会被旧快照覆盖。
+///
+/// 严格读取遇到无效 TOML、读取失败或仍被拒绝的变声条目时返回错误，原文件保持不动；
+/// 错误经保存状态显示为「未保存」。
 #[cfg(feature = "voice")]
 fn save_voice_snapshot(path: &Path, write: &VoiceWrite) -> Result<()> {
     crate::host::with_config_write(|| {
-        let mut config = crate::host::load_config_for_write(path)?;
+        let mut config = Config::load_for_write_from(path)?;
+        let external: Vec<VoicePreset> = config
+            .voice_presets
+            .drain(..)
+            .filter(|preset| !write.known_preset_ids.contains(&preset.id))
+            .collect();
         config.voice.enabled = write.enabled;
         config.voice.active_preset = write.preset_id.clone();
         config.voice_presets.clone_from(&write.user_presets);
+        config.voice_presets.extend(external);
         config.save_to(path)
     })
 }

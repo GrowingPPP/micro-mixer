@@ -584,6 +584,20 @@ fn voice_presets(host: State<'_, AudioHost>) -> Vec<VoicePresetDto> {
     host.voice_presets()
 }
 
+/// 麦克风校准开始：把变声切回原声，校准读到的才是真实人声电平。
+///
+/// 只改变声运行状态，不取生命周期锁，可在界面线程同步执行。
+#[tauri::command]
+fn voice_calibration_begin(host: State<'_, AudioHost>) {
+    host.voice_calibration_begin();
+}
+
+/// 麦克风校准结束：解除原声暂停；重复调用无副作用。
+#[tauri::command]
+fn voice_calibration_end(host: State<'_, AudioHost>) {
+    host.voice_calibration_end();
+}
+
 #[tauri::command]
 fn voice_set_enabled(host: State<'_, AudioHost>, enabled: bool) -> Res<VoiceStatusDto> {
     host.voice_set_enabled(enabled).map_err(err)
@@ -652,14 +666,25 @@ async fn voice_preview_stop(app: tauri::AppHandle) -> Res<VoiceStatusDto> {
     .map_err(err)?
 }
 
+/// 保存并重绑人声效果热键。
+///
+/// 它要拿生命周期锁（开流或释放时可能被持有数秒）并同步落盘；同步 Tauri 命令在界面线程
+/// 执行，会冻住界面，若恰逢 `start` 正等主线程绑定槽位热键，两边互等直到 6 秒超时，
+/// 槽位热键因此绑定失败。必须放到后台线程，与 `voice_preview_*` 一致。
 #[tauri::command]
-fn voice_set_hotkeys(
-    host: State<'_, AudioHost>,
+async fn voice_set_hotkeys(
+    app: tauri::AppHandle,
     bypass: String,
     next: String,
     prev: String,
 ) -> Res<VoiceStatusDto> {
-    host.voice_set_hotkeys(&bypass, &next, &prev).map_err(err)
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<AudioHost>()
+            .voice_set_hotkeys(&bypass, &next, &prev)
+            .map_err(err)
+    })
+    .await
+    .map_err(err)?
 }
 
 /// 前端加载完成后主动上报 —— 用来证明 WebView 真的渲染并执行了 JS。
@@ -728,10 +753,26 @@ fn parse_sound_items(items: &[serde_json::Value]) -> Vec<app_config::SoundEntry>
 }
 
 /// 读取上次保存的配置（音效目录、设备、增益、热键）。
+///
+/// 读取是宽松的；配置文件有问题时附带 `config_notices`，界面据此提示用户。
+/// `config_write_blocked` 为真表示保存会被拒绝，直到文件被修复。
 #[tauri::command]
 fn load_config() -> serde_json::Value {
-    let c = Config::load();
-    saved_config_dto(&c)
+    config_dto_with_notices(Config::load_report())
+}
+
+fn config_dto_with_notices(report: app_config::LoadReport) -> serde_json::Value {
+    let mut dto = saved_config_dto(&report.config);
+    dto["config_notices"] = serde_json::json!(report.notices);
+    dto["config_write_blocked"] = serde_json::json!(report.write_blocked);
+    dto
+}
+
+/// 把配置读取问题写入日志；打包后的 App 没有控制台，日志文件是事后排查的唯一线索。
+fn log_config_notices(notices: &[String]) {
+    for notice in notices {
+        log::warn!("配置: {notice}");
+    }
 }
 
 fn saved_config_dto(c: &Config) -> serde_json::Value {
@@ -825,8 +866,7 @@ pub(crate) fn save_config_at(
     hotkeys: String,
 ) -> Result<(), String> {
     crate::host::with_config_write(|| {
-        let mut c =
-            crate::host::load_config_for_write(path).map_err(|error| format!("{error:#}"))?;
+        let mut c = Config::load_for_write_from(path).map_err(|error| format!("{error:#}"))?;
         c.sound_dirs = if dir.trim().is_empty() {
             Vec::new()
         } else {
@@ -1171,7 +1211,9 @@ fn main() {
             // 同样提前探测 —— 否则用户点「启动」时会**毫无反应**，
             // 因为文件读取在授权确定之前是直接阻塞的。
             {
-                let cfg = Config::load();
+                let report = Config::load_report();
+                log_config_notices(&report.notices);
+                let cfg = report.config;
                 let files: Vec<PathBuf> = if cfg.sound_files.is_empty() {
                     cfg.collect_sounds().unwrap_or_default()
                 } else {
@@ -1270,6 +1312,8 @@ fn main() {
             status,
             voice_status,
             voice_presets,
+            voice_calibration_begin,
+            voice_calibration_end,
             voice_set_enabled,
             voice_set_bypass,
             voice_set_params,
@@ -1302,6 +1346,64 @@ fn main() {
             }
             _ => {}
         });
+}
+
+/// 同步 Tauri 命令在界面线程执行。会等待生命周期锁、解码、开关流或做配置落盘的命令
+/// 必须声明为异步并交给后台线程；这里按源码契约守住，运行时线程模型无法在单元测试里构造。
+#[cfg(test)]
+mod command_thread_tests {
+    const BLOCKING_COMMANDS: &[&str] = &[
+        "voice_set_hotkeys",
+        "voice_preview_start",
+        "voice_preview_stop",
+    ];
+
+    fn command_source(name: &str) -> (&'static str, &'static str) {
+        let source = include_str!("main.rs");
+        let declaration = format!("fn {name}(");
+        let at = source
+            .find(&declaration)
+            .unwrap_or_else(|| panic!("找不到命令 {name}"));
+        let end = source[at..]
+            .find("#[tauri::command]")
+            .map_or(source.len(), |offset| at + offset);
+        (&source[..at], &source[at..end])
+    }
+
+    #[test]
+    fn 会阻塞的变声命令必须是异步后台命令() {
+        for name in BLOCKING_COMMANDS {
+            let (before, body) = command_source(name);
+            assert!(
+                before.ends_with("async "),
+                "{name} 不是 async fn：同步命令会在界面线程执行并冻住 WebView"
+            );
+            assert!(
+                body.contains("spawn_blocking"),
+                "{name} 必须把阻塞工作交给 spawn_blocking"
+            );
+            assert!(
+                !body.contains("State<'_, AudioHost>"),
+                "{name} 用 AppHandle 取宿主，避免把借用跨越 await"
+            );
+        }
+    }
+
+    #[test]
+    fn 阻塞命令都已注册到命令处理器() {
+        let source = include_str!("main.rs");
+        let handler = source
+            .split("tauri::generate_handler![")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .expect("找不到 generate_handler 列表");
+        for name in BLOCKING_COMMANDS {
+            assert!(
+                handler.split(',').any(|item| item.trim() == *name),
+                "{name} 未注册到 generate_handler"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

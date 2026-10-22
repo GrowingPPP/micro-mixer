@@ -1660,6 +1660,54 @@ test('旧自检失败不能将结果插入新打开的遥控面板', async () =>
   assert.equal(app.document.getElementById('testPanel').classList.contains('hidden'), true);
 });
 
+test('配置文件会拒绝保存时启动即显示常驻提示并带出原因', async () => {
+  const notice = '配置文件 /cfg/config.toml 不是有效 TOML（第 3 行：invalid escape），已拒绝写入';
+  const app = await boot({ onInvoke(command) {
+    if (command === 'load_config') {
+      return { items, dir: '', hotkeys: ',F2', config_notices: [notice], config_write_blocked: true };
+    }
+  } });
+  const banner = app.document.getElementById('notice');
+  assert.equal(banner.classList.contains('hidden'), false, '会阻止保存的问题必须常驻显示');
+  assert.match(banner.textContent, /配置文件需要处理/);
+  assert.match(banner.textContent, /不是有效 TOML/);
+});
+
+test('只是数值被规范化的配置提示不占用常驻提示条', async () => {
+  const app = await boot({ onInvoke(command) {
+    if (command === 'load_config') {
+      return { items, dir: '', hotkeys: ',F2', config_write_blocked: false,
+        config_notices: ['用户预设「甲」参数越界，已钳制'] };
+    }
+  } });
+  assert.equal(app.document.getElementById('notice').classList.contains('hidden'), true);
+  assert.match(app.document.getElementById('toast').textContent, /已钳制/);
+});
+
+test('配置没有问题时不显示配置提示', async () => {
+  const app = await boot({ onInvoke(command) {
+    if (command === 'load_config') {
+      return { items, dir: '', hotkeys: ',F2', config_notices: [], config_write_blocked: false };
+    }
+  } });
+  assert.equal(app.document.getElementById('notice').classList.contains('hidden'), true);
+  assert.doesNotMatch(app.document.getElementById('toast').textContent, /配置文件/);
+});
+
+test('保存被宿主拒绝时说明未保存与原因而不虚报成功', async () => {
+  const reason = '配置文件 /cfg/config.toml 不是有效 TOML，已拒绝写入以免覆盖原内容';
+  const app = await boot({ onInvoke(command) {
+    if (command === 'save_config') return Promise.reject(new Error(reason));
+  } });
+  await app.document.getElementById('btnSetup').emit('click');
+  await app.document.getElementById('btnSetupSave').emit('click');
+  assert.equal(app.document.getElementById('setup').classList.contains('hidden'), false);
+  const toast = app.document.getElementById('toast').textContent;
+  assert.match(toast, /保存失败/);
+  assert.match(toast, /已拒绝写入/);
+  assert.doesNotMatch(toast, /已保存/);
+});
+
 test('连接保存失败保留面板并说明未保存而不虚报成功', async () => {
   const app = await boot({ onInvoke(command) {
     if (command === 'save_config') return Promise.reject(new Error('permission denied'));
@@ -1698,6 +1746,147 @@ test('校准应用成功但配置保存失败时明确说明未保存', async ()
   assert.match(app.document.getElementById('calibHint').textContent, /已生效.*未保存/);
   assert.doesNotMatch(app.document.getElementById('calibHint').textContent, /设置已保存/);
   assert.match(app.document.getElementById('toast').textContent, /保存失败/);
+});
+
+// 校准读取送往虚拟麦克风的电平。变声启用时那是变声之后的信号，所以校准必须先把变声
+// 暂停成原声，并且只采纳变声链确认回到 off 的读数。
+function calibrationClock() {
+  const clock = { now: 0 };
+  clock.settle = async (app, promise) => {
+    let done = false;
+    promise.then(() => { done = true; }, () => { done = true; });
+    for (let i = 0; i < 400 && !done; i++) {
+      clock.now += 100;
+      await app.advanceTimers(400);
+      await app.pollStatus();
+    }
+    await promise;
+  };
+  return clock;
+}
+
+const calibrationCommands = app => app.calls.map(call => call.command)
+  .filter(command => ['voice_calibration_begin', 'voice_calibration_end', 'stop_all',
+    'set_gains', 'save_config'].includes(command));
+
+test('校准先把变声暂停成原声再测量并在结束后解除', async () => {
+  const clock = calibrationClock();
+  let paused = false;
+  const app = await boot({ running: true, now: () => clock.now, onInvoke(command) {
+    if (command === 'voice_calibration_begin') { paused = true; return undefined; }
+    if (command === 'voice_calibration_end') { paused = false; return undefined; }
+    if (command === 'status') {
+      return playbackStatus({
+        // 变声启用时电平表读到的是变声之后的 -3 dBFS，原声才是 -20 dBFS。
+        out_peak_db: paused ? -20 : -3,
+        voice: voiceSnapshot({ enabled: true, phase: paused ? 'off' : 'wet', bypassed: paused }),
+      });
+    }
+  } });
+  app.calls.length = 0;
+  await clock.settle(app, app.document.getElementById('btnCalib').emit('click'));
+
+  const commands = calibrationCommands(app);
+  assert.equal(commands[0], 'voice_calibration_begin', '测量前必须先暂停变声');
+  assert.ok(commands.indexOf('voice_calibration_begin') < commands.indexOf('stop_all'));
+  assert.ok(commands.indexOf('voice_calibration_begin') < commands.indexOf('set_gains'));
+  assert.equal(commands.at(-1), 'voice_calibration_end', '结束后必须解除暂停');
+  assert.equal(app.calls.filter(c => c.command === 'voice_calibration_begin').length, 1);
+  assert.equal(app.calls.filter(c => c.command === 'voice_calibration_end').length, 1);
+  const gain = app.calls.filter(c => c.command === 'set_gains').at(-1).args.micDb;
+  assert.equal(gain, 5, '补偿必须按原声 -20 dBFS 计算，而不是变声后的 -3 dBFS');
+  assert.match(app.document.getElementById('calibHint').textContent, /峰值 -20\.0 dBFS/);
+  assert.equal(paused, false);
+});
+
+test('变声链尚未回到原声的读数不参与校准', async () => {
+  const clock = calibrationClock();
+  let paused = false;
+  let polls = 0;
+  const app = await boot({ running: true, now: () => clock.now, onInvoke(command) {
+    if (command === 'voice_calibration_begin') { paused = true; polls = 0; return undefined; }
+    if (command === 'voice_calibration_end') { paused = false; return undefined; }
+    if (command === 'status') {
+      if (!paused) {
+        return playbackStatus({ out_peak_db: -3, voice: voiceSnapshot({ enabled: true, phase: 'wet' }) });
+      }
+      polls++;
+      // 淡出阶段与采样中途离开 off 的读数都更响，必须被丢弃。
+      const dry = polls > 4 && polls !== 12;
+      return playbackStatus({
+        out_peak_db: dry ? -20 : -1,
+        voice: voiceSnapshot({ enabled: true, phase: dry ? 'off' : 'fading_out' }),
+      });
+    }
+  } });
+  app.calls.length = 0;
+  await clock.settle(app, app.document.getElementById('btnCalib').emit('click'));
+
+  const gain = app.calls.filter(c => c.command === 'set_gains').at(-1).args.micDb;
+  assert.equal(gain, 5, '只有 phase 为 off 的读数（-20 dBFS）可以参与补偿');
+  assert.match(app.document.getElementById('calibHint').textContent, /峰值 -20\.0 dBFS/);
+  assert.equal(calibrationCommands(app).at(-1), 'voice_calibration_end');
+});
+
+test('变声始终没能切回原声时放弃校准且不改增益并解除暂停', async () => {
+  const clock = calibrationClock();
+  const app = await boot({ running: true, now: () => clock.now, onInvoke(command) {
+    if (command === 'status') {
+      return playbackStatus({ out_peak_db: -3, voice: voiceSnapshot({ enabled: true, phase: 'wet' }) });
+    }
+  } });
+  app.calls.length = 0;
+  await clock.settle(app, app.document.getElementById('btnCalib').emit('click'));
+
+  assert.match(app.document.getElementById('calibHint').textContent, /变声没能切回原声/);
+  assert.equal(app.document.getElementById('calibHint').className.includes('bad'), true);
+  const gains = app.calls.filter(c => c.command === 'set_gains').map(c => c.args.micDb);
+  assert.deepEqual(gains, [0, 0], '只有测量前归零与失败后恢复原增益，不能写入新补偿');
+  assert.equal(app.calls.some(c => c.command === 'save_config'), false, '失败的校准不保存设置');
+  assert.equal(calibrationCommands(app).at(-1), 'voice_calibration_end');
+});
+
+test('暂停变声失败时校准中止且不测量并仍发送结束', async () => {
+  const clock = calibrationClock();
+  const app = await boot({ running: true, now: () => clock.now, onInvoke(command) {
+    if (command === 'voice_calibration_begin') return Promise.reject(new Error('host busy'));
+  } });
+  app.calls.length = 0;
+  await clock.settle(app, app.document.getElementById('btnCalib').emit('click'));
+
+  assert.match(app.document.getElementById('calibHint').textContent, /校准失败.*host busy/);
+  assert.equal(app.calls.some(c => c.command === 'stop_all' || c.command === 'set_gains'), false,
+    '无法保证原声时不能继续测量');
+  assert.deepEqual(calibrationCommands(app), ['voice_calibration_begin', 'voice_calibration_end'],
+    '宿主可能已部分生效，仍要发送结束');
+});
+
+test('结束校准失败时提示变声稍后自动恢复并释放校准按钮', async () => {
+  const clock = calibrationClock();
+  const app = await boot({ running: true, now: () => clock.now, onInvoke(command) {
+    if (command === 'voice_calibration_end') return Promise.reject(new Error('ipc closed'));
+  } });
+  await clock.settle(app, app.document.getElementById('btnCalib').emit('click'));
+
+  assert.match(app.document.getElementById('toast').textContent, /变声暂停未能解除/);
+  assert.equal(app.document.getElementById('btnCalib').disabled, false);
+  app.calls.length = 0;
+  const again = app.document.getElementById('btnCalib').emit('click');
+  await clock.settle(app, again);
+  assert.equal(app.calls.filter(c => c.command === 'voice_calibration_begin').length, 1,
+    '失败后可以再次校准');
+});
+
+test('校准进行中再次点击不会重复暂停变声', async () => {
+  const clock = calibrationClock();
+  const app = await boot({ running: true, now: () => clock.now });
+  app.calls.length = 0;
+  const first = app.document.getElementById('btnCalib').emit('click');
+  await flush();
+  await app.document.getElementById('btnCalib').emit('click');
+  await clock.settle(app, first);
+  assert.equal(app.calls.filter(c => c.command === 'voice_calibration_begin').length, 1);
+  assert.equal(app.calls.filter(c => c.command === 'voice_calibration_end').length, 1);
 });
 
 test('播放按钮长按空格仅停止一次并阻止重复原生激活', async () => {

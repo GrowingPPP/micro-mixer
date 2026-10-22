@@ -304,7 +304,7 @@ fn 变声显式关闭再开启清除临时旁路() {
 }
 
 #[test]
-fn 变声暂停期间临时旁路并在结束后恢复() {
+fn 变声自检暂停期间回到干声并在结束后恢复() {
     let dir = TemporaryDir::new();
     let service = service(&dir);
     let control = VoiceControl::new(VoiceParams::neutral());
@@ -375,6 +375,214 @@ fn 变声多层暂停逐层恢复() {
     let status = service.status();
     assert!(!status.bypassed);
     assert_eq!(control.phase(), VoicePhase::Warmup);
+}
+
+const CALIBRATION_LEASE: Duration = Duration::from_secs(30);
+
+#[test]
+fn 校准暂停让变声回到干声且不改启用状态与配置() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    service.set_enabled(true).unwrap();
+    service.flush_saves();
+    assert_eq!(control.phase(), VoicePhase::Warmup);
+
+    service.begin_calibration(CALIBRATION_LEASE);
+    assert_eq!(control.phase(), VoicePhase::Off, "校准读取的必须是干声");
+    let status = service.status();
+    assert!(status.enabled, "校准不改写启用状态");
+    assert!(status.bypassed, "暂停期间界面显示旁路，因为输出确实是干声");
+    service.flush_saves();
+    assert!(
+        Config::load_from(&config_path(&dir)).voice.enabled,
+        "校准暂停不得改写启用配置"
+    );
+
+    service.end_calibration();
+    let status = service.status();
+    assert!(status.enabled && !status.bypassed);
+    assert_eq!(
+        control.phase(),
+        VoicePhase::Warmup,
+        "结束后恢复到校准前的启用状态"
+    );
+}
+
+#[test]
+fn 校准暂停独立于用户临时旁路() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    service.set_enabled(true).unwrap();
+    service.set_bypass(true).unwrap();
+
+    service.begin_calibration(CALIBRATION_LEASE);
+    service.end_calibration();
+
+    let status = service.status();
+    assert!(
+        status.bypassed,
+        "结束校准只解除自己那一层，不能清除用户的临时旁路"
+    );
+    assert_eq!(control.phase(), VoicePhase::Off);
+    service.set_bypass(false).unwrap();
+    assert_eq!(control.phase(), VoicePhase::Warmup);
+}
+
+#[test]
+fn 校准暂停期间的用户命令不被结束覆盖() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    service.set_enabled(true).unwrap();
+
+    service.begin_calibration(CALIBRATION_LEASE);
+    service.set_enabled(false).unwrap();
+    assert_eq!(control.phase(), VoicePhase::Off);
+    service.select_preset("builtin:male").unwrap();
+
+    service.end_calibration();
+    let status = service.status();
+    assert!(!status.enabled, "结束不能把暂停期间的关闭命令改回启用");
+    assert_eq!(status.preset_id, "builtin:male");
+    assert_eq!(control.phase(), VoicePhase::Off);
+    service.flush_saves();
+    let saved = Config::load_from(&config_path(&dir));
+    assert!(!saved.voice.enabled);
+    assert_eq!(saved.voice.active_preset, "builtin:male");
+}
+
+#[test]
+fn 校准暂停重复开始只刷新租约重复结束无操作() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    service.set_enabled(true).unwrap();
+
+    service.begin_calibration(CALIBRATION_LEASE);
+    service.begin_calibration(CALIBRATION_LEASE);
+    service.end_calibration();
+    assert_eq!(
+        control.phase(),
+        VoicePhase::Warmup,
+        "重复开始不能叠成两层，一次结束就应解除"
+    );
+
+    let generation = service.generation();
+    service.end_calibration();
+    assert_eq!(service.generation(), generation, "没有在校准时结束应无操作");
+    assert_eq!(control.phase(), VoicePhase::Warmup);
+}
+
+#[test]
+fn 校准暂停租约到期自动恢复() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    service.set_enabled(true).unwrap();
+
+    // 界面在校准中刷新或崩溃时不会再调用结束；租约到期后变声必须自己回来。
+    service.begin_calibration(Duration::from_millis(40));
+    assert_eq!(control.phase(), VoicePhase::Off);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while service.status().bypassed && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let status = service.status();
+    assert!(!status.bypassed, "租约到期后必须自动解除暂停");
+    assert!(status.enabled);
+    assert_eq!(control.phase(), VoicePhase::Warmup);
+}
+
+#[test]
+fn 校准暂停与自检暂停叠加后逐层解除() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    service.set_enabled(true).unwrap();
+
+    service.suspend();
+    service.begin_calibration(CALIBRATION_LEASE);
+    service.restore();
+    assert!(service.status().bypassed, "校准层还在时不得提前启用");
+    assert_eq!(control.phase(), VoicePhase::Off);
+
+    service.end_calibration();
+    assert!(!service.status().bypassed);
+    assert_eq!(control.phase(), VoicePhase::Warmup);
+}
+
+#[test]
+fn 校准暂停取消进行中的试听() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    service.attach(VoiceControl::new(VoiceParams::neutral()));
+    service.set_enabled(true).unwrap();
+    service.preview_begin();
+    assert_eq!(service.status().preview.state, "preparing");
+
+    service.begin_calibration(CALIBRATION_LEASE);
+    assert_eq!(
+        service.status().preview.state,
+        "idle",
+        "暂停会改变人声路径，进行中的试听不能跨阶段继续"
+    );
+}
+
+#[test]
+fn 校准暂停期间会话重建仍保持干声直到结束() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    service.attach(VoiceControl::new(VoiceParams::neutral()));
+    service.set_enabled(true).unwrap();
+
+    service.begin_calibration(CALIBRATION_LEASE);
+    // 看门狗或设备恢复在校准期间重启音频：新会话不能把人声路径重新打开。
+    service.detach();
+    let rebuilt = VoiceControl::new(VoiceParams::neutral());
+    service.attach(rebuilt.clone());
+    assert_eq!(rebuilt.phase(), VoicePhase::Off);
+    assert!(service.status().bypassed);
+
+    service.end_calibration();
+    assert_eq!(rebuilt.phase(), VoicePhase::Warmup);
+}
+
+#[test]
+fn 自检暂停重建会话保留临时旁路普通重建清除() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    service.attach(VoiceControl::new(VoiceParams::neutral()));
+    service.set_enabled(true).unwrap();
+    service.set_bypass(true).unwrap();
+
+    service.suspend();
+    service.detach();
+    let rebuilt = VoiceControl::new(VoiceParams::neutral());
+    service.attach(rebuilt.clone());
+    service.restore();
+    let status = service.status();
+    assert!(
+        status.bypassed,
+        "自检暂停期间重建会话必须保留用户的临时旁路"
+    );
+    assert_eq!(rebuilt.phase(), VoicePhase::Off);
+
+    service.detach();
+    let restarted = VoiceControl::new(VoiceParams::neutral());
+    service.attach(restarted.clone());
+    assert!(
+        !service.status().bypassed,
+        "没有暂停层的会话重启清除临时旁路"
+    );
+    assert_eq!(restarted.phase(), VoicePhase::Warmup);
 }
 
 #[test]
@@ -495,6 +703,224 @@ fn 变声配置读取失败不写盘并报告错误() {
     .unwrap_err();
     assert!(error.contains("读取配置文件失败"));
     assert_eq!(std::fs::read(&path).unwrap(), original);
+}
+
+/// 与界面「保存设置」相同的入口：不带变声字段，只覆盖音效库与连接设置。
+fn full_save(path: &Path) -> Result<(), String> {
+    crate::save_config_at(
+        path,
+        Vec::new(),
+        false,
+        None,
+        None,
+        String::new(),
+        None,
+        None,
+        20,
+        0.0,
+        -6.0,
+        String::new(),
+    )
+}
+
+/// 音效库、变声节与用户预设俱全，只有一处非法反斜杠转义。
+const INVALID_TOML_LIBRARY: &str = concat!(
+    "[[sounds]]\n",
+    "id = \"s1\"\n",
+    "path = \"C:\\Users\\Doe\\a.wav\"\n",
+    "name = \"笑声\"\n",
+    "\n",
+    "[voice]\n",
+    "enabled = false\n",
+    "active_preset = \"user:mine-abc123\"\n",
+    "bypass_hotkey = \"F9\"\n",
+    "\n",
+    "[[voice_presets]]\n",
+    "id = \"user:mine-abc123\"\n",
+    "name = \"我的声音\"\n",
+    "pitch_semitones = 3.0\n",
+);
+
+#[test]
+fn 配置不是有效_toml_时所有写入路径都拒绝且保留原文件() {
+    let dir = TemporaryDir::new();
+    let path = config_path(&dir);
+    std::fs::write(&path, INVALID_TOML_LIBRARY).unwrap();
+
+    // 变声后台写入：无需用户显式保存就会触发，必须报告「未保存」而不是改写文件。
+    let service = VoiceService::new_with_path(&Config::load_from(&path), path.clone());
+    service.set_enabled(true).unwrap();
+    service.select_preset("builtin:male").unwrap();
+    service.flush_saves();
+    let status = service.status();
+    assert!(status.enabled, "写入失败时运行期状态仍然生效");
+    let error = status.save_error.expect("拒绝写入必须进入保存错误");
+    assert!(error.contains("不是有效 TOML"), "{error}");
+
+    // 界面完整保存与热键保存走同一严格读取。
+    let error = full_save(&path).unwrap_err();
+    assert!(error.contains("不是有效 TOML"), "{error}");
+    let before = service.hotkey_specs();
+    let error = service.save_hotkeys("F1", "F2", "F3").unwrap_err();
+    assert!(format!("{error:#}").contains("不是有效 TOML"));
+    assert_eq!(service.hotkey_specs(), before, "落盘失败不得更新内存热键");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        INVALID_TOML_LIBRARY,
+        "音效库与用户预设不能被降级成注释或默认值"
+    );
+}
+
+#[test]
+fn 被拒绝的预设不会被后台写入静默删除_修复后恢复保存() {
+    let dir = TemporaryDir::new();
+    let path = config_path(&dir);
+    // 第二条预设缺少 user: 前缀，加载时被拒绝；其余条目有效。
+    let broken = concat!(
+        "[voice]\n",
+        "enabled = false\n",
+        "active_preset = \"user:good\"\n",
+        "\n",
+        "[[voice_presets]]\n",
+        "id = \"user:good\"\n",
+        "name = \"完好\"\n",
+        "pitch_semitones = 2.0\n",
+        "\n",
+        "[[voice_presets]]\n",
+        "id = \"handwritten\"\n",
+        "name = \"手写条目\"\n",
+        "pitch_semitones = 5.0\n",
+        "\n",
+        "[[sounds]]\n",
+        "id = \"s1\"\n",
+        "path = \"/a.wav\"\n",
+    );
+    std::fs::write(&path, broken).unwrap();
+
+    let loaded = Config::load_from(&path);
+    assert!(
+        loaded
+            .voice_warnings
+            .iter()
+            .any(|w| w.contains("handwritten")),
+        "启动读取必须产生警告：{:?}",
+        loaded.voice_warnings
+    );
+    let service = VoiceService::new_with_path(&loaded, path.clone());
+    service.set_enabled(true).unwrap();
+    service.flush_saves();
+    let error = service
+        .status()
+        .save_error
+        .expect("拒绝写入必须进入保存错误");
+    assert!(
+        error.contains("handwritten") && error.contains("拒绝写入"),
+        "{error}"
+    );
+    assert!(full_save(&path).unwrap_err().contains("handwritten"));
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        broken,
+        "被拒绝的手写条目必须仍在文件里"
+    );
+
+    // 用户修复条目后，下一次命令恢复正常落盘并清除错误。
+    let fixed = broken.replace("id = \"handwritten\"", "id = \"user:handwritten\"");
+    std::fs::write(&path, &fixed).unwrap();
+    service.set_enabled(false).unwrap();
+    service.flush_saves();
+    assert!(service.status().save_error.is_none());
+    let saved = Config::load_for_write_from(&path).unwrap();
+    assert_eq!(saved.voice_presets.len(), 2, "两条预设都应保留");
+    assert!(saved.find_voice_preset("user:handwritten").is_some());
+    assert_eq!(saved.sound_entries().len(), 1);
+}
+
+#[test]
+fn 载入配置带出配置提示与保存阻塞标记() {
+    let dir = TemporaryDir::new();
+    let path = config_path(&dir);
+
+    let clean = crate::config_dto_with_notices(Config::load_report_from(&path));
+    assert_eq!(clean["config_notices"], serde_json::json!([]));
+    assert_eq!(clean["config_write_blocked"], serde_json::json!(false));
+
+    std::fs::write(&path, INVALID_TOML_LIBRARY).unwrap();
+    let invalid = crate::config_dto_with_notices(Config::load_report_from(&path));
+    assert_eq!(invalid["config_write_blocked"], serde_json::json!(true));
+    let notices = invalid["config_notices"].as_array().unwrap();
+    assert!(
+        notices[0].as_str().unwrap().contains("不是有效 TOML"),
+        "{notices:?}"
+    );
+
+    std::fs::write(
+        &path,
+        "[[voice_presets]]\nid = \"mine\"\nname = \"缺前缀\"\n",
+    )
+    .unwrap();
+    let rejected = crate::config_dto_with_notices(Config::load_report_from(&path));
+    assert_eq!(rejected["config_write_blocked"], serde_json::json!(true));
+    let text = rejected["config_notices"].to_string();
+    assert!(
+        text.contains("缺少 user: 前缀") && text.contains("拒绝"),
+        "{text}"
+    );
+}
+
+#[test]
+fn 保存发生_panic_时写线程不卡死并报告未保存_之后恢复() {
+    let dir = TemporaryDir::new();
+    let path = config_path(&dir);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let save: Arc<VoiceSaveFn> = Arc::new(move |path, write| {
+        if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("注入的保存 panic");
+        }
+        let mut config = Config::load_for_write_from(path)?;
+        config.voice.enabled = write.enabled;
+        config.save_to(path)
+    });
+    let service = VoiceService::new_with_save(&Config::default(), path.clone(), save);
+
+    service.set_enabled(true).unwrap();
+    // 修复前这里会永久等待：写线程 panic 退出，`writer_active` 一直为真。
+    let (done_tx, done_rx) = mpsc::channel();
+    let waiter = {
+        let service = service.clone();
+        std::thread::spawn(move || {
+            service.flush_saves();
+            done_tx.send(()).unwrap();
+        })
+    };
+    assert!(
+        done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "保存 panic 后写线程必须收尾，flush 不得无限等待"
+    );
+    waiter.join().unwrap();
+
+    let status = service.status();
+    assert!(status.enabled, "保存失败时运行期状态仍然生效");
+    let error = status.save_error.expect("panic 必须进入保存错误");
+    assert!(
+        error.contains("注入的保存 panic") && error.contains("内部错误"),
+        "{error}"
+    );
+    assert!(!path.exists(), "panic 的那次保存没有写出任何内容");
+
+    // 写线程仍可用：下一次命令照常落盘并清除错误。
+    service.set_enabled(false).unwrap();
+    service.set_enabled(true).unwrap();
+    service.flush_saves();
+    assert!(
+        service.status().save_error.is_none(),
+        "{:?}",
+        service.status().save_error
+    );
+    assert!(Config::load_from(&path).voice.enabled);
+    assert!(calls.load(Ordering::SeqCst) >= 2);
 }
 
 #[test]

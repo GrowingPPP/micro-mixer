@@ -214,6 +214,9 @@ pub fn scan_dir(dir: &Path) -> Result<Vec<PathBuf>> {
 
 /// 完整配置保存与变声持久化共用这一把进程内门，防止两者各自读到旧文件后
 /// 用整份快照互相覆盖。持门期间只做配置读写，不等待音频或界面线程。
+///
+/// 持门写入一律先用 `Config::load_for_write_from` 严格读取：无效 TOML、读取失败或
+/// 含被拒绝的变声条目时放弃写入并把错误交给界面，磁盘上的文件保持原样。
 static CONFIG_WRITE_GATE: Mutex<()> = Mutex::new(());
 
 pub(crate) fn with_config_write<T, E>(
@@ -223,20 +226,6 @@ pub(crate) fn with_config_write<T, E>(
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     action()
-}
-
-/// 写入前的严格读取：只有文件不存在才用默认值。
-///
-/// 权限、编码等读取失败必须返回错误；否则整份默认配置会被写回磁盘，
-/// 抹掉音效库、热键与用户预设。
-pub(crate) fn load_config_for_write(path: &Path) -> Result<app_config::Config> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => Ok(app_config::Config::parse(&text)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Ok(app_config::Config::default())
-        }
-        Err(error) => Err(error).with_context(|| format!("读取配置文件失败: {}", path.display())),
-    }
 }
 
 // ─────────────────────────────────────────── 宿主
@@ -409,6 +398,11 @@ pub fn install_panic_hook() {
         default(info);
     }));
 }
+
+/// 校准暂停的租约时长。界面的完整校准约 8 秒；租约只是界面失联时的兜底，
+/// 正常结束由 `voice_calibration_end` 解除。
+#[cfg(feature = "voice")]
+const CALIBRATION_VOICE_LEASE: Duration = Duration::from_secs(30);
 
 /// 人声热键提示按代次展示一次，避免 250 ms 轮询反复弹出。
 #[derive(Default)]
@@ -1471,7 +1465,7 @@ impl AudioHost {
         test: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
         let _operation = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
-        // 自检、校准与设备恢复期间不使用人声；只叠加暂停层，不改配置。
+        // 自检期间不使用人声；只叠加暂停层，不改配置。暂停层存在时会话重建保留临时旁路。
         #[cfg(feature = "voice")]
         self.voice.suspend();
         let saved = self
@@ -2281,6 +2275,24 @@ impl AudioHost {
 
     // ─────────────────────────────────────── 变声命令
 
+    /// 麦克风校准开始：人声路径回到原声，直到 [`voice_calibration_end`] 或租约到期。
+    ///
+    /// 校准读取送往虚拟麦克风的电平，变声启用时那是变声与路径限幅之后的信号，
+    /// 得到的增益会偏离真实人声。该层只读写变声状态，不取生命周期锁、不重建会话，
+    /// 因此可在界面线程上同步调用。
+    ///
+    /// [`voice_calibration_end`]: Self::voice_calibration_end
+    pub fn voice_calibration_begin(&self) {
+        #[cfg(feature = "voice")]
+        self.voice.begin_calibration(CALIBRATION_VOICE_LEASE);
+    }
+
+    /// 麦克风校准结束：解除暂停；没有在校准时无操作。
+    pub fn voice_calibration_end(&self) {
+        #[cfg(feature = "voice")]
+        self.voice.end_calibration();
+    }
+
     pub fn voice_status(&self) -> VoiceStatusDto {
         #[cfg(feature = "voice")]
         {
@@ -2739,17 +2751,12 @@ impl AudioHost {
         if let Some(specs) = running_specs {
             return specs;
         }
-        match load_config_for_write(self.voice.config_path()) {
-            Ok(config) => config
-                .sound_entries()
-                .into_iter()
-                .map(|entry| entry.hotkey)
-                .collect(),
-            Err(error) => {
-                log::warn!("读取音效热键失败，跨组校验按空列表处理: {error:#}");
-                Vec::new()
-            }
-        }
+        // 只读用途：配置异常时仍按能读出的槽位热键校验，真正的写入由 `save_hotkeys` 严格拒绝。
+        app_config::Config::load_from(self.voice.config_path())
+            .sound_entries()
+            .into_iter()
+            .map(|entry| entry.hotkey)
+            .collect()
     }
 
     /// 在需要时把绑定动作调度到主线程，并复用宿主唯一的管理器。

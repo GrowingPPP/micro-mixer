@@ -311,8 +311,21 @@ async function loadSavedConfig() {
     syncConnection();
 
     if (c.dir) hint('已载入上次的设置', 'ok');
+    showConfigNotices(c);
     return c;
   } catch (e) { return null; }
+}
+
+// 配置文件有问题时宿主会拒绝保存，以免覆盖原内容；必须在用户动手保存之前就让他看到原因。
+// 会阻止保存的问题用常驻提示条，只是数值被规范化的提示用短暂提示。
+function showConfigNotices(config) {
+  const notices = Array.isArray(config.config_notices)
+    ? config.config_notices.filter(item => typeof item === 'string' && item)
+    : [];
+  if (!notices.length) return;
+  const text = '配置文件需要处理：' + notices.join('；');
+  if (config.config_write_blocked) hint(text, 'error');
+  else toast(text);
 }
 
 let configSaveTail = Promise.resolve();
@@ -1771,10 +1784,18 @@ el.btnRevertMic.addEventListener('click', async () => {
 //
 // 为什么不用新开一条测量通路：**没有音效在放时，输出电平就是麦克风电平** ——
 // 现成的电平表已经够了，不必再加一套采集。
+//
+// 变声启用时电平表量到的是变声与路径限幅之后的信号，补偿会偏离真实人声。
+// 所以测量前宿主先把变声暂停成原声（独立于用户的临时旁路，结束必解除），
+// 并且只采纳变声链已确认回到 off 的读数。
 const CALIB_TARGET_PEAK = -15.0;   // 目标带 -18~-12 的正中
 const CALIB_SECS = 5;
+const CALIB_DRY_WAIT_MS = 2000;    // 等变声链淡出回到原声的上限
 
 let calibrating = false;
+
+// 没有变声状态（未编译变声）时输出本来就是原声。
+const voiceIsDry = st => !st?.voice || st.voice.phase === 'off';
 
 async function calibrateMic() {
   if (calibrating) return;
@@ -1791,39 +1812,49 @@ async function calibrateMic() {
     el.calibHint.textContent = t;
     el.calibHint.className = 'calibhint' + (cls ? ' ' + cls : '');
   };
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const sfxDb = () => parseFloat(el.inSfxGain.value || '-6');
   try {
     const savedMic = parseFloat(el.inMicGain.value || '0');
+    // 0. 变声暂停成原声。begin 失败时也要在 finally 里 end，宿主可能已部分生效。
+    await invoke('voice_calibration_begin');
     // 1. 停掉音效 + 增益归零 —— 这样测到的就是纯粹的麦克风电平
     await invoke('stop_all');
-    await invoke('set_gains', {
-      micDb: 0,
-      sfxDb: parseFloat(el.inSfxGain.value || '-6'),
-    });
-    await new Promise(r => setTimeout(r, 400));
+    await invoke('set_gains', { micDb: 0, sfxDb: sfxDb() });
+    await sleep(400);
 
-    // 2. 采样
+    // 2. 等变声链确认回到原声；超时就放弃，量到变声后的电平比不校准更糟。
+    const dryDeadline = Date.now() + CALIB_DRY_WAIT_MS;
+    while (!voiceIsDry(state.lastStatus) && Date.now() < dryDeadline) await sleep(100);
+    if (!voiceIsDry(state.lastStatus)) {
+      setHint2('测量失败：变声没能切回原声，校准已取消，增益未改动', 'bad');
+      await invoke('set_gains', { micDb: savedMic, sfxDb: sfxDb() });
+      return;
+    }
+
+    // 3. 采样；变声链离开 off 的读数不是原声，丢弃
     const peaks = [];
     const t0 = Date.now();
     while (Date.now() - t0 < CALIB_SECS * 1000) {
       const st = state.lastStatus;
-      if (st && st.running) peaks.push(st.out_peak_db);
+      if (st && st.running && voiceIsDry(st)) peaks.push(st.out_peak_db);
       const left = Math.ceil(CALIB_SECS - (Date.now() - t0) / 1000);
       btn.textContent = `请正常说话… ${left}s`;
       setHint2(`剩余 ${left} 秒，请对着麦克风正常说话。`);
-      await new Promise(r => setTimeout(r, 200));
+      await sleep(200);
     }
 
     if (!peaks.length) {
       setHint2('测量失败：没读到电平', 'bad');
-      await invoke('set_gains', { micDb: savedMic, sfxDb: parseFloat(el.inSfxGain.value || '-6') });
+      await invoke('set_gains', { micDb: savedMic, sfxDb: sfxDb() });
       return;
     }
     const measured = Math.max(...peaks);
 
-    // 3. 判断 + 算补偿
+    // 4. 判断 + 算补偿
     if (measured < -55) {
       setHint2(`几乎没测到声音（峰值 ${measured.toFixed(1)} dBFS）—— 请对着麦克风正常说话后重试`, 'bad');
-      await invoke('set_gains', { micDb: savedMic, sfxDb: parseFloat(el.inSfxGain.value || '-6') });
+      await invoke('set_gains', { micDb: savedMic, sfxDb: sfxDb() });
       return;
     }
     const limiterHit = (state.lastStatus?.limiter_db || 0) > 0.5;
@@ -1832,7 +1863,7 @@ async function calibrateMic() {
 
     el.inMicGain.value = gain;
     syncGainControls();
-    await invoke('set_gains', { micDb: gain, sfxDb: parseFloat(el.inSfxGain.value || '-6') });
+    await invoke('set_gains', { micDb: gain, sfxDb: sfxDb() });
 
     const band = measured + gain;
     const saved = await saveCurrentConfig();
@@ -1847,6 +1878,13 @@ async function calibrateMic() {
   } catch (e) {
     setHint2('校准失败：' + e, 'bad');
   } finally {
+    // 成功、失败或异常都解除原声暂停；结束前不放开 calibrating，避免新一轮校准的
+    // begin 被这一轮迟到的 end 解除。
+    try {
+      await invoke('voice_calibration_end');
+    } catch (e) {
+      toast('校准已结束，但变声暂停未能解除，稍后会自动恢复：' + e, true);
+    }
     btn.disabled = false;
     btn.textContent = oldText;
     calibrating = false;

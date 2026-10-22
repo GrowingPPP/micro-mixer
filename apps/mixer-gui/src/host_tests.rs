@@ -485,7 +485,7 @@ fn 变声释放后重建使用最新配置() {
 
 #[cfg(feature = "voice")]
 #[test]
-fn 变声自检与校准期间临时旁路并在结束后恢复() {
+fn 变声自检暂停期间旁路并在结束后恢复() {
     let (host, _backend, dir) = voice_fixture(true);
     host.voice_set_enabled(true).unwrap();
     host.voice.flush_saves();
@@ -522,6 +522,145 @@ fn 变声自检与校准期间临时旁路并在结束后恢复() {
             .enabled,
         "自检暂停与恢复不得改写启用配置"
     );
+}
+
+/// 自检暂停期间的会话重建是同一次使用中的临时让出设备：用户的临时旁路要保留到结束后。
+#[cfg(feature = "voice")]
+#[test]
+fn 变声自检暂停重建会话后保留用户临时旁路() {
+    let dir = TemporaryDir::new();
+    let mut host = preview_test_host();
+    host.voice =
+        VoiceService::new_with_path(&app_config::Config::default(), dir.0.join("config.toml"));
+    host.attach_voice_control(Some(VoiceControl::new(VoiceParams::neutral())));
+    host.voice_set_enabled(true).unwrap();
+    host.voice_set_bypass(true).unwrap();
+
+    host.with_suspended(None, || {
+        // 与 start_inner 一致：先释放旧会话，再绑定重建后的新控制句柄。
+        host.attach_voice_control(None);
+        let rebuilt = VoiceControl::new(VoiceParams::neutral());
+        host.attach_voice_control(Some(rebuilt.clone()));
+        assert_eq!(
+            rebuilt.phase(),
+            VoicePhase::Off,
+            "暂停期间新会话也必须是干声"
+        );
+        assert!(host.voice_status().bypassed);
+        Ok(())
+    })
+    .unwrap();
+
+    let status = host.voice_status();
+    assert!(status.enabled, "自检不改写启用状态");
+    assert!(status.bypassed, "自检暂停结束后必须回到用户原来的临时旁路");
+    let rebuilt = host.voice_control.lock().unwrap().clone().unwrap();
+    assert_eq!(rebuilt.phase(), VoicePhase::Off, "旁路仍在，新会话保持干声");
+
+    // 没有暂停层的会话重建（释放后重新启动、看门狗重启、设备恢复）按常规规则清除旁路。
+    host.attach_voice_control(None);
+    host.attach_voice_control(Some(VoiceControl::new(VoiceParams::neutral())));
+    let status = host.voice_status();
+    assert!(!status.bypassed, "普通会话重建必须清除临时旁路");
+    assert_eq!(status.phase, "warmup");
+}
+
+/// 校准读取送往虚拟麦克风的电平（`StatusDto.out_peak_db`）。变声启用时那是变声之后的
+/// 信号，校准暂停必须让该读数回到干声。
+#[cfg(feature = "voice")]
+#[test]
+fn 变声校准暂停让电平读数回到干声并在结束后恢复湿声() {
+    // 假后端把人声缩放到 0.5：湿声读数约 -16.5 dBFS，干声约 -10.5 dBFS。
+    let (host, backend, dir) = voice_fixture_scaled(true, 0.5);
+    let peak = |host: &AudioHost, backend: &FakeBackend| {
+        for _ in 0..8 {
+            drive_voice(backend, 4_410, 0.3);
+        }
+        host.status().out_peak_db
+    };
+    for _ in 0..200 {
+        drive_voice(&backend, 4_410, 0.3);
+    }
+    assert_eq!(host.voice_status().phase, "wet");
+    let wet = peak(&host, &backend);
+    assert!(
+        (wet - (-16.5)).abs() < 1.0,
+        "变声启用时读到的是变声之后的电平，实测 {wet:.2}"
+    );
+
+    host.voice_calibration_begin();
+    assert!(
+        wait_for(Duration::from_secs(2), || {
+            drive_voice(&backend, 4_410, 0.3);
+            host.status()
+                .voice
+                .is_some_and(|voice| voice.phase == "off")
+        }),
+        "校准暂停后人声链必须回到 off"
+    );
+    let dry = peak(&host, &backend);
+    assert!(
+        (dry - (-10.46)).abs() < 1.0,
+        "校准读数必须是干声电平（约 -10.5 dBFS），实测 {dry:.2}"
+    );
+    assert!(
+        dry - wet > 4.0,
+        "干湿读数应有明确差距：干 {dry:.2} 湿 {wet:.2}"
+    );
+    let status = host.voice_status();
+    assert!(status.enabled, "校准不改写启用状态");
+
+    host.voice_calibration_end();
+    assert!(
+        wait_for(Duration::from_secs(2), || {
+            drive_voice(&backend, 4_410, 0.3);
+            host.voice_status().phase == "wet"
+        }),
+        "校准结束后必须恢复到变声启用前的湿声"
+    );
+    let restored = peak(&host, &backend);
+    assert!(
+        (restored - wet).abs() < 1.0,
+        "恢复后读数应回到湿声 {wet:.2}，实测 {restored:.2}"
+    );
+    host.voice.flush_saves();
+    assert!(
+        !dir.0.join("config.toml").exists(),
+        "校准暂停与恢复只改运行状态，不得写配置"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 变声校准暂停不改用户临时旁路也不取生命周期锁() {
+    let (host, _backend, _dir) = voice_fixture(true);
+    host.voice_set_bypass(true).unwrap();
+    let host = Arc::new(host);
+
+    // 开流或释放可能持有生命周期锁数秒；校准命令在界面线程执行，不能等它。
+    let lifecycle = host.lifecycle.lock().unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = {
+        let host = host.clone();
+        std::thread::spawn(move || {
+            host.voice_calibration_begin();
+            host.voice_calibration_end();
+            done_tx.send(()).unwrap();
+        })
+    };
+    assert!(
+        done_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+        "校准命令不得等待生命周期锁"
+    );
+    worker.join().unwrap();
+    drop(lifecycle);
+
+    let status = host.voice_status();
+    assert!(
+        status.bypassed,
+        "结束校准只解除自己那一层，用户的临时旁路保持"
+    );
+    assert_eq!(status.phase, "off");
 }
 
 #[cfg(feature = "voice")]
@@ -3294,7 +3433,8 @@ fn 监听与自检不经过人声链() {
     );
     assert_eq!(host.voice_status().phase, "wet");
 
-    // 自检、校准与设备恢复共用的生产暂停入口：暂停期间必须旁路并回到干声。
+    // 自检使用的生产暂停入口 `with_suspended`：暂停期间必须旁路并回到干声。
+    // 校准不释放会话，走独立的校准暂停层，见 `变声校准暂停让电平读数回到干声并在结束后恢复湿声`。
     let dir = TemporaryDir::new();
     let mut selftest_host = preview_test_host();
     selftest_host.voice =
