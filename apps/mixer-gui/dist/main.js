@@ -61,7 +61,13 @@ const el = {
   btnSoundLeft: $('btnSoundLeft'), btnSoundRight: $('btnSoundRight'), btnSoundRemove: $('btnSoundRemove'),
   utilityOverlay: $('utilityOverlay'), utilityTitle: $('utilityTitle'), btnUtilityClose: $('btnUtilityClose'),
   calibPanel: $('calibPanel'),
-
+  voiceState: $('voiceState'), voiceEnabled: $('voiceEnabled'),
+  voicePreset: $('voicePreset'), bypassBadge: $('bypassBadge'), voicePreview: $('voicePreview'),
+  voiceEdit: $('voiceEdit'), previewHint: $('previewHint'), voiceStatus: $('voiceStatus'),
+  voiceOverlay: $('voiceOverlay'), voiceClose: $('voiceClose'), voiceDone: $('voiceDone'),
+  voiceCurrentPreset: $('voiceCurrentPreset'), dirtyBadge: $('dirtyBadge'),
+  modalBypassBadge: $('modalBypassBadge'), pitch: $('pitch'), pitchOut: $('pitchOut'),
+  formant: $('formant'), formantOut: $('formantOut'),
 };
 
 el.selTheme.value = window.MixerTheme.getPreference();
@@ -134,7 +140,7 @@ async function openAbout() {
 function closeAbout() { if (aboutOpen) closeModal(); }
 el.btnAbout.addEventListener('click', openAbout);
 el.btnAboutClose.addEventListener('click', closeAbout);
-for (const overlay of [el.aboutOverlay, el.setup, el.soundOverlay, el.utilityOverlay]) {
+for (const overlay of [el.aboutOverlay, el.setup, el.soundOverlay, el.voiceOverlay, el.utilityOverlay]) {
   overlay.addEventListener('click', event => {
     if (event.target === overlay) closeModal();
   });
@@ -156,6 +162,34 @@ let state = { running: false, slots: [], items: [], lastStatus: null,
                lastDeviceLost: null, lastPanicSeen: null, lastStalled: null,
                lastMonitorError: null,
                silentSecs: 0, micHelpShown: false, micHelpDismissed: false };
+
+// ── 变声状态与音效播放状态分开缓存 ───────────────────────────
+// 变声命令不领取播放票据；保存类命令共用一条队列，回复按用户操作顺序生效。
+// 本地编辑先写入 voiceState，轮询快照只在没有对应本地修改时覆盖。
+// 块时长与宿主会话默认值一致；启动参数只影响当前会话，不写入配置。
+const VOICE_BLOCK_MS = 10;
+function neutralVoiceParams() {
+  return {
+    pitch_semitones: 0, formant_semitones: 0,
+    gate_enabled: false, gate_db: -45,
+    eq_low_enabled: false, eq_low_db: 0,
+    eq_mid_enabled: false, eq_mid_db: 0,
+    eq_high_enabled: false, eq_high_db: 0,
+    drive_enabled: false, drive: 0,
+    robot_enabled: false, robot_hz: 50, robot_mix: 0.8,
+  };
+}
+const voiceState = {
+  loaded: false, enabled: false, bypassed: false,
+  presetId: '', presetName: '', modified: false,
+  params: neutralVoiceParams(),
+};
+let voicePresets = [];
+let voiceAppliedGeneration = -1;
+let voiceEditVersion = 0;
+const voicePending = { enabled: 0, preset: 0, params: 0 };
+let voiceParamTimer = null;
+let voiceCommandTail = Promise.resolve();
 
 // ── 音效库条目：{ id, file, name, gain, tags: string[] }
 //    标签始终保存为数组，单个标签中的标点不作为分隔符。
@@ -384,6 +418,15 @@ async function start() {
         monitor_device: state.monitorDevice || null,
         remote_port: el.inRemote.checked ? 8765 : null,
       };
+    // 变声初值只影响本次会话；配置持久化由 voice_* 命令负责。
+    // 未成功读取状态时省略该字段，宿主回退读取自己的配置。
+    if (voiceState.loaded) {
+      cfg.voice = {
+        enabled: !!voiceState.enabled,
+        params: { ...voiceState.params },
+        block_ms: VOICE_BLOCK_MS,
+      };
+    }
     if (!await confirmedAudio(await invokeAudio('start', { cfg }, choice), choice)) return;
     opened = true;
     state.running = true;
@@ -546,6 +589,240 @@ function syncToggle() {
   el.btnToggle.classList.toggle('running', state.running);
   syncConnection();
 }
+
+// ─────────────────────────────── 人声效果
+
+function voiceParamsFrom(source) {
+  const params = neutralVoiceParams();
+  if (source && typeof source === 'object') {
+    for (const key of Object.keys(params)) {
+      if (key.endsWith('_enabled')) params[key] = source[key] === true;
+      else if (Number.isFinite(+source[key])) params[key] = +source[key];
+    }
+  }
+  return params;
+}
+
+function voicePresetName(id) {
+  return voicePresets.find(preset => preset && preset.id === id)?.name;
+}
+
+function markVoicePending(kind) {
+  const token = ++voiceEditVersion;
+  voicePending[kind] = token;
+  return token;
+}
+
+function settleVoicePending(kind, token) {
+  if (voicePending[kind] !== token) return false;
+  voicePending[kind] = 0;
+  return true;
+}
+
+function queueVoiceCommand(run) {
+  const task = voiceCommandTail.catch(() => {}).then(run);
+  voiceCommandTail = task.catch(() => {});
+  return task;
+}
+
+/// 变声命令只有在仍属于最新一次本地操作时才回写状态；
+/// 失败时重新读取宿主快照，避免用乐观值掩盖未生效的设置。
+function runVoiceCommand(kind, token, command, args, failureText) {
+  return queueVoiceCommand(async () => {
+    try {
+      const snapshot = await invoke(command, args);
+      settleVoicePending(kind, token);
+      applyVoiceSnapshot(snapshot);
+    } catch (error) {
+      if (settleVoicePending(kind, token)) {
+        toast(failureText + '：' + error, true);
+        await loadVoiceStatus();
+      }
+    }
+  });
+}
+
+function formatSemitone(value) {
+  const number = Number.isFinite(value) ? Math.round(value * 10) / 10 : 0;
+  return `${number > 0 ? '+' : number < 0 ? '−' : ''}${Math.abs(number)} 半音`;
+}
+
+function syncVoicePreview() {
+  const sessionAlive = state.running || state.standby;
+  const reason = !sessionAlive ? '音频未启动'
+    : state.lastStatus?.preview_playing ? '本机试听占用中' : '';
+  el.voicePreview.disabled = !!reason;
+  el.voicePreview.title = reason || '录制 3 秒后本机回放，不送给对方';
+  el.previewHint.textContent = reason || '试听只在本机回放，不送给对方。';
+}
+
+function voicePresetOption(id) {
+  for (const option of el.voicePreset.options) if (option.value === id) return option;
+  return null;
+}
+
+function ensureVoicePresetOption(id, name) {
+  if (!id || voicePresetOption(id)) return;
+  const option = document.createElement('option');
+  option.value = id;
+  option.textContent = name || id;
+  el.voicePreset.appendChild(option);
+}
+
+function renderVoicePresets() {
+  const pendingId = voicePending.preset ? el.voicePreset.value : '';
+  const selected = pendingId || voiceState.presetId;
+  el.voicePreset.innerHTML = '';
+  for (const preset of voicePresets) {
+    if (!preset || typeof preset.id !== 'string') continue;
+    const option = document.createElement('option');
+    option.value = preset.id;
+    option.textContent = String(preset.name ?? preset.id);
+    el.voicePreset.appendChild(option);
+  }
+  ensureVoicePresetOption(selected, voiceState.presetName);
+  if (selected) el.voicePreset.value = selected;
+}
+
+function renderVoicePanel() {
+  el.modalBypassBadge.classList.toggle('hidden', !voiceState.bypassed);
+  el.dirtyBadge.classList.toggle('hidden', !voiceState.modified);
+  el.voiceCurrentPreset.textContent = voiceState.presetName || '未读取';
+  el.pitch.value = String(voiceState.params.pitch_semitones);
+  el.formant.value = String(voiceState.params.formant_semitones);
+  el.pitchOut.textContent = formatSemitone(voiceState.params.pitch_semitones);
+  el.formantOut.textContent = formatSemitone(voiceState.params.formant_semitones);
+  el.pitch.setAttribute('aria-valuetext', el.pitchOut.textContent);
+  el.formant.setAttribute('aria-valuetext', el.formantOut.textContent);
+}
+
+function renderVoice() {
+  const name = voiceState.presetName || '未读取';
+  const stateText = voiceState.bypassed ? '临时旁路'
+    : voiceState.enabled ? '已启用' : '已关闭';
+  el.voiceState.textContent = voiceState.loaded ? `${name} · ${stateText}` : '未读取';
+  el.voiceStatus.textContent = voiceState.loaded ? `人声效果：${name} · ${stateText}` : '人声效果';
+  el.voiceStatus.title = el.voiceStatus.textContent;
+  el.voiceEnabled.checked = !!voiceState.enabled;
+  if (voiceState.presetId) {
+    ensureVoicePresetOption(voiceState.presetId, voiceState.presetName);
+    el.voicePreset.value = voiceState.presetId;
+  }
+  el.bypassBadge.classList.toggle('hidden', !voiceState.bypassed);
+  if (activeModal === el.voiceOverlay) renderVoicePanel();
+  syncVoicePreview();
+}
+
+/// 应用一份宿主快照。轮询请求发出后若用户又编辑过，整份快照作废；
+/// 单项仍在等待回复时也只跳过该项，避免把用户刚拖到的值回退。
+function applyVoiceSnapshot(snapshot, { fromPoll = false, requestVersion = null } = {}) {
+  if (!snapshot || typeof snapshot !== 'object') return;
+  if (fromPoll && requestVersion !== voiceEditVersion) return;
+  const generation = Number(snapshot.generation);
+  if (Number.isFinite(generation) && generation < voiceAppliedGeneration) return;
+  const hasPendingEdit = voicePending.enabled || voicePending.preset || voicePending.params;
+  if (fromPoll && !hasPendingEdit && Number.isFinite(generation)
+      && generation === voiceAppliedGeneration) return;
+  voiceState.loaded = true;
+  if (!voicePending.enabled) voiceState.enabled = snapshot.enabled === true;
+  if (!voicePending.preset) {
+    if (typeof snapshot.preset_id === 'string') voiceState.presetId = snapshot.preset_id;
+    if (typeof snapshot.preset_name === 'string') voiceState.presetName = snapshot.preset_name;
+  }
+  if (!voicePending.params) {
+    voiceState.params = voiceParamsFrom(snapshot.params);
+    voiceState.modified = snapshot.modified === true;
+  }
+  voiceState.bypassed = snapshot.bypassed === true;
+  if (Number.isFinite(generation)) voiceAppliedGeneration = Math.max(voiceAppliedGeneration, generation);
+  renderVoice();
+}
+
+async function loadVoicePresets() {
+  try {
+    const presets = await invoke('voice_presets');
+    voicePresets = Array.isArray(presets)
+      ? presets.filter(preset => preset && typeof preset.id === 'string')
+      : [];
+    renderVoicePresets();
+  } catch (_) {
+    // 保留已有预设；状态文案仍由 voice_status 提供。
+  }
+}
+
+async function loadVoiceStatus(guard) {
+  const requestVersion = voiceEditVersion;
+  try {
+    const snapshot = await invoke('voice_status');
+    if (guard && !guard()) return;
+    applyVoiceSnapshot(snapshot, { fromPoll: !!guard, requestVersion });
+  } catch (_) {
+    // 变声不可用时保留上次快照，不阻塞其他界面。
+  }
+}
+
+async function openVoicePanel() {
+  showModal(el.voiceOverlay, el.voiceClose);
+  renderVoice();
+  const generation = modalGeneration;
+  await Promise.all([
+    loadVoicePresets(),
+    loadVoiceStatus(() => generation === modalGeneration),
+  ]);
+}
+
+el.voiceEdit.addEventListener('click', openVoicePanel);
+el.voiceClose.addEventListener('click', closeModal);
+el.voiceDone.addEventListener('click', closeModal);
+
+el.voiceEnabled.addEventListener('change', () => {
+  const enabled = !!el.voiceEnabled.checked;
+  const token = markVoicePending('enabled');
+  voiceState.enabled = enabled;
+  renderVoice();
+  runVoiceCommand('enabled', token, 'voice_set_enabled', { enabled }, '变声开关更新失败');
+});
+
+el.voicePreset.addEventListener('change', () => {
+  const id = el.voicePreset.value;
+  if (!id) return;
+  const token = markVoicePending('preset');
+  voiceState.presetId = id;
+  voiceState.presetName = voicePresetName(id) || voiceState.presetName;
+  renderVoice();
+  runVoiceCommand('preset', token, 'voice_select_preset', { id }, '切换变声预设失败');
+});
+
+function queueVoiceParams() {
+  markVoicePending('params');
+  voiceState.modified = true;
+  voiceState.params = {
+    ...voiceState.params,
+    pitch_semitones: boundedVoiceValue(el.pitch),
+    formant_semitones: boundedVoiceValue(el.formant),
+  };
+  renderVoice();
+  clearTimeout(voiceParamTimer);
+  voiceParamTimer = setTimeout(() => {
+    voiceParamTimer = null;
+    const token = voicePending.params;
+    if (!token) return;
+    const params = { ...voiceState.params };
+    runVoiceCommand('params', token, 'voice_set_params', { params }, '人声参数更新失败');
+  }, 50);
+}
+
+function boundedVoiceValue(input) {
+  const value = Number(input.value);
+  if (!Number.isFinite(value)) return 0;
+  const min = Number(input.getAttribute('min'));
+  const max = Number(input.getAttribute('max'));
+  return Math.max(Number.isFinite(min) ? min : value,
+    Math.min(Number.isFinite(max) ? max : value, value));
+}
+
+el.pitch.addEventListener('input', queueVoiceParams);
+el.formant.addEventListener('input', queueVoiceParams);
 
 // ─────────────────────────────── 播放
 
@@ -931,6 +1208,7 @@ let appliedStatus = 0;
 async function poll(choice = audioChoice) {
   if (choice !== audioChoice) return;
   const request = ++requestedStatus;
+  const voiceVersionAtRequest = voiceEditVersion;
   try {
     const st = await invoke('status');
     // 命令会立即刷新状态；较早的轮询迟到时不能把当前音效切回旧卡片。
@@ -940,6 +1218,9 @@ async function poll(choice = audioChoice) {
     state.running = st.running;
     state.lastStatus = st;
     state.slots = st.slots || [];
+    if (st.voice) {
+      applyVoiceSnapshot(st.voice, { fromPoll: true, requestVersion: voiceVersionAtRequest });
+    }
 
     // 顶栏：三种状态必须一眼分得清 ——
     //   待机时**麦克风仍在转发**，这点写出来，否则用户会以为"停了对方就听不到我"
@@ -1068,6 +1349,7 @@ async function poll(choice = audioChoice) {
     }
     syncConnection();
     syncSoundFields();
+    syncVoicePreview();
     updatePlayer();
   } catch (e) { /* 窗口关闭时忽略 */ }
 }
@@ -1642,6 +1924,9 @@ document.addEventListener('click', event => {
       ? 'VB-CABLE：本软件输出选 CABLE Input；目标应用麦克风选 CABLE Output。'
       : '在目标应用中选择对应的虚拟麦克风；BlackHole 两边选择同一设备。';
   } catch (_) { /* 设备指导仍可从连接设置和关于中查看。 */ }
+  await Promise.all([loadVoicePresets(), loadVoiceStatus()]);
+  // 即使状态读取失败，也要初始化侧栏状态与试听可用性。
+  renderVoice();
   syncGainControls();
   await queueGainUpdate().catch(e => toast('音量设置同步失败：' + e, true));
   setSetupOpen(false);

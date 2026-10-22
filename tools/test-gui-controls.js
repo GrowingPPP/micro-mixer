@@ -128,6 +128,8 @@ const items = [
   { id: 'sound-B', file: '/sounds/B.wav', name: 'Beta', gain: -6, tags: [] },
 ];
 const flush = async () => { for (let i = 0; i < 25; i++) await Promise.resolve(); };
+// Boot performs voice status/preset IPC before its first render, so it needs a deeper microtask drain.
+const flushBoot = async () => { for (let i = 0; i < 100; i++) await Promise.resolve(); };
 const playbackStatus = (patch = {}) => ({
   running: true, passthrough: true, device: 'Fake output', uptime_secs: 1,
   slots: items.map((item, index) => ({ index, source_index: index, id: item.id,
@@ -137,6 +139,37 @@ const playbackStatus = (patch = {}) => ({
   out_peak_db: -18, out_rms_db: -24, limiter_db: 0, ring_ms: 20, remote_urls: [],
   ...patch,
 });
+
+// Voice fixture mirrors VoiceParamsDto so assertions can require a complete snapshot.
+const voiceParams = (patch = {}) => ({
+  pitch_semitones: 0, formant_semitones: 0,
+  gate_enabled: false, gate_db: -45,
+  eq_low_enabled: false, eq_low_db: 0,
+  eq_mid_enabled: false, eq_mid_db: 0,
+  eq_high_enabled: false, eq_high_db: 0,
+  drive_enabled: false, drive: 0,
+  robot_enabled: false, robot_hz: 50, robot_mix: 0.8,
+  ...patch,
+});
+const voiceSnapshot = (patch = {}) => ({
+  enabled: false, bypassed: false, phase: 'off',
+  preset_id: 'builtin:female', preset_name: '女声',
+  modified: false, draft_available: false,
+  params: voiceParams(), preview: { state: 'idle', elapsed_ms: 0, reason: null },
+  save_error: null, generation: 1,
+  ...patch,
+});
+const voicePresetList = [
+  { id: 'builtin:female', name: '女声', builtin: true,
+    params: voiceParams({ pitch_semitones: 4, formant_semitones: 3 }) },
+  { id: 'builtin:male', name: '男声', builtin: true,
+    params: voiceParams({ pitch_semitones: -4, formant_semitones: -2 }) },
+];
+const voiceFixture = command => {
+  if (command === 'voice_status') return voiceSnapshot();
+  if (command === 'voice_presets') return voicePresetList;
+  return undefined;
+};
 
 async function boot({ running = false, initialLoop, onInvoke, now, dark = false, storedTheme, storageFailure } = {}) {
   const document = new Element('document', null);
@@ -195,7 +228,7 @@ async function boot({ running = false, initialLoop, onInvoke, now, dark = false,
   if (fs.existsSync(path.join(root, 'theme.js'))) vm.runInContext(fs.readFileSync(path.join(root, 'theme.js'), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(root, 'library-model.js'), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(root, 'main.js'), 'utf8'), context);
-  await flush();
+  await flushBoot();
   assert.equal(document.querySelectorAll('.card').length, 2,
     'the shipped script must initialize and render the loaded library');
   assert.deepEqual(calls.filter(call => call.command === 'js_error'), [], 'frontend must boot without errors');
@@ -1726,4 +1759,256 @@ test('主题存储写入失败仍即时切换并明确提示未保存', async ()
   assert.equal(select.value, 'light');
   assert.match(app.document.getElementById('themeHelp').textContent, /未能保存/);
   assert.match(app.document.getElementById('toast').textContent, /未能保存/);
+});
+
+// ── 人声效果侧栏与基础面板 ───────────────────────────────────
+
+test('人声侧栏渲染启用预设与编辑入口', async () => {
+  const app = await boot({ onInvoke(command) {
+    if (command === 'voice_status') return voiceSnapshot({ enabled: true });
+    if (command === 'voice_presets') return voicePresetList;
+  } });
+  const enabled = app.document.getElementById('voiceEnabled');
+  const preset = app.document.getElementById('voicePreset');
+  const preview = app.document.getElementById('voicePreview');
+  const edit = app.document.getElementById('voiceEdit');
+  assert.ok(enabled, '侧栏应有启用开关');
+  assert.ok(preset, '侧栏应有预设下拉');
+  assert.ok(preview, '侧栏应有试听按钮');
+  assert.ok(edit, '侧栏应有编辑入口');
+  assert.equal(enabled.getAttribute('aria-label'), '启用变声');
+  assert.equal(preset.getAttribute('aria-label'), '当前变声预设');
+  assert.equal(preview.textContent, '试听 3 秒');
+  assert.equal(edit.textContent, '编辑');
+  assert.equal(edit.getAttribute('aria-haspopup'), 'dialog');
+  assert.deepEqual(preset.options.map(option => option.value), ['builtin:female', 'builtin:male']);
+  assert.equal(preset.value, 'builtin:female');
+  assert.equal(enabled.checked, true);
+  const micBlock = app.document.getElementById('inMicGain').closest('.gain-control');
+  const sfxBlock = app.document.getElementById('inSfxGain').closest('.gain-control');
+  const voiceBlock = app.document.getElementById('voiceBlock');
+  assert.ok(voiceBlock, '侧栏应有人声效果分组');
+  const siblings = voiceBlock.parentElement.children;
+  assert.ok(siblings.indexOf(micBlock) < siblings.indexOf(voiceBlock),
+    '人声效果应排在麦克风音量之后');
+  assert.ok(siblings.indexOf(voiceBlock) < siblings.indexOf(sfxBlock),
+    '人声效果应排在音效总音量之前');
+  assert.equal(app.calls.filter(call => call.command === 'voice_status').length, 1,
+    '启动时应读取一次变声状态');
+  assert.equal(app.calls.filter(call => call.command === 'voice_presets').length, 1,
+    '启动时应读取一次预设列表');
+});
+
+test('启用开关发送变声命令', async () => {
+  const app = await boot({ onInvoke(command) {
+    const voice = voiceFixture(command);
+    if (voice !== undefined) return voice;
+    if (command === 'voice_set_enabled') return voiceSnapshot({ enabled: true, generation: 2 });
+  } });
+  const toggle = app.document.getElementById('voiceEnabled');
+  toggle.checked = true;
+  await toggle.emit('change');
+  await flush();
+  assert.deepEqual(app.calls.filter(call => call.command === 'voice_set_enabled'), [
+    { command: 'voice_set_enabled', args: { enabled: true } },
+  ], '启用开关只能调用变声命令');
+  assert.equal(app.calls.some(call => call.command === 'save_config'), false,
+    '变声启用状态不能混入全量配置保存');
+  assert.equal(toggle.checked, true);
+});
+
+test('预设选择不自动启用', async () => {
+  const app = await boot({ onInvoke(command) {
+    const voice = voiceFixture(command);
+    if (voice !== undefined) return voice;
+    if (command === 'voice_select_preset') {
+      return voiceSnapshot({ preset_id: 'builtin:male', preset_name: '男声', generation: 2 });
+    }
+  } });
+  const toggle = app.document.getElementById('voiceEnabled');
+  const preset = app.document.getElementById('voicePreset');
+  assert.equal(toggle.checked, false);
+  preset.value = 'builtin:male';
+  await preset.emit('change');
+  await flush();
+  assert.deepEqual(app.calls.filter(call => call.command === 'voice_select_preset'), [
+    { command: 'voice_select_preset', args: { id: 'builtin:male' } },
+  ]);
+  assert.equal(app.calls.some(call => call.command === 'voice_set_enabled'), false,
+    '选择预设不能隐式开启变声');
+  assert.equal(app.calls.some(call => call.command === 'save_config'), false,
+    '选择预设不能写入全量配置');
+  assert.equal(toggle.checked, false);
+  assert.match(app.document.getElementById('voiceState').textContent, /男声.*已关闭/);
+});
+
+test('音高共振峰输入合并发送', async () => {
+  const app = await boot({ onInvoke: voiceFixture });
+  await app.document.getElementById('voiceEdit').emit('click');
+  const pitch = app.document.getElementById('pitch');
+  const formant = app.document.getElementById('formant');
+  assert.equal(pitch.getAttribute('min'), '-24');
+  assert.equal(pitch.getAttribute('max'), '24');
+  assert.equal(formant.getAttribute('min'), '-12');
+  assert.equal(formant.getAttribute('max'), '12');
+  for (const value of [3, 5, 7]) {
+    pitch.value = String(value);
+    await pitch.emit('input');
+  }
+  formant.value = '4';
+  await formant.emit('input');
+  assert.equal(app.calls.filter(call => call.command === 'voice_set_params').length, 0,
+    '输入合并窗口内不应逐次发送');
+  assert.equal(app.document.getElementById('pitchOut').textContent, '+7 半音');
+  assert.equal(app.document.getElementById('formantOut').textContent, '+4 半音');
+  await app.advanceTimers(50);
+  await flush();
+  const snapshots = app.calls.filter(call => call.command === 'voice_set_params');
+  assert.equal(snapshots.length, 1, '一次合并只发送一个完整参数快照');
+  assert.deepEqual(Object.keys(snapshots[0].args.params).sort(), Object.keys(voiceParams()).sort(),
+    '参数快照必须包含完整 VoiceParams 字段');
+  assert.equal(snapshots[0].args.params.pitch_semitones, 7);
+  assert.equal(snapshots[0].args.params.formant_semitones, 4);
+  pitch.value = '-2';
+  await pitch.emit('input');
+  await app.advanceTimers(50);
+  await flush();
+  const later = app.calls.filter(call => call.command === 'voice_set_params');
+  assert.equal(later.length, 2);
+  assert.equal(later[1].args.params.pitch_semitones, -2);
+  assert.equal(later[1].args.params.formant_semitones, 4, '后续快照仍保持完整参数');
+});
+
+test('人声面板焦点与 Escape 恢复', async () => {
+  const app = await boot({ onInvoke: voiceFixture });
+  const edit = app.document.getElementById('voiceEdit');
+  const overlay = app.document.getElementById('voiceOverlay');
+  edit.focus();
+  await edit.emit('click');
+  assert.equal(overlay.classList.contains('hidden'), false);
+  assert.equal(app.document.getElementById('appShell').inert, true);
+  assert.equal(app.document.activeElement, app.document.getElementById('voiceClose'));
+  assert.equal(app.calls.filter(call => call.command === 'voice_presets').length, 2,
+    '打开面板时应重新读取预设');
+  const first = app.document.getElementById('voiceClose');
+  const last = app.document.getElementById('voiceDone');
+  first.focus();
+  await app.document.emit('keydown', { key: 'Tab', shiftKey: true, target: first });
+  assert.equal(app.document.activeElement, last, 'Shift+Tab 从首个控件回到末个控件');
+  await app.document.emit('keydown', { key: 'Tab', target: last });
+  assert.equal(app.document.activeElement, first, 'Tab 从末个控件回到首个控件');
+  await app.document.emit('keydown', { key: 'Escape', target: first });
+  assert.equal(overlay.classList.contains('hidden'), true);
+  assert.equal(app.document.getElementById('appShell').inert, false);
+  assert.equal(app.document.activeElement, edit, '关闭后恢复触发按钮焦点');
+  await edit.emit('click');
+  await overlay.emit('click', { target: overlay });
+  assert.equal(overlay.classList.contains('hidden'), true, '点击遮罩空白处应关闭面板');
+  assert.equal(app.document.activeElement, edit);
+});
+
+test('旧变声状态回复不覆盖新选择', async () => {
+  let holdNextStatus = false;
+  let finishOlderStatus;
+  const initial = voiceSnapshot();
+  const app = await boot({ onInvoke(command) {
+    if (command === 'voice_status') return initial;
+    if (command === 'voice_presets') return voicePresetList;
+    if (command === 'status') {
+      if (holdNextStatus) {
+        holdNextStatus = false;
+        return new Promise(resolve => { finishOlderStatus = resolve; });
+      }
+      return playbackStatus({ voice: initial });
+    }
+    if (command === 'voice_select_preset') {
+      return voiceSnapshot({ preset_id: 'builtin:male', preset_name: '男声', generation: 2 });
+    }
+  } });
+  await app.document.getElementById('voiceEdit').emit('click');
+  const pitch = app.document.getElementById('pitch');
+  pitch.value = '6';
+  await pitch.emit('input');
+  holdNextStatus = true;
+  await app.pollStatus();
+  assert.equal(typeof finishOlderStatus, 'function', '应有一份旧状态回复仍在途中');
+  const preset = app.document.getElementById('voicePreset');
+  preset.value = 'builtin:male';
+  await preset.emit('change');
+  await app.advanceTimers(50);
+  await flush();
+  finishOlderStatus(playbackStatus({ voice: initial }));
+  await flush();
+  await app.pollStatus();
+  assert.equal(preset.value, 'builtin:male', '旧轮询不得回退用户选择的预设');
+  assert.equal(pitch.value, '6', '旧轮询不得回退正在编辑的滑杆');
+  assert.match(app.document.getElementById('voiceCurrentPreset').textContent, /男声/);
+});
+
+test('音频未启动时试听显示原因', async () => {
+  const idle = await boot({ onInvoke: voiceFixture });
+  const idlePreview = idle.document.getElementById('voicePreview');
+  assert.equal(idlePreview.disabled, true);
+  assert.equal(idlePreview.textContent, '试听 3 秒');
+  assert.match(idle.document.getElementById('previewHint').textContent, /音频未启动/);
+
+  const busy = await boot({ running: true, onInvoke(command) {
+    if (command === 'status') {
+      return playbackStatus({ preview_playing: true, preview_sound_id: 'sound-A',
+        preview_playhead_secs: 0.5, preview_duration_secs: 2, voice: voiceSnapshot() });
+    }
+    return voiceFixture(command);
+  } });
+  const busyPreview = busy.document.getElementById('voicePreview');
+  assert.equal(busyPreview.disabled, true);
+  assert.match(busy.document.getElementById('previewHint').textContent, /本机试听占用中/);
+
+  const ready = await boot({ running: true, onInvoke(command) {
+    if (command === 'status') return playbackStatus({ voice: voiceSnapshot() });
+    return voiceFixture(command);
+  } });
+  const readyPreview = ready.document.getElementById('voicePreview');
+  assert.equal(readyPreview.disabled, false);
+  assert.match(ready.document.getElementById('previewHint').textContent, /试听只在本机回放/);
+});
+
+test('临时旁路状态显示为独立提示', async () => {
+  const snapshot = voiceSnapshot({ enabled: true, bypassed: true,
+    preset_id: 'builtin:male', preset_name: '男声' });
+  const app = await boot({ running: true, onInvoke(command) {
+    if (command === 'voice_status') return snapshot;
+    if (command === 'voice_presets') return voicePresetList;
+    if (command === 'status') return playbackStatus({ voice: snapshot });
+  } });
+  const toggle = app.document.getElementById('voiceEnabled');
+  const badge = app.document.getElementById('bypassBadge');
+  assert.equal(toggle.checked, true, '临时旁路不能把启用开关改成关闭');
+  assert.equal(badge.classList.contains('hidden'), false);
+  assert.equal(badge.textContent, '临时旁路');
+  const status = app.document.getElementById('voiceStatus').textContent;
+  assert.match(status, /男声/);
+  assert.match(status, /临时旁路/);
+  await app.document.getElementById('voiceEdit').emit('click');
+  const modalBadge = app.document.getElementById('modalBypassBadge');
+  assert.equal(modalBadge.classList.contains('hidden'), false);
+  assert.equal(modalBadge.textContent, '临时旁路');
+  assert.equal(toggle.checked, true);
+});
+
+test('人声变声状态进入启动参数且配置保存不含变声字段', async () => {
+  const params = voiceParams({ pitch_semitones: 5, formant_semitones: 2 });
+  const app = await boot({ onInvoke(command) {
+    if (command === 'voice_status') {
+      return voiceSnapshot({ enabled: true, preset_id: 'builtin:male',
+        preset_name: '男声', params });
+    }
+    if (command === 'voice_presets') return voicePresetList;
+  } });
+  await app.document.getElementById('btnToggle').emit('click');
+  const start = app.calls.filter(call => call.command === 'start').at(-1);
+  assert.ok(start, '启动命令应携带变声状态');
+  assert.deepEqual(start.args.cfg.voice, { enabled: true, params, block_ms: 10 });
+  const saved = app.calls.filter(call => call.command === 'save_config').at(-1);
+  assert.ok(saved, '启动前应保存普通配置');
+  assert.equal('voice' in saved.args, false, '全量配置保存不能包含变声字段');
 });

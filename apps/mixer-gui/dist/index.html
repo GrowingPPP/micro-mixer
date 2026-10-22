@@ -54,6 +54,21 @@
         <input id="micGainSlider" type="range" min="-60" max="36" step="1" value="0" aria-label="麦克风音量滑杆" aria-describedby="micGainHelp gainRangeHelp">
         <p id="micGainHelp" class="hint">调整对方听到的人声大小。</p>
       </div>
+      <section id="voiceBlock" class="voice-block" aria-labelledby="voiceBlockTitle">
+        <div class="voice-head">
+          <div><h3 id="voiceBlockTitle">人声效果</h3><span id="voiceState" class="voice-state">未读取</span></div>
+          <label class="switch-row" title="开启后按当前预设改变发送给对方的人声"><input id="voiceEnabled" type="checkbox" aria-label="启用变声"></label>
+        </div>
+        <div class="voice-preset-row">
+          <select id="voicePreset" aria-label="当前变声预设"></select>
+          <span id="bypassBadge" class="badge warn hidden">临时旁路</span>
+        </div>
+        <div class="voice-actions">
+          <button id="voicePreview" class="preview" disabled>试听 3 秒</button>
+          <button id="voiceEdit" class="ghost" aria-haspopup="dialog">编辑</button>
+        </div>
+        <p id="previewHint" class="voice-hint">音频未启动</p>
+      </section>
       <div class="gain-control">
         <div class="gain-heading"><label for="inSfxGain">音效总音量</label><span class="withunit"><input id="inSfxGain" type="number" value="-6" step="1" min="-60" max="36" aria-label="音效总音量" aria-describedby="sfxGainHelp gainRangeHelp"><i>dB</i></span></div>
         <input id="sfxGainSlider" type="range" min="-60" max="36" step="1" value="-6" aria-label="音效总音量滑杆" aria-describedby="sfxGainHelp gainRangeHelp">
@@ -83,6 +98,7 @@
     </div>
     <div class="statusbar">
       <span id="meter" class="meter off" title="送往虚拟麦克风的混合信号电平"><i class="zone"></i><i class="bar"></i><i class="peak"></i></span>
+      <span id="voiceStatus" class="voice-status">人声效果</span>
       <span id="signalLabel">音频设备未启动</span>
       <details id="healthDetails" class="health-details"><summary id="healthSummary">音频状态</summary><div id="metrics" class="metrics">设备未启动</div></details>
       <span class="status-spacer"></span><button id="remote" class="remote quiet"></button><button id="btnQr" class="quiet" aria-haspopup="dialog">手机遥控</button>
@@ -121,6 +137,25 @@
     <p id="soundEditHelp" class="hint">名称、标签和热键在关闭音效后可修改；音量随时可调。</p>
     <div class="sound-tools"><button id="btnSoundLeft" class="ghost">前移</button><button id="btnSoundRight" class="ghost">后移</button><button id="btnSoundRemove" class="quiet danger">从库中移除</button></div>
     <div class="dialog-footer"><button id="btnSoundSave" class="primary">保存并关闭</button></div>
+  </section>
+</div>
+
+<div id="voiceOverlay" class="modal-overlay hidden">
+  <section class="dialog voice-dialog" role="dialog" aria-modal="true" aria-labelledby="voiceTitle">
+    <div class="dialog-heading">
+      <div><p class="eyebrow">麦克风人声</p><h2 id="voiceTitle">人声效果</h2></div>
+      <button id="voiceClose" class="quiet" aria-label="关闭人声效果">关闭</button>
+    </div>
+    <p class="voice-summary"><span>当前预设</span><b id="voiceCurrentPreset">未读取</b><span id="dirtyBadge" class="badge dirty hidden">● 已修改</span><span id="modalBypassBadge" class="badge warn hidden">临时旁路</span></p>
+    <section class="settings-section">
+      <h3>音高与音色</h3>
+      <div class="param-list">
+        <div class="param-row"><label for="pitch">音高</label><input id="pitch" type="range" min="-24" max="24" step="1" value="0" aria-describedby="pitchOut"><output id="pitchOut" for="pitch">0 半音</output></div>
+        <div class="param-row"><label for="formant">共振峰</label><input id="formant" type="range" min="-12" max="12" step="1" value="0" aria-describedby="formantOut"><output id="formantOut" for="formant">0 半音</output></div>
+      </div>
+      <p class="hint">参数立即作用于当前人声；未保存的修改只在本次运行有效。</p>
+    </section>
+    <div class="dialog-footer"><button id="voiceDone" class="primary">完成</button></div>
   </section>
 </div>
 
