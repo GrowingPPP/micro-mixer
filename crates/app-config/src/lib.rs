@@ -4,7 +4,10 @@
 //!
 //! 使用 TOML 解析器处理字符串转义、空数组和多行配置；旧版扁平配置仍可读取。
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
@@ -216,13 +219,17 @@ impl Config {
 
     pub fn save(&self) -> Result<PathBuf> {
         let path = Self::path();
-        if let Some(dir) = path.parent() {
+        self.save_to(&path)?;
+        Ok(path)
+    }
+
+    /// 保存到指定路径，写入过程原子替换目标文件。
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("创建配置目录失败: {}", dir.display()))?;
         }
-        std::fs::write(&path, self.to_text())
-            .with_context(|| format!("写入配置失败: {}", path.display()))?;
-        Ok(path)
+        write_atomic(path, &self.to_text())
     }
 
     // ── 解析
@@ -673,6 +680,48 @@ impl Config {
         g.resize(count, 0.0);
         g
     }
+}
+
+/// 原子写入配置文本：同目录临时文件写完并同步后，重命名覆盖目标。
+///
+/// 临时文件必须与目标同目录，重命名才不会跨文件系统。任一步失败都删除临时文件，
+/// 目标路径上的旧配置保持原样。
+fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("配置路径缺少文件名: {}", path.display()))?;
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let temp_path = dir.join(format!(
+        ".{}.{}.{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        nanos,
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::File::create(&temp_path)
+            .with_context(|| format!("创建临时配置文件失败: {}", temp_path.display()))?;
+        file.write_all(text.as_bytes())
+            .with_context(|| format!("写入临时配置文件失败: {}", temp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("同步临时配置文件失败: {}", temp_path.display()))?;
+        drop(file);
+        std::fs::rename(&temp_path, path)
+            .with_context(|| format!("替换配置文件失败: {}", path.display()))
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
 }
 
 fn parse_str(v: &str) -> Option<String> {
@@ -1400,6 +1449,140 @@ value = "second"
         assert_eq!(c.sound_dirs[0], expected);
         let c = Config::parse(r#"sound_files = ["~/Sounds"]"#);
         assert_eq!(c.sound_files[0], expected);
+    }
+
+    struct TemporaryDirectory(PathBuf);
+
+    impl TemporaryDirectory {
+        fn new(label: &str) -> Self {
+            static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("系统时钟早于 UNIX_EPOCH")
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "mixer-config-{label}-{}-{nanos}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TemporaryDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn 保存后旧文件被完整替换() {
+        let dir = TemporaryDirectory::new("replace");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "output_device = \"旧设备\"\nbuffer_ms = 10\n").unwrap();
+        let config = Config {
+            output_device: Some("新设备".into()),
+            buffer_ms: Some(40),
+            monitor: false,
+            ..Default::default()
+        };
+        config.save_to(&path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("旧设备"), "旧值仍然存在：\n{saved}");
+        let restored = Config::load_from(&path);
+        assert_eq!(restored.output_device.as_deref(), Some("新设备"));
+        assert_eq!(restored.buffer_ms, Some(40));
+        assert!(!restored.monitor, "显式关闭的监听必须保存并恢复");
+    }
+
+    #[test]
+    fn 保存失败保留旧文件() {
+        let dir = TemporaryDirectory::new("failure");
+        let target = dir.path().join("目标目录");
+        std::fs::create_dir(&target).unwrap();
+        let old_path = target.join("config.toml");
+        const OLD: &str = "output_device = \"旧设备\"\n";
+        std::fs::write(&old_path, OLD).unwrap();
+
+        let config = Config {
+            output_device: Some("新设备".into()),
+            ..Default::default()
+        };
+        assert!(
+            config.save_to(&target).is_err(),
+            "目标路径是目录时保存必须失败"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&old_path).unwrap(),
+            OLD,
+            "保存失败不能改动旧文件"
+        );
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            [std::ffi::OsString::from("目标目录")],
+            "失败后残留临时文件"
+        );
+    }
+
+    #[test]
+    fn 未知键与音效条目在原子保存后仍保留() {
+        let dir = TemporaryDirectory::new("unknown");
+        let path = dir.path().join("config.toml");
+        let text = r#"
+future_scalar = "keep,me"
+[[sounds]]
+id = "stable-id"
+path = 'C:\Users\Doe, John\sound.wav'
+name = "Good"
+gain_db = -9.0
+tags = ["literal,tag", "another"]
+hotkey = "F2"
+"#;
+        let original = Config::try_parse(text).unwrap();
+        original.save_to(&path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let document = saved.parse::<toml::Table>().unwrap();
+        assert_eq!(document["future_scalar"].as_str(), Some("keep,me"));
+        let restored = Config::try_parse(&saved).unwrap();
+        assert!(
+            restored
+                .unknown_lines
+                .iter()
+                .any(|line| line.contains("future_scalar")),
+            "未知键丢失：\n{saved}"
+        );
+        assert_eq!(restored.sound_entries(), original.sound_entries());
+        assert_eq!(
+            restored.sound_entries()[0].tags,
+            ["literal,tag", "another"],
+            "音效标签不能按标点拆分"
+        );
+    }
+
+    #[test]
+    fn 保存后不留下临时文件() {
+        let dir = TemporaryDirectory::new("clean");
+        let path = dir.path().join("config.toml");
+        Config::default().save_to(&path).unwrap();
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [std::ffi::OsString::from("config.toml")],
+            "目录里有残留文件"
+        );
     }
 }
 
