@@ -149,31 +149,24 @@ impl VoiceRuntime {
             .is_ok()
     }
 
-    /// 把当前的淡出阶段推进到关闭；新请求已改写阶段时返回 false。
-    pub(crate) fn finish_fade_out(&self) -> bool {
-        loop {
-            let raw = self.state.load(Ordering::Acquire);
-            let (generation, phase) = unpack(raw);
-            if phase != VoicePhase::FadingOut {
-                return false;
-            }
-            let next = pack(generation, VoicePhase::Off);
-            if self
-                .state
-                .compare_exchange_weak(raw, next, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                return true;
-            }
-        }
+    /// 只允许发起这次淡出的那一代把阶段推进到关闭。
+    ///
+    /// 淡出期间重复关闭会推进代次；旧代次的完成结果不能结束新一次淡出。
+    pub(crate) fn finish_fade_out(&self, generation: u64) -> bool {
+        let expected = pack(generation, VoicePhase::FadingOut);
+        let next = pack(generation, VoicePhase::Off);
+        self.state
+            .compare_exchange(expected, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
     }
 }
 
 /// 变声会话的构造输入。
 ///
-/// `block_ms` 决定 [`super::VoiceChain`] 的固定适配块；`backend` 由宿主在
-/// 非实时线程创建并注入，测试可使用可控延迟替身。后端的 `Send` 约束保证
-/// 引擎可以随采集处理移动到音频线程。`params` 在构造时写入后端。
+/// `block_ms` 按输出采样率解释，决定 [`super::VoiceChain`] 的固定适配块，
+/// 必须是 `(0, 40]` 毫秒内的有限值。`backend` 由宿主在非实时线程创建并注入，
+/// 测试可使用可控延迟替身。后端的 `Send` 约束保证引擎可以随采集处理移动到
+/// 音频线程。`params` 在构造时写入后端。
 pub struct VoiceSetup {
     pub params: VoiceParams,
     pub block_ms: f32,
@@ -220,7 +213,7 @@ mod tests {
         assert_eq!(runtime.phase(), VoicePhase::FadingOut);
         let fading = runtime.generation();
         assert!(fading > warming);
-        assert!(runtime.finish_fade_out());
+        assert!(runtime.finish_fade_out(fading));
         assert_eq!(runtime.phase(), VoicePhase::Off);
         assert_eq!(runtime.generation(), fading);
     }
@@ -248,10 +241,14 @@ mod tests {
         assert!(runtime.finish_warmup(warming));
         runtime.request_disable();
         assert_eq!(runtime.phase(), VoicePhase::FadingOut);
+        let fading = runtime.generation();
 
         runtime.request_enable();
         assert_eq!(runtime.phase(), VoicePhase::Warmup);
-        assert!(!runtime.finish_fade_out(), "新代次已预热时不得回到关闭");
+        assert!(
+            !runtime.finish_fade_out(fading),
+            "新代次已预热时不得回到关闭"
+        );
         assert_eq!(runtime.phase(), VoicePhase::Warmup);
     }
 
@@ -264,7 +261,31 @@ mod tests {
 
         runtime.request_bypass();
         assert_eq!(runtime.phase(), VoicePhase::FadingOut);
-        assert!(runtime.finish_fade_out());
+        let fading = runtime.generation();
+        assert!(runtime.finish_fade_out(fading));
+        assert_eq!(runtime.phase(), VoicePhase::Off);
+    }
+
+    #[test]
+    fn 淡出期间重复关闭后旧代次不能完成() {
+        let runtime = VoiceRuntime::new();
+        runtime.request_enable();
+        let warming = runtime.generation();
+        assert!(runtime.finish_warmup(warming));
+
+        runtime.request_disable();
+        let stale = runtime.generation();
+        runtime.request_disable();
+        let current = runtime.generation();
+        assert!(current > stale, "重复关闭应推进代次");
+        assert_eq!(runtime.phase(), VoicePhase::FadingOut);
+
+        assert!(
+            !runtime.finish_fade_out(stale),
+            "旧代次的完成回调不得结束新一次淡出"
+        );
+        assert_eq!(runtime.phase(), VoicePhase::FadingOut);
+        assert!(runtime.finish_fade_out(current));
         assert_eq!(runtime.phase(), VoicePhase::Off);
     }
 }

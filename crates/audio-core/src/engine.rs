@@ -536,6 +536,9 @@ impl FilePlayer {
 /// 干湿交叉淡化时长（毫秒）。
 const VOICE_CROSSFADE_MS: f32 = 25.0;
 
+/// 变声算法块时长上限（毫秒），防止异常配置造成超大预分配。
+const MAX_VOICE_BLOCK_MS: f32 = 40.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VoiceTeeState {
     Idle,
@@ -568,6 +571,7 @@ struct VoiceTee {
     generation: u64,
     warmup_generation: u64,
     warmup_frames: usize,
+    fade_generation: u64,
     fade_pos: usize,
     crossfade_frames: usize,
 }
@@ -605,6 +609,7 @@ impl VoiceTee {
             generation,
             warmup_generation: generation,
             warmup_frames: 0,
+            fade_generation: generation,
             fade_pos,
             crossfade_frames,
         }
@@ -637,30 +642,34 @@ impl VoiceTee {
                 frames
             }
             VoicePhase::Wet => {
-                let wet_frames = self.chain.0.process(dry, out);
+                // 每次最多排出本回调输入帧数，块量化积压留在链内 FIFO，
+                // 避免小回调时向环形缓冲突发整块数据。
+                let wet_frames = self.chain.0.process(dry, &mut out[..frames]);
                 if self.state == VoiceTeeState::FadingIn {
-                    let mixed = frames.max(wet_frames).min(out.len());
-                    self.mix_fade(out, dry, wet_frames, mixed, true);
+                    self.mix_fade(out, dry, wet_frames, frames, true);
                     if self.fade_pos >= self.crossfade_frames {
                         self.state = VoiceTeeState::SteadyWet;
                     }
-                    mixed
+                    frames
                 } else {
                     self.state = VoiceTeeState::SteadyWet;
                     wet_frames
                 }
             }
             VoicePhase::FadingOut => {
-                let wet_frames = self.chain.0.process(dry, out);
-                let mixed = frames.max(wet_frames).min(out.len());
-                self.mix_fade(out, dry, wet_frames, mixed, false);
-                if self.fade_pos >= self.crossfade_frames && self.runtime.finish_fade_out() {
+                // 淡出同样按输入帧数排出，缺湿声时用干声补齐，
+                // 保证写环速率与设备回调一致。
+                let wet_frames = self.chain.0.process(dry, &mut out[..frames]);
+                self.mix_fade(out, dry, wet_frames, frames, false);
+                if self.fade_pos >= self.crossfade_frames
+                    && self.runtime.finish_fade_out(self.fade_generation)
+                {
                     self.chain.0.reset();
                     self.state = VoiceTeeState::Idle;
                     self.warmup_frames = 0;
                     self.fade_pos = 0;
                 }
-                mixed
+                frames
             }
         }
     }
@@ -697,6 +706,7 @@ impl VoiceTee {
                     self.fade_pos = 0;
                 }
                 self.state = VoiceTeeState::FadingOut;
+                self.fade_generation = generation;
             }
         }
     }
@@ -1170,7 +1180,8 @@ impl EngineParts {
     /// 组装带可选变声 tee 的引擎。
     ///
     /// `voice` 为 `Some` 时，采集侧在重采样之后分出干声与湿声；`None` 时
-    /// 与 [`EngineParts::build`] 的行为完全一致。
+    /// 与 [`EngineParts::build`] 的行为完全一致。变声块时长按输出采样率解释，
+    /// 必须是 `(0, 40]` 毫秒内的有限值。
     pub fn build_with_voice(
         input_format: StreamFormat,
         output_format: StreamFormat,
@@ -1178,6 +1189,15 @@ impl EngineParts {
         buffer_ms: u32,
         voice: Option<VoiceSetup>,
     ) -> Self {
+        if let Some(setup) = &voice {
+            assert!(
+                setup.block_ms.is_finite()
+                    && setup.block_ms > 0.0
+                    && setup.block_ms <= MAX_VOICE_BLOCK_MS,
+                "变声块时长必须为 (0, 40] ms 内的有限值，实际 {}",
+                setup.block_ms
+            );
+        }
         // 水位按输出侧的样本数计（立体声 → ×2）
         let target_frames = (output_format.sample_rate as u64 * buffer_ms as u64 / 1000) as usize;
         let target_samples = target_frames * 2;
@@ -2559,7 +2579,7 @@ mod tests {
     const 变声缓冲毫秒: u32 = 100;
     const 小回调帧: usize = 128;
     /// 每个样本对应一个唯一的源序号，用来读出切换处的时间不连续。
-    const 斜坡步长: f32 = 1e-5;
+    const 斜坡步长: f32 = 5e-6;
 
     struct DelayBackend {
         delay_frames: usize,
@@ -2636,6 +2656,23 @@ mod tests {
         (0..帧数).map(|i| (起始 + i) as f32 * 斜坡步长).collect()
     }
 
+    fn 构造指定块时长的引擎(block_ms: f32) -> EngineParts {
+        let runtime = Arc::new(VoiceRuntime::new());
+        let setup = VoiceSetup::new(
+            VoiceParams::default(),
+            block_ms,
+            runtime,
+            Box::new(DelayBackend::new(0)),
+        );
+        EngineParts::build_with_voice(
+            StreamFormat::new(48_000, 1),
+            StreamFormat::new(48_000, 2),
+            空槽位(),
+            20,
+            Some(setup),
+        )
+    }
+
     /// 由输出斜坡值反推源样本序号，再用「已喂帧数 − 源序号 − 环内帧数」
     /// 消掉固定的传输延迟；干湿切换前后的差值就是重复或跳过的样本数。
     fn 变声偏移(e: &EngineParts, fed: usize, last_left: f32) -> i64 {
@@ -2653,26 +2690,59 @@ mod tests {
 
     #[test]
     fn 关闭变声时输出与现有引擎一致() {
-        let (mut voiced, runtime) = 构造带变声引擎(变声延迟帧);
-        let mut plain = 构造引擎();
+        const 缓冲毫秒: u32 = 20;
+        let (mut voiced, runtime) = 构造带变声引擎与缓冲(变声延迟帧, 缓冲毫秒);
+        let mut plain = EngineParts::build(
+            StreamFormat::new(48_000, 1),
+            StreamFormat::new(48_000, 2),
+            空槽位(),
+            缓冲毫秒,
+        );
         assert_eq!(runtime.phase(), VoicePhase::Off);
 
-        let mut plain_out = vec![0.0; 512 * 2];
-        let mut voiced_out = vec![0.0; 512 * 2];
+        let mut plain_out = vec![0.0; 8192 * 2];
+        let mut voiced_out = vec![0.0; 8192 * 2];
         let mut fed = 0usize;
-        for frames in [997, 100, 4800, 37, 1024, 8192] {
+
+        // 两个引擎使用相同缓冲参数，先同步预热到漂移与限幅的稳态。
+        for _ in 0..5 {
+            let input: Vec<f32> = (0..480)
+                .map(|i| ((fed + i) as f32 * 0.01).sin() * 0.2)
+                .collect();
+            fed += 480;
+            plain.capture.process(&input);
+            voiced.capture.process(&input);
+        }
+        for _ in 0..200 {
+            let input: Vec<f32> = (0..480)
+                .map(|i| ((fed + i) as f32 * 0.01).sin() * 0.2)
+                .collect();
+            fed += 480;
+            plain.capture.process(&input);
+            voiced.capture.process(&input);
+            plain.render.process(&mut plain_out[..480 * 2]);
+            voiced.render.process(&mut voiced_out[..480 * 2]);
+        }
+
+        // 再比较同一组稳态渲染输出，覆盖不同回调大小。
+        let mut compared_frames = 0usize;
+        for frames in [997, 128, 4800, 37, 1024, 8192] {
             let input: Vec<f32> = (0..frames)
                 .map(|i| ((fed + i) as f32 * 0.01).sin() * 0.3)
                 .collect();
             fed += frames;
             plain.capture.process(&input);
             voiced.capture.process(&input);
-            for _ in 0..2 {
-                plain.render.process(&mut plain_out);
-                voiced.render.process(&mut voiced_out);
-                assert_eq!(plain_out, voiced_out, "Off 阶段输出必须逐样本一致");
-            }
+            plain.render.process(&mut plain_out[..frames * 2]);
+            voiced.render.process(&mut voiced_out[..frames * 2]);
+            assert_eq!(
+                plain_out[..frames * 2],
+                voiced_out[..frames * 2],
+                "Off 阶段稳态输出必须逐样本一致（{frames} 帧）"
+            );
+            compared_frames += frames;
         }
+        assert!(compared_frames > 0);
         assert_eq!(voiced.render.voice_phase(), VoicePhase::Off);
     }
 
@@ -2726,24 +2796,97 @@ mod tests {
     }
 
     #[test]
+    fn 紧缓冲小回调在湿声阶段不欠载() {
+        const 缓冲毫秒: u32 = 10;
+        const 运行帧数: usize = 48_000 * 5;
+        for 回调帧 in [128usize, 256] {
+            let (mut e, runtime) = 构造带变声引擎与缓冲(变声延迟帧, 缓冲毫秒);
+            let mut out = vec![0.0; 回调帧 * 2];
+            let mut fed = 0usize;
+
+            // 预填环形缓冲，隔离启动阶段本身的欠载。
+            for _ in 0..20 {
+                e.capture.process(&vec![0.1; 回调帧]);
+                fed += 回调帧;
+            }
+            runtime.request_enable();
+            assert_eq!(runtime.phase(), VoicePhase::Warmup);
+
+            let mut wet_started = false;
+            let mut wet_underruns = 0u64;
+            let mut min_wet_fill = usize::MAX;
+            let mut last_underruns = e.stats.underruns.load(Ordering::Relaxed);
+            while fed < 运行帧数 {
+                let frames = 回调帧.min(运行帧数 - fed);
+                e.capture.process(&vec![0.1; frames]);
+                fed += frames;
+                e.render.process(&mut out[..frames * 2]);
+                let underruns = e.stats.underruns.load(Ordering::Relaxed);
+                if runtime.phase() == VoicePhase::Wet {
+                    wet_started = true;
+                }
+                if wet_started {
+                    wet_underruns += underruns - last_underruns;
+                    min_wet_fill = min_wet_fill.min(e.stats.ring_fill.load(Ordering::Relaxed));
+                }
+                last_underruns = underruns;
+            }
+
+            assert_eq!(
+                runtime.phase(),
+                VoicePhase::Wet,
+                "{回调帧} 帧回调应在预热后进入湿声"
+            );
+            assert!(wet_started, "{回调帧} 帧回调未观察到湿声阶段");
+            assert_eq!(
+                wet_underruns, 0,
+                "{回调帧} 帧回调在 10 ms 缓冲下湿声阶段不应欠载"
+            );
+            assert!(min_wet_fill > 0, "{回调帧} 帧回调湿声阶段环形缓冲被抽干");
+            assert_eq!(
+                e.stats.underruns.load(Ordering::Relaxed),
+                0,
+                "{回调帧} 帧回调整个运行期都不应欠载"
+            );
+            assert_eq!(
+                e.stats.overruns.load(Ordering::Relaxed),
+                0,
+                "{回调帧} 帧回调不应撑爆环形缓冲"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "变声块时长")]
+    fn 非有限变声块时长应被拒绝() {
+        let _ = 构造指定块时长的引擎(f32::NAN);
+    }
+
+    #[test]
+    #[should_panic(expected = "变声块时长")]
+    fn 过长变声块时长应被拒绝() {
+        let _ = 构造指定块时长的引擎(40.1);
+    }
+
+    #[test]
     fn 启用切换重复不超过算法延迟() {
         let (mut e, runtime) = 构造带变声引擎(变声延迟帧);
         let mut out = vec![0.0; 变声块帧 * 2];
         let mut fed = 0usize;
 
+        // 预填后先排空到目标水位，让漂移比率收敛到 1，避免时间基偏差混入测量。
         for _ in 0..10 {
             e.capture.process(&斜坡块(fed, 变声块帧));
             fed += 变声块帧;
         }
-        let mut dry_offset = 0;
-        for _ in 0..8 {
+        for _ in 0..160 {
             采集并渲染(&mut e, &mut fed, &mut out);
-            dry_offset = 变声偏移(&e, fed, out[out.len() - 2]);
         }
+        let dry_offset = 变声偏移(&e, fed, out[out.len() - 2]);
         assert_eq!(runtime.phase(), VoicePhase::Off);
 
         runtime.request_enable();
-        for _ in 0..40 {
+        for _ in 0..80 {
             采集并渲染(&mut e, &mut fed, &mut out);
         }
         assert_eq!(runtime.phase(), VoicePhase::Wet);
@@ -2773,12 +2916,16 @@ mod tests {
         let mut out = vec![0.0; 变声块帧 * 2];
         let mut fed = 0usize;
 
+        // 预填后先排空到目标水位，让漂移比率收敛到 1，避免时间基偏差混入测量。
         for _ in 0..10 {
             e.capture.process(&斜坡块(fed, 变声块帧));
             fed += 变声块帧;
         }
+        for _ in 0..160 {
+            采集并渲染(&mut e, &mut fed, &mut out);
+        }
         runtime.request_enable();
-        for _ in 0..20 {
+        for _ in 0..80 {
             采集并渲染(&mut e, &mut fed, &mut out);
         }
         assert_eq!(runtime.phase(), VoicePhase::Wet);
