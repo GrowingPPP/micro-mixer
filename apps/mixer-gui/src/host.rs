@@ -24,11 +24,11 @@ use audio_core::device::{AudioBackend, DeviceId, StreamFormat};
 use audio_core::engine::{AtomicF32, EngineStats};
 use audio_core::limiter::Limiter;
 use backend_cpal::CpalBackend;
-use hotkeys::Hotkeys;
+use hotkeys::{HotkeyGroup, HotkeyGroups, HotkeyManager, Hotkeys};
 
-use crate::voice::{VoiceParamsDto, VoicePresetDto, VoiceStartConfig, VoiceStatusDto};
 #[cfg(feature = "voice")]
-use crate::voice::{VoiceService, DEFAULT_VOICE_BLOCK_MS};
+use crate::voice::{VoiceHotkeyAction, VoiceHotkeyOutcome, VoiceService, DEFAULT_VOICE_BLOCK_MS};
+use crate::voice::{VoiceParamsDto, VoicePresetDto, VoiceStartConfig, VoiceStatusDto};
 #[cfg(feature = "voice")]
 use audio_core::voice::VoiceControl;
 
@@ -249,8 +249,8 @@ struct Running {
     monitor_error: Mutex<Option<String>>,
     started_at: std::time::Instant,
     skipped_notes: Vec<String>,
-    hotkeys: Arc<Mutex<Option<Hotkeys>>>,
-    poller: Arc<Mutex<Option<hotkeys::HotkeyPoller>>>,
+    /// 音效槽位与人声效果两组绑定共用一个平台管理器。
+    hotkeys: Arc<Mutex<HotkeyGroups>>,
     cfg_key: String,
     cfg: StartConfig,
 }
@@ -418,7 +418,10 @@ pub struct AudioHost {
     /// 会话之外也保存音量，试听与启动中的用户调整共用这一份状态。
     gains: Mutex<HostGains>,
     next_generation: AtomicU64,
-    last_error: Mutex<Option<String>>,
+    /// 热键线程需要把动作失败写回状态，因此与宿主共享同一错误槽。
+    last_error: Arc<Mutex<Option<String>>>,
+    /// 进程内唯一的平台热键管理器；音效与变声热键都用它绑定。
+    hotkey_manager: Arc<Mutex<Option<Arc<HotkeyManager>>>>,
     /// 试听代号：每次试听自增，旧的那次看到代号变了就自行停止。
     /// 用它避免连点多个音效时声音叠在一起。
     preview_gen: Arc<AtomicU64>,
@@ -647,7 +650,7 @@ impl AudioHost {
             hotkeys_active: r
                 .hotkeys
                 .lock()
-                .map(|h| h.as_ref().map(|x| x.is_bound()).unwrap_or(false))
+                .map(|groups| groups.slots_bound())
                 .unwrap_or(false),
             last_error: self
                 .last_error
@@ -955,34 +958,71 @@ impl AudioHost {
         let control = playback.control.clone();
         let stats = session.stats.clone();
         let shutdown = Arc::new(AtomicBool::new(false));
-        let hotkeys = Arc::new(Mutex::new(None));
-        let poller = Arc::new(Mutex::new(None));
-        let filtered_specs: Vec<_> = slots_meta.iter().map(|s| s.hotkey.clone()).collect();
-        if filtered_specs.iter().any(|s| !s.is_empty()) {
-            match bind_hotkeys_on_main_thread(app, &filtered_specs) {
-                Ok((hk, how)) => {
-                    println!("[热键] 绑定成功（{how}）");
-                    *poller.lock().unwrap_or_else(|e| e.into_inner()) = Some(hk.poller());
-                    *hotkeys.lock().unwrap_or_else(|e| e.into_inner()) = Some(hk);
+        let slot_specs: Vec<_> = slots_meta.iter().map(|s| s.hotkey.clone()).collect();
+        #[cfg(feature = "voice")]
+        let voice_specs = self.voice.hotkey_specs();
+        #[cfg(not(feature = "voice"))]
+        let voice_specs: Vec<String> = Vec::new();
+        let has_slot_keys = slot_specs.iter().any(|spec| !spec.trim().is_empty());
+        let has_voice_keys = voice_specs.iter().any(|spec| !spec.trim().is_empty());
+        let voice_keys_allowed = if has_slot_keys || has_voice_keys {
+            match hotkeys::validate_disjoint(&[&slot_specs, &voice_specs]) {
+                Ok(()) => true,
+                Err(error) => {
+                    // 热键冲突不能阻止音频启动；槽位照常绑定，变声热键跳过并在界面提示。
+                    println!("[热键] ❌ 人声效果热键校验失败: {error:#}");
+                    self.record_error(format!("人声效果热键未绑定: {error:#}"));
+                    false
                 }
-                Err(e) => println!("[热键] ❌ 绑定失败: {e:#}"),
+            }
+        } else {
+            true
+        };
+
+        let mut slot_hotkeys = None;
+        if has_slot_keys {
+            match self.bind_hotkeys_on_main_thread(app, &slot_specs) {
+                Ok((hotkeys, how)) => {
+                    println!("[热键] 绑定成功（{how}）");
+                    slot_hotkeys = Some(hotkeys);
+                }
+                Err(error) => println!("[热键] ❌ 绑定失败: {error:#}"),
             }
         }
+        let mut voice_hotkeys = None;
+        if has_voice_keys && voice_keys_allowed {
+            match self.bind_hotkeys_on_main_thread(app, &voice_specs) {
+                Ok((hotkeys, how)) => {
+                    println!("[人声热键] 绑定成功（{how}）");
+                    voice_hotkeys = Some(hotkeys);
+                }
+                Err(error) => {
+                    println!("[人声热键] ❌ 绑定失败: {error:#}");
+                    self.record_error(format!("人声效果热键绑定失败: {error:#}"));
+                }
+            }
+        }
+        let hotkeys = Arc::new(Mutex::new(HotkeyGroups::new(slot_hotkeys, voice_hotkeys)));
         // Always keep a poll worker, even when the initial key registration fails.
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
         let play = self.play_handler(playback.clone(), generation);
+        let voice_action = self.voice_hotkey_handler(generation);
         let sd = shutdown.clone();
-        let hks = poller.clone();
+        let groups = hotkeys.clone();
         let hotkey_thread = Some(std::thread::Builder::new().name("hotkeys".into()).spawn(
             move || {
                 while !sd.load(Ordering::Acquire) {
-                    let slot = hks
+                    let actions = groups
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .as_ref()
-                        .and_then(|h: &hotkeys::HotkeyPoller| h.poll());
-                    if let Some(slot) = slot {
-                        play(slot);
+                        .poll_actions();
+                    for (group, index) in actions {
+                        match group {
+                            HotkeyGroup::Slots => {
+                                play(index);
+                            }
+                            HotkeyGroup::Voice => voice_action(index),
+                        }
                     }
                     std::thread::sleep(Duration::from_millis(12));
                 }
@@ -1052,7 +1092,6 @@ impl AudioHost {
             started_at: std::time::Instant::now(),
             skipped_notes,
             hotkeys,
-            poller,
             cfg_key: cfg_fingerprint(&cfg),
             cfg,
         };
@@ -1168,13 +1207,11 @@ impl AudioHost {
                 return;
             };
             r.playback.standby();
-            *r.poller.lock().unwrap_or_else(|e| e.into_inner()) = None;
             r.hotkeys.clone()
         };
-        if let Err(e) = self.with_hotkeys(handles, |h| {
-            h.as_mut().map(Hotkeys::unbind_all).transpose().map(|_| ())
-        }) {
-            self.record_error(format!("注销热键失败: {e:#}"));
+        // 待机只归还音效槽位按键；变声热键继续可用。
+        if let Err(error) = self.with_hotkey_groups(handles, |groups| groups.standby()) {
+            self.record_error(format!("注销热键失败: {error:#}"));
         }
         if let Some(sh) = self
             .remote
@@ -1247,24 +1284,20 @@ impl AudioHost {
         if let Some(thread) = running.hotkey_thread.take() {
             let _ = thread.join();
         }
-        if let Err(error) = self.with_hotkeys(running.hotkeys.clone(), |handle| {
-            if let Some(mut hotkeys) = handle.take() {
-                hotkeys.unbind_all()?;
-                drop(hotkeys);
-            }
-            Ok(())
-        }) {
+        if let Err(error) =
+            self.with_hotkey_groups(running.hotkeys.clone(), |groups| groups.release())
+        {
             self.record_error(format!("释放热键失败: {error:#}"));
         }
         drop(running); // Session closes all streams on their owner thread.
     }
 
-    fn with_hotkeys<T: Send + 'static>(
+    fn with_hotkey_groups<T: Send + 'static>(
         &self,
-        handle: Arc<Mutex<Option<Hotkeys>>>,
-        action: impl FnOnce(&mut Option<Hotkeys>) -> Result<T> + Send + 'static,
+        handle: Arc<Mutex<HotkeyGroups>>,
+        action: impl FnOnce(&mut HotkeyGroups) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        if handle.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+        if !handle.lock().unwrap_or_else(|e| e.into_inner()).has_sets() {
             return action(&mut handle.lock().unwrap_or_else(|e| e.into_inner()));
         }
         if !cfg!(target_os = "macos") || hotkeys::is_main_thread() {
@@ -1292,12 +1325,11 @@ impl AudioHost {
     }
 
     fn activate_inner(&self, app: Option<&tauri::AppHandle>) -> Result<()> {
-        let (handle, poller, playback, specs, names, remote_port, generation) = {
+        let (handle, playback, specs, names, remote_port, generation) = {
             let guard = self.running.lock().unwrap_or_else(|e| e.into_inner());
             let r = guard.as_ref().context("音频还没启动")?;
             (
                 r.hotkeys.clone(),
-                r.poller.clone(),
                 r.playback.clone(),
                 r.slots_meta
                     .iter()
@@ -1311,25 +1343,25 @@ impl AudioHost {
                 r.generation,
             )
         };
-        if specs.iter().any(|s| !s.is_empty()) {
-            let has_manager = handle.lock().unwrap_or_else(|e| e.into_inner()).is_some();
-            let result = if has_manager {
-                self.with_hotkeys(handle.clone(), move |h| {
-                    h.as_mut().context("热键管理器已释放")?.rebind(&specs)
-                })
+        if specs.iter().any(|s| !s.trim().is_empty()) {
+            let has_slot_set = handle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .slot_hotkeys()
+                .is_some();
+            let result = if has_slot_set {
+                self.with_hotkey_groups(handle, move |groups| groups.rebind_slots(&specs))
             } else {
-                bind_hotkeys_on_main_thread(app, &specs)
-                    .map(|(h, _)| *handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(h))
+                self.bind_hotkeys_on_main_thread(app, &specs)
+                    .map(|(hotkeys, _)| {
+                        handle
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .set_slot_hotkeys(Some(hotkeys));
+                    })
             };
-            match result {
-                Ok(()) => {
-                    *poller.lock().unwrap_or_else(|e| e.into_inner()) = handle
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .as_ref()
-                        .map(|h| h.poller())
-                }
-                Err(e) => self.record_error(format!("恢复热键失败: {e:#}")),
+            if let Err(error) = result {
+                self.record_error(format!("恢复热键失败: {error:#}"));
             }
         }
         if remote_port.is_some() {
@@ -2279,6 +2311,138 @@ impl AudioHost {
         }
     }
 
+    /// 保存三个人声效果热键并在有会话时重绑。
+    ///
+    /// 先校验跨组冲突再落盘；重绑失败保留旧绑定并把错误返回界面。
+    pub fn voice_set_hotkeys(
+        &self,
+        bypass: &str,
+        next: &str,
+        prev: &str,
+    ) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            let _operation = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            let voice_specs = vec![
+                bypass.trim().to_owned(),
+                next.trim().to_owned(),
+                prev.trim().to_owned(),
+            ];
+            let slot_specs = self.slot_hotkey_specs();
+            hotkeys::validate_disjoint(&[&slot_specs, &voice_specs])?;
+            // 先保存用户选择；系统级冲突导致重绑失败时，旧绑定仍然有效。
+            self.voice
+                .save_hotkeys(&voice_specs[0], &voice_specs[1], &voice_specs[2])?;
+            let handle = self
+                .running
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map(|running| running.hotkeys.clone());
+            if let Some(handle) = handle {
+                let has_voice_set = handle
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .voice_hotkeys()
+                    .is_some();
+                if has_voice_set {
+                    self.with_hotkey_groups(handle, move |groups| {
+                        groups.rebind_voice(&voice_specs)
+                    })
+                    .context("人声效果热键重绑失败，原热键仍然有效")?;
+                } else {
+                    let app = self.app.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let (bound, _) =
+                        self.bind_hotkeys_on_main_thread(app.as_ref(), &voice_specs)?;
+                    handle
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .set_voice_hotkeys(Some(bound));
+                }
+            }
+            Ok(self.voice.status())
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            let _ = (bypass, next, prev);
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    /// 当前生效的音效槽位热键；无会话时读取配置里的持久列表。
+    #[cfg(feature = "voice")]
+    fn slot_hotkey_specs(&self) -> Vec<String> {
+        let running_specs = self
+            .running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|running| {
+                running
+                    .slots_meta
+                    .iter()
+                    .map(|slot| slot.hotkey.clone())
+                    .collect::<Vec<_>>()
+            });
+        if let Some(specs) = running_specs {
+            return specs;
+        }
+        match load_config_for_write(self.voice.config_path()) {
+            Ok(config) => config
+                .sound_entries()
+                .into_iter()
+                .map(|entry| entry.hotkey)
+                .collect(),
+            Err(error) => {
+                log::warn!("读取音效热键失败，跨组校验按空列表处理: {error:#}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// 在需要时把绑定动作调度到主线程，并复用宿主唯一的管理器。
+    fn bind_hotkeys_on_main_thread(
+        &self,
+        app: Option<&tauri::AppHandle>,
+        keys: &[String],
+    ) -> Result<(Hotkeys, &'static str)> {
+        bind_hotkeys_with_manager(app, &self.hotkey_manager, keys)
+    }
+
+    /// 未编译变声后端时没有人声效果热键；保留空处理器让轮询线程结构一致。
+    #[cfg(not(feature = "voice"))]
+    fn voice_hotkey_handler(&self, _generation: u64) -> Arc<dyn Fn(usize) + Send + Sync> {
+        Arc::new(|_| {})
+    }
+
+    /// 热键线程的事件入口：只调用宿主控制路径，不接触音频回调。
+    #[cfg(feature = "voice")]
+    fn voice_hotkey_handler(&self, generation: u64) -> Arc<dyn Fn(usize) + Send + Sync> {
+        let voice = self.voice.clone();
+        let requests = self.audio_requests.clone();
+        let last_error = self.last_error.clone();
+        Arc::new(move |index| {
+            let action = match index {
+                0 => VoiceHotkeyAction::ToggleBypass,
+                1 => VoiceHotkeyAction::NextPreset,
+                2 => VoiceHotkeyAction::PrevPreset,
+                _ => return,
+            };
+            let registered = requests.generation.load(Ordering::Acquire);
+            match route_voice_hotkey(&voice, registered, generation, action) {
+                Ok(outcome) => {
+                    if let Some(notice) = outcome.notice {
+                        *last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(notice);
+                    }
+                }
+                Err(error) => {
+                    *last_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some(format!("人声效果热键执行失败: {error:#}"));
+                }
+            }
+        })
+    }
+
     #[cfg(feature = "voice")]
     fn attach_voice_control(&self, control: Option<VoiceControl>) {
         let mut slot = self.voice_control.lock().unwrap_or_else(|e| e.into_inner());
@@ -2295,6 +2459,27 @@ impl AudioHost {
     pub fn record_error(&self, e: impl Into<String>) {
         *self.last_error.lock().unwrap_or_else(|x| x.into_inner()) = Some(e.into());
     }
+}
+
+/// 把一次热键事件路由到当前的变声状态。
+///
+/// 捕获代次与当前会话代次不一致时丢弃事件：旧会话的按键不能影响新会话。
+/// 代次为 0 表示没有音频会话，此时预设热键仍更新待用参数，旁路热键只提示。
+#[cfg(feature = "voice")]
+pub(crate) fn route_voice_hotkey(
+    voice: &VoiceService,
+    registered_generation: u64,
+    handler_generation: u64,
+    action: VoiceHotkeyAction,
+) -> Result<VoiceHotkeyOutcome> {
+    if handler_generation != 0 && registered_generation != handler_generation {
+        return Ok(VoiceHotkeyOutcome {
+            status: voice.status(),
+            acted: false,
+            notice: None,
+        });
+    }
+    voice.handle_hotkey(action, registered_generation != 0)
 }
 
 impl Drop for AudioHost {
@@ -2358,33 +2543,49 @@ pub fn request_mic_permission() {
 
 // ─────────────────────────────────────────── 热键绑定
 
-/// 在**主线程**上绑定热键并在需要时取回结果。
+/// 取得宿主唯一的平台管理器；没有时在**主线程**创建并缓存。
 ///
 /// macOS 的 Carbon 热键要求管理器在主线程创建，而 Tauri 的命令处理器不保证
-/// 跑在主线程，所以这里显式调度过去再等结果回来。
-fn bind_hotkeys_on_main_thread(
+/// 跑在主线程，所以创建动作必须调度过去。创建之后的绑定可以复用同一句柄。
+fn acquire_hotkey_manager(slot: &Mutex<Option<Arc<HotkeyManager>>>) -> Result<Arc<HotkeyManager>> {
+    if let Some(manager) = slot.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return Ok(manager);
+    }
+    let created = Arc::new(Hotkeys::new_manager()?);
+    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(guard.get_or_insert(created).clone())
+}
+
+/// 在**主线程**上创建/复用管理器并绑定热键，必要时取回结果。
+fn bind_hotkeys_with_manager(
     app: Option<&tauri::AppHandle>,
+    manager_slot: &Arc<Mutex<Option<Arc<HotkeyManager>>>>,
     keys: &[String],
 ) -> Result<(Hotkeys, &'static str)> {
     if hotkeys::is_main_thread() {
-        return Ok((Hotkeys::bind_to_slots(keys)?, "调用方本来就在主线程"));
+        let manager = acquire_hotkey_manager(manager_slot)?;
+        return Ok((Hotkeys::bind_with(manager, keys)?, "调用方本来就在主线程"));
     }
     let Some(app) = app else {
         // 无 GUI 场景（--smoke）：直接绑，让 new_manager 给出明确报错
-        return Ok((Hotkeys::bind_to_slots(keys)?, "无 GUI 上下文"));
+        let manager = acquire_hotkey_manager(manager_slot)?;
+        return Ok((Hotkeys::bind_with(manager, keys)?, "无 GUI 上下文"));
     };
 
     let (tx, rx) = mpsc::channel();
     let keys: Vec<String> = keys.to_vec();
+    let manager_slot = manager_slot.clone();
     app.run_on_main_thread(move || {
-        let _ = tx.send(Hotkeys::bind_to_slots(&keys));
+        let result = acquire_hotkey_manager(&manager_slot)
+            .and_then(|manager| Hotkeys::bind_with(manager, &keys));
+        let _ = tx.send(result);
     })
     .context("把热键绑定调度到主线程失败")?;
 
-    let hk = rx
+    let hotkeys = rx
         .recv_timeout(Duration::from_secs(6))
         .map_err(|_| anyhow::anyhow!("在主线程绑定热键超时（6 秒）"))??;
-    Ok((hk, "已调度到主线程"))
+    Ok((hotkeys, "已调度到主线程"))
 }
 
 // ─────────────────────────────────────────── 试听

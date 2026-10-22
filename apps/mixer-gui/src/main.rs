@@ -633,6 +633,16 @@ fn voice_restore_draft(host: State<'_, AudioHost>) -> Res<VoiceStatusDto> {
     host.voice_restore_draft().map_err(err)
 }
 
+#[tauri::command]
+fn voice_set_hotkeys(
+    host: State<'_, AudioHost>,
+    bypass: String,
+    next: String,
+    prev: String,
+) -> Res<VoiceStatusDto> {
+    host.voice_set_hotkeys(&bypass, &next, &prev).map_err(err)
+}
+
 /// 前端加载完成后主动上报 —— 用来证明 WebView 真的渲染并执行了 JS。
 /// `--probe` 模式下会把它打印出来，供自动化验证。
 fn sound_item_dto(item: &app_config::SoundEntry) -> serde_json::Value {
@@ -737,6 +747,11 @@ fn saved_config_dto(c: &Config) -> serde_json::Value {
         "mic_gain_db": c.mic_gain_db.unwrap_or(0.0),
         "sfx_gain_db": c.sfx_gain_db.unwrap_or(-6.0),
         "hotkeys": c.hotkeys.join(","),
+        "voice_hotkeys": {
+            "bypass": &c.voice.bypass_hotkey,
+            "next": &c.voice.next_preset_hotkey,
+            "prev": &c.voice.prev_preset_hotkey,
+        },
         "path": Config::path().display().to_string(),
     })
 }
@@ -1239,6 +1254,7 @@ fn main() {
             voice_rename_preset,
             voice_delete_preset,
             voice_restore_draft,
+            voice_set_hotkeys,
             frontend_ready,
             load_config,
             save_config,
@@ -1477,5 +1493,17 @@ mod sound_item_dto_tests {
             "file": "legacy.wav", "tags": " old, second| third; ",
         })]);
         assert_eq!(parsed[0].tags, ["old", "second", "third"]);
+    }
+
+    #[test]
+    fn 载入配置暴露三个人声效果热键() {
+        let mut config = Config::default();
+        config.voice.bypass_hotkey = "F9".into();
+        config.voice.next_preset_hotkey = "F10".into();
+        config.voice.prev_preset_hotkey = "F8".into();
+        let dto = saved_config_dto(&config);
+        assert_eq!(dto["voice_hotkeys"]["bypass"], "F9");
+        assert_eq!(dto["voice_hotkeys"]["next"], "F10");
+        assert_eq!(dto["voice_hotkeys"]["prev"], "F8");
     }
 }

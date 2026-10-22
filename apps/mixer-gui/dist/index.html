@@ -122,6 +122,14 @@
       <label>全局热键（逗号分隔，与音效顺序对应）<input id="inKeys" type="text" placeholder="F1,F2,F3"></label>
       <div class="setting-actions"><button id="btnClear" class="quiet danger">清空音效库</button><span class="hint">只移除列表，不删除原文件</span></div>
     </section>
+    <section class="settings-section"><h3>人声效果热键</h3>
+      <div class="row">
+        <label>临时旁路<input id="voiceKeyBypass" type="text" placeholder="例如 F9"></label>
+        <label>下一个预设<input id="voiceKeyNext" type="text" placeholder="例如 F10"></label>
+        <label>上一个预设<input id="voiceKeyPrev" type="text" placeholder="例如 F8"></label>
+      </div>
+      <p class="hint">输入变化立即保存并重绑；与音效热键重复时会提示冲突，旧绑定保持有效。</p>
+    </section>
     <section class="settings-section"><h3>手机遥控</h3><label class="switch-row"><span><strong>启用局域网遥控</strong><small>启动后，用同一网络中的手机扫码触发音效</small></span><input id="inRemote" type="checkbox" checked></label></section>
     <section class="settings-section"><h3>结束转发</h3><p class="hint">平常「停止播放」只停止音效；「关闭音效」仍转发人声。释放设备后，目标应用需要改回真实麦克风。</p><div class="setting-actions"><button id="btnRevertMic" class="ghost">切回真实麦克风</button><button id="btnRelease" class="ghost danger">彻底释放音频设备</button></div></section>
     <div class="dialog-footer"><button id="btnSetupSave" class="primary">保存设置并关闭</button></div>

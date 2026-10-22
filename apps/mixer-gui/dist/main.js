@@ -30,6 +30,7 @@ const el = {
   selIn: $('selIn'), selOut: $('selOut'), inBuf: $('inBuf'),
   inDir: $('inDir'), btnBrowse: $('btnBrowse'), btnScan: $('btnScan'),
   inKeys: $('inKeys'), inMicGain: $('inMicGain'), inSfxGain: $('inSfxGain'),
+  voiceKeyBypass: $('voiceKeyBypass'), voiceKeyNext: $('voiceKeyNext'), voiceKeyPrev: $('voiceKeyPrev'),
   inLoop: $('inLoop'), loopHelp: $('loopHelp'), hint: $('setupHint'),
   btnAdd: $('btnAdd'), btnClear: $('btnClear'), count: $('count'),
   inRemote: $('inRemote'), remote: $('remote'), meter: $('meter'),
@@ -279,6 +280,12 @@ async function loadSavedConfig() {
     if (Number.isFinite(c.mic_gain_db)) el.inMicGain.value = boundedGain(c.mic_gain_db);
     if (Number.isFinite(c.sfx_gain_db)) el.inSfxGain.value = boundedGain(c.sfx_gain_db);
     if (typeof c.hotkeys === 'string') el.inKeys.value = c.hotkeys;
+    const voiceKeys = c.voice_hotkeys;
+    if (voiceKeys && typeof voiceKeys === 'object') {
+      if (typeof voiceKeys.bypass === 'string') el.voiceKeyBypass.value = voiceKeys.bypass;
+      if (typeof voiceKeys.next === 'string') el.voiceKeyNext.value = voiceKeys.next;
+      if (typeof voiceKeys.prev === 'string') el.voiceKeyPrev.value = voiceKeys.prev;
+    }
     if (typeof c.monitor === 'boolean') el.inMonitor.checked = c.monitor;
     if (typeof c.looping === 'boolean') el.inLoop.checked = c.looping;
     syncLoopHelp();
@@ -2030,6 +2037,22 @@ el.btnDriverHelp.addEventListener('click', async () => {
 for (const control of [el.selIn, el.selOut]) control.addEventListener('change', syncConnection);
 el.selMonitor.addEventListener('change', () => { state.monitorDevice = el.selMonitor.value || null; });
 for (const control of [el.inMonitor, el.inRemote]) control.addEventListener('change', () => saveCurrentConfig());
+
+// 人声效果热键独立保存并立即重绑，不经过音效全量配置，也不重启音频。
+async function saveVoiceHotkeys() {
+  try {
+    await invoke('voice_set_hotkeys', {
+      bypass: el.voiceKeyBypass.value.trim(),
+      next: el.voiceKeyNext.value.trim(),
+      prev: el.voiceKeyPrev.value.trim(),
+    });
+  } catch (error) {
+    toast('人声效果热键保存失败：' + error, true);
+  }
+}
+for (const control of [el.voiceKeyBypass, el.voiceKeyNext, el.voiceKeyPrev]) {
+  control.addEventListener('change', saveVoiceHotkeys);
+}
 
 
 async function runSelfTest() {

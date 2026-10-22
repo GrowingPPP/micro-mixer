@@ -259,6 +259,27 @@ fn preset_dto(preset: &VoicePreset) -> VoicePresetDto {
     }
 }
 
+/// 人声效果热键的语义动作；索引映射在宿主轮询线程里完成。
+#[cfg(feature = "voice")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VoiceHotkeyAction {
+    ToggleBypass,
+    NextPreset,
+    PrevPreset,
+}
+
+/// 一次热键动作的结果：是否真的改变了状态，以及需要提示用户的说明。
+#[cfg(feature = "voice")]
+#[derive(Debug, Clone)]
+pub(crate) struct VoiceHotkeyOutcome {
+    /// 测试与界面状态断言使用；生产热键路径只消费 `notice`。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) status: VoiceStatusDto,
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) acted: bool,
+    pub(crate) notice: Option<String>,
+}
+
 /// 切换预设时留在宿主内存里的未保存修改；进程退出自然丢失。
 #[cfg(feature = "voice")]
 #[derive(Debug, Clone)]
@@ -305,6 +326,10 @@ struct VoiceState {
     /// 当前预设的保存基线；用户保存后立即前移，落盘失败时回滚。
     saved_params: VoiceParams,
     params: VoiceParams,
+    /// `[voice]` 中由命令维护的三个人声效果热键；启动时用于绑定。
+    bypass_hotkey: String,
+    next_preset_hotkey: String,
+    prev_preset_hotkey: String,
     user_presets: Vec<VoicePreset>,
     draft: Option<VoiceDraft>,
     pending_save_rollback: Option<PendingSaveRollback>,
@@ -340,6 +365,7 @@ struct VoiceShared {
 
 /// 宿主变声状态与命令入口。
 #[cfg(feature = "voice")]
+#[derive(Clone)]
 pub(crate) struct VoiceService {
     shared: Arc<VoiceShared>,
 }
@@ -390,6 +416,9 @@ impl VoiceService {
                     preset_name,
                     saved_params: params,
                     params,
+                    bypass_hotkey: config.voice.bypass_hotkey.clone(),
+                    next_preset_hotkey: config.voice.next_preset_hotkey.clone(),
+                    prev_preset_hotkey: config.voice.prev_preset_hotkey.clone(),
                     user_presets: config.voice_presets.clone(),
                     draft: None,
                     pending_save_rollback: None,
@@ -441,6 +470,116 @@ impl VoiceService {
         });
         presets.append(&mut users);
         presets
+    }
+
+    /// 当前配置的三个人声效果热键：旁路、下一个预设、上一个预设。
+    pub(crate) fn hotkey_specs(&self) -> Vec<String> {
+        let state = self.lock();
+        vec![
+            state.bypass_hotkey.clone(),
+            state.next_preset_hotkey.clone(),
+            state.prev_preset_hotkey.clone(),
+        ]
+    }
+
+    /// 变声配置路径；无会话时用于读取音效热键做跨组校验。
+    pub(crate) fn config_path(&self) -> &Path {
+        &self.shared.config_path
+    }
+
+    /// 只写入 `[voice]` 的三个热键字段，保留磁盘上的其他配置与用户预设。
+    ///
+    /// 先落盘再更新内存：保存失败时下一次启动仍按旧热键绑定。
+    pub(crate) fn save_hotkeys(&self, bypass: &str, next: &str, prev: &str) -> Result<()> {
+        let values = [
+            bypass.trim().to_owned(),
+            next.trim().to_owned(),
+            prev.trim().to_owned(),
+        ];
+        crate::host::with_config_write(|| {
+            let mut config = crate::host::load_config_for_write(self.config_path())?;
+            config.voice.bypass_hotkey.clone_from(&values[0]);
+            config.voice.next_preset_hotkey.clone_from(&values[1]);
+            config.voice.prev_preset_hotkey.clone_from(&values[2]);
+            config.save_to(self.config_path())
+        })?;
+        let mut state = self.lock();
+        state.bypass_hotkey.clone_from(&values[0]);
+        state.next_preset_hotkey.clone_from(&values[1]);
+        state.prev_preset_hotkey.clone_from(&values[2]);
+        Ok(())
+    }
+
+    /// 按热键语义执行动作。
+    ///
+    /// 无会话或变声关闭时旁路只返回提示，不建立临时旁路、也不启动音频；
+    /// 预设热键始终更新待用参数与配置，循环不改变启用状态。
+    pub(crate) fn handle_hotkey(
+        &self,
+        action: VoiceHotkeyAction,
+        session_active: bool,
+    ) -> Result<VoiceHotkeyOutcome> {
+        match action {
+            VoiceHotkeyAction::ToggleBypass => {
+                if !session_active {
+                    return Ok(VoiceHotkeyOutcome {
+                        status: self.status(),
+                        acted: false,
+                        notice: Some("音频未启动，旁路热键不生效".to_owned()),
+                    });
+                }
+                let status = self.status();
+                if !status.enabled {
+                    return Ok(VoiceHotkeyOutcome {
+                        status,
+                        acted: false,
+                        notice: Some("变声未开启，旁路热键不生效".to_owned()),
+                    });
+                }
+                Ok(VoiceHotkeyOutcome {
+                    status: self.set_bypass(!status.bypassed)?,
+                    acted: true,
+                    notice: None,
+                })
+            }
+            VoiceHotkeyAction::NextPreset => Ok(VoiceHotkeyOutcome {
+                status: self.cycle_preset(true)?,
+                acted: true,
+                notice: None,
+            }),
+            VoiceHotkeyAction::PrevPreset => Ok(VoiceHotkeyOutcome {
+                status: self.cycle_preset(false)?,
+                acted: true,
+                notice: None,
+            }),
+        }
+    }
+
+    /// 按界面预设顺序循环：六个内置预设按定义顺序，随后用户预设按名称后 ID。
+    fn cycle_preset(&self, forward: bool) -> Result<VoiceStatusDto> {
+        let (ids, current) = {
+            let state = self.lock();
+            let mut ids: Vec<String> = builtin_voice_presets()
+                .iter()
+                .map(|preset| preset.id.clone())
+                .collect();
+            let mut users = state.user_presets.clone();
+            users.sort_by(|left, right| {
+                left.name
+                    .cmp(&right.name)
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            ids.extend(users.into_iter().map(|preset| preset.id));
+            (ids, state.preset_id.clone())
+        };
+        anyhow::ensure!(!ids.is_empty(), "没有可用的变声预设");
+        let index = ids.iter().position(|id| *id == current).unwrap_or(0);
+        let next = if forward {
+            (index + 1) % ids.len()
+        } else {
+            (index + ids.len() - 1) % ids.len()
+        };
+        self.select_preset(&ids[next])
     }
 
     /// 新会话发布后绑定控制句柄；会话重建会清除临时旁路。

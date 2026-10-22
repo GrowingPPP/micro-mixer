@@ -1830,6 +1830,38 @@ test('启用开关发送变声命令', async () => {
   assert.equal(toggle.checked, true);
 });
 
+test('人声效果热键输入只发送变声热键命令', async () => {
+  const app = await boot({ onInvoke(command) {
+    if (command === 'load_config') {
+      return { items, dir: '', hotkeys: ',F2',
+        voice_hotkeys: { bypass: 'F9', next: 'F10', prev: 'F8' } };
+    }
+    const voice = voiceFixture(command);
+    if (voice !== undefined) return voice;
+    if (command === 'voice_set_hotkeys') return voiceSnapshot({ generation: 2 });
+  } });
+  const bypass = app.document.getElementById('voiceKeyBypass');
+  const next = app.document.getElementById('voiceKeyNext');
+  const prev = app.document.getElementById('voiceKeyPrev');
+  assert.ok(bypass && next && prev, '设置面板应有人声效果热键组');
+  assert.equal(bypass.value, 'F9');
+  assert.equal(next.value, 'F10');
+  assert.equal(prev.value, 'F8');
+
+  const before = app.calls.length;
+  bypass.value = 'F11';
+  await bypass.emit('change');
+  await flush();
+  const later = app.calls.slice(before);
+  assert.deepEqual(later.filter(call => call.command === 'voice_set_hotkeys'), [
+    { command: 'voice_set_hotkeys', args: { bypass: 'F11', next: 'F10', prev: 'F8' } },
+  ], '输入变化只发送人声热键命令');
+  assert.equal(later.some(call => call.command === 'save_config'), false,
+    '人声热键不能混入全量配置保存');
+  assert.equal(later.some(call => ['start', 'stop', 'release'].includes(call.command)), false,
+    '人声热键不能重启音频会话');
+});
+
 test('预设选择不自动启用', async () => {
   const app = await boot({ onInvoke(command) {
     const voice = voiceFixture(command);
