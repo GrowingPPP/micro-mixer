@@ -1031,49 +1031,8 @@ impl EngineParts {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::alloc::{GlobalAlloc, Layout, System};
+    use crate::test_support::count_allocations;
     use std::cell::Cell;
-
-    struct TrackingAllocator;
-    thread_local! {
-        static ALLOCATIONS: Cell<Option<usize>> = const { Cell::new(None) };
-    }
-
-    // 只记录当前测试线程的分配，避免并行测试影响结果。
-    unsafe impl GlobalAlloc for TrackingAllocator {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            let _ = ALLOCATIONS.try_with(|count| {
-                if let Some(n) = count.get() {
-                    count.set(Some(n + 1));
-                }
-            });
-            // SAFETY: 原样转发调用方提供的合法分配布局。
-            unsafe { System.alloc(layout) }
-        }
-
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            // SAFETY: 使用与 System.alloc 相同的布局释放其返回的指针。
-            unsafe { System.dealloc(ptr, layout) }
-        }
-    }
-
-    #[global_allocator]
-    static TEST_ALLOCATOR: TrackingAllocator = TrackingAllocator;
-
-    fn count_allocations(f: impl FnOnce()) -> usize {
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                ALLOCATIONS.with(|count| count.set(None));
-            }
-        }
-        ALLOCATIONS.with(|count| count.set(Some(0)));
-        let reset = Reset;
-        f();
-        let n = ALLOCATIONS.with(|count| count.get().unwrap());
-        drop(reset);
-        n
-    }
 
     fn 空槽位() -> Vec<SfxSlot> {
         Vec::new()

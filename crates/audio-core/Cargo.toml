@@ -13,5 +13,13 @@ log.workspace = true
 rtrb.workspace = true
 symphonia.workspace = true
 
+# 变声后端捆绑 C++ 源码并通过 bindgen 生成绑定，只在启用对应 feature 时编译，
+# 避免默认构建依赖 C++ 工具链与 libclang。
+signalsmith-stretch = { version = "0.1.3", optional = true }
+
+[features]
+default = []
+voice-signalsmith = ["dep:signalsmith-stretch"]
+
 [lints]
 workspace = true
