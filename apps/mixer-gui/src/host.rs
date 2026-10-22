@@ -811,6 +811,9 @@ impl AudioHost {
         //    这个泄漏被"停止=彻底关闭"的旧语义掩盖了很久，改待机后才暴露出来。
         self.release_inner();
         *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // 上一次“音频未启动”之类的提示在新一轮启动开始时失效；
+        // 本轮启动后段记录的冲突/绑定提示不能被发布动作清掉。
+        self.dismiss_voice_notice();
 
         let b = CpalBackend::new();
 
@@ -1117,17 +1120,26 @@ impl AudioHost {
             self.attach_voice_control(voice_control);
         }
         if let Some(unpublished) = unpublished {
-            if let Some(shared) = self
-                .remote
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-            {
-                shared.clear();
-            }
-            self.close_running(unpublished);
+            self.discard_unpublished_session(unpublished);
         }
         Ok(())
+    }
+
+    /// 被取代的启动从未发布，但它的槽位热键已装入宿主级集合，必须一并归还。
+    ///
+    /// 调用方持有生命周期锁，更新会话不可能在此时完成发布，因此不会误清
+    /// 已提交会话的热键。
+    fn discard_unpublished_session(&self, running: Running) {
+        if let Some(shared) = self
+            .remote
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            shared.clear();
+        }
+        self.end_session_hotkeys();
+        self.close_running(running);
     }
 
     /// Commit ownership and its routable generation together. No reservation can
@@ -1152,8 +1164,6 @@ impl AudioHost {
         self.audio_requests
             .generation
             .store(generation, Ordering::Release);
-        // 会话已发布，旧的“音频未启动”提示不再成立。
-        self.dismiss_voice_notice();
         None
     }
 
@@ -2373,6 +2383,9 @@ impl AudioHost {
         {
             return Ok(());
         }
+        // 启动时槽位热键尚未绑定，但配置里的键位仍会与常驻的人声热键冲突。
+        let slot_specs = self.slot_hotkey_specs();
+        hotkeys::validate_disjoint(&[&slot_specs, &specs]).context("人声效果热键与音效热键冲突")?;
         let (bound, how) = self.bind_hotkeys_on_main_thread(app, &specs)?;
         println!("[人声热键] 绑定成功（{how}）");
         self.install_voice_hotkeys(bound)?;

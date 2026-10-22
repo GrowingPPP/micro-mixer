@@ -115,7 +115,7 @@ fn preview_test_host() -> AudioHost {
     host
 }
 
-fn fixture() -> (AudioHost, FakeBackend) {
+fn running_fixture() -> (Running, FakeBackend) {
     let cfg = config();
     let backend = FakeBackend::default();
     let format = StreamFormat::stereo(44_100);
@@ -146,22 +146,10 @@ fn fixture() -> (AudioHost, FakeBackend) {
         backend.clone(),
     )
     .unwrap();
-    let playback = session.playback.clone();
-    let host = preview_test_host();
-    host.next_generation.store(1, Ordering::Relaxed);
-    host.audio_requests.register_session(1);
-    let shared = Arc::new(remote::Shared::default());
-    shared.set_routed(
-        playback.control.clone(),
-        vec!["Good".into()],
-        host.play_handler(playback.clone(), 1),
-        host.remote_stop_handler(playback.clone(), 1),
-    );
-    *host.remote.lock().unwrap() = Some(shared);
-    *host.running.lock().unwrap() = Some(Running {
+    let running = Running {
         generation: 1,
         stats: session.stats.clone(),
-        playback,
+        playback: session.playback.clone(),
         session,
         slots_meta: vec![SlotDto {
             index: 0,
@@ -183,8 +171,66 @@ fn fixture() -> (AudioHost, FakeBackend) {
         skipped_notes: vec!["Invalid".into()],
         cfg_key: cfg_fingerprint(&cfg),
         cfg,
-    });
+    };
+    (running, backend)
+}
+
+fn fixture() -> (AudioHost, FakeBackend) {
+    let (running, backend) = running_fixture();
+    let host = preview_test_host();
+    host.next_generation.store(1, Ordering::Relaxed);
+    host.audio_requests.register_session(1);
+    let playback = running.playback.clone();
+    let shared = Arc::new(remote::Shared::default());
+    shared.set_routed(
+        playback.control.clone(),
+        vec!["Good".into()],
+        host.play_handler(playback.clone(), 1),
+        host.remote_stop_handler(playback.clone(), 1),
+    );
+    *host.remote.lock().unwrap() = Some(shared);
+    *host.running.lock().unwrap() = Some(running);
     (host, backend)
+}
+
+#[test]
+fn 启动阶段记录的人声提示在会话发布后仍然可见() {
+    let host = preview_test_host();
+    let (running, _backend) = running_fixture();
+    host.record_voice_notice("热键冲突，未绑定：F9");
+
+    let unpublished = host.publish_running(running, None);
+
+    assert!(unpublished.is_none());
+    let status = host.status();
+    assert!(status.running);
+    assert_eq!(
+        status.voice_notice.as_deref(),
+        Some("热键冲突，未绑定：F9"),
+        "发布成功不能清掉本轮启动刚记录的提示"
+    );
+    assert!(status.voice_notice_generation > 0);
+}
+
+#[test]
+fn 被取代的启动归还宿主级槽位热键() {
+    let host = preview_test_host();
+    let (running, _backend) = running_fixture();
+    let (manager, _registrations) = hotkeys::test_support::manager().unwrap();
+    *host.hotkey_manager.lock().unwrap() = Some(manager.clone());
+    let slot = Hotkeys::bind_with(manager, &["F1".into()]).unwrap();
+    host.install_slot_hotkeys(Some(slot)).unwrap();
+    *host.slot_action.lock().unwrap() = Some(host.play_handler(running.playback.clone(), 1));
+    assert!(host.hotkeys.lock().unwrap().slots_bound());
+
+    host.discard_unpublished_session(running);
+
+    assert!(
+        !host.hotkeys.lock().unwrap().slots_bound(),
+        "被取代且未发布的启动必须归还槽位热键"
+    );
+    assert!(host.slot_action.lock().unwrap().is_none());
+    assert!(host.running.lock().unwrap().is_none());
 }
 
 #[cfg(feature = "voice")]
@@ -2012,6 +2058,10 @@ fn combo_session_publication_rejects_old_start_but_transfers_committed_owner_to_
     for cancelled_before_commit in [false, true] {
         let (host, _) = fixture();
         host.release();
+        let (manager, _registrations) = hotkeys::test_support::manager().unwrap();
+        *host.hotkey_manager.lock().unwrap() = Some(manager.clone());
+        let slot = Hotkeys::bind_with(manager, &["F1".into()]).unwrap();
+        host.install_slot_hotkeys(Some(slot)).unwrap();
         let (prepared_host, prepared_audio) = fixture();
         let mut running = prepared_host.running.lock().unwrap().take().unwrap();
         running.generation = 2;
@@ -2030,8 +2080,13 @@ fn combo_session_publication_rejects_old_start_but_transfers_committed_owner_to_
         let rejected = host.publish_running(running, Some(start));
         if cancelled_before_commit {
             assert!(!host.status().passthrough);
-            shared.clear();
-            host.close_running(rejected.expect("a superseded start cannot publish its owner"));
+            host.discard_unpublished_session(
+                rejected.expect("a superseded start cannot publish its owner"),
+            );
+            assert!(
+                !host.hotkeys.lock().unwrap().slots_bound(),
+                "被取代的启动必须归还槽位热键"
+            );
             for callback in prepared_audio.outputs.lock().unwrap().iter_mut() {
                 let mut pcm = [1.0; 8_192];
                 callback(&mut pcm);
@@ -2053,6 +2108,10 @@ fn combo_session_publication_rejects_old_start_but_transfers_committed_owner_to_
             assert!(
                 host.status().passthrough,
                 "committed owner remains the host's responsibility"
+            );
+            assert!(
+                host.hotkeys.lock().unwrap().slots_bound(),
+                "已提交会话保留槽位热键"
             );
             for callback in prepared_audio.outputs.lock().unwrap().iter_mut() {
                 let mut pcm = [0.0; 8_192];
@@ -2490,6 +2549,40 @@ fn voice_config_with_hotkeys(enabled: bool) -> app_config::Config {
         },
         ..app_config::Config::default()
     }
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 启动初始化校验槽位与人声热键冲突() {
+    let dir = TemporaryDir::new();
+    let path = dir.0.join("config.toml");
+    let mut config = voice_config_with_hotkeys(false);
+    config.sound_files = vec![PathBuf::from("/sounds/a.wav")];
+    config.hotkeys = vec!["F9".into()];
+    config.save_to(&path).unwrap();
+    let mut host = preview_test_host();
+    host.voice = VoiceService::new_with_path(&config, path);
+    install_fake_hotkeys(&host);
+
+    let error = host.initialize_hotkeys(None).unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("F9"),
+        "启动初始化必须报告跨组冲突：{error:#}"
+    );
+    assert!(
+        !host.hotkeys.lock().unwrap().voice_bound(),
+        "冲突时不能绑定人声热键"
+    );
+    let status = host.status();
+    assert!(
+        status
+            .voice_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("F9")),
+        "冲突提示必须可显示：{:?}",
+        status.voice_notice
+    );
 }
 
 #[cfg(feature = "voice")]
