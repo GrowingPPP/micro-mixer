@@ -239,6 +239,8 @@ type VoiceSaveFn = dyn Fn(&Path, &VoiceWrite) -> Result<()> + Send + Sync;
 struct VoiceState {
     enabled: bool,
     bypassed: bool,
+    /// 自检、校准与设备恢复的嵌套暂停层数；只叠加，不覆盖用户状态。
+    suspended: u32,
     preset_id: String,
     preset_name: String,
     /// 当前预设自身的参数，用于判断是否存在未保存修改。
@@ -254,6 +256,18 @@ struct VoiceState {
     save_generation: u64,
     pending_write: Option<VoiceWrite>,
     writer_active: bool,
+}
+
+#[cfg(feature = "voice")]
+impl VoiceState {
+    /// 暂停和临时旁路都只会让运行态更保守，不会改写保存的启用值。
+    fn effective_enabled(&self) -> bool {
+        self.enabled && !self.bypassed && self.suspended == 0
+    }
+
+    fn effective_bypassed(&self) -> bool {
+        self.bypassed || self.suspended > 0
+    }
 }
 
 #[cfg(feature = "voice")]
@@ -311,6 +325,7 @@ impl VoiceService {
                 state: Mutex::new(VoiceState {
                     enabled,
                     bypassed: false,
+                    suspended: 0,
                     preset_id,
                     preset_name,
                     saved_params: params,
@@ -335,8 +350,9 @@ impl VoiceService {
     pub(crate) fn status(&self) -> VoiceStatusDto {
         let state = self.lock();
         VoiceStatusDto {
+            // 开关显示保存的启用值；暂停与临时旁路通过 bypassed 单独表达。
             enabled: state.enabled,
-            bypassed: state.bypassed,
+            bypassed: state.effective_bypassed(),
             phase: state
                 .control
                 .as_ref()
@@ -371,7 +387,7 @@ impl VoiceService {
         state.bypassed = false;
         state.control = Some(control.clone());
         control.set_params(state.params);
-        if state.enabled {
+        if state.effective_enabled() {
             control.request_enable();
         } else {
             control.request_disable();
@@ -379,6 +395,9 @@ impl VoiceService {
     }
 
     /// 会话释放后丢弃旧句柄，旧控制不能再影响之后的命令。
+    ///
+    /// 暂停计数属于调用方生命周期，不能随会话释放清掉；否则自检恢复后
+    /// 会在暂停尚未结束时提前启用人声。
     pub(crate) fn detach(&self) {
         let mut state = self.lock();
         state.control = None;
@@ -390,7 +409,7 @@ impl VoiceService {
         validate_block_ms(block_ms)?;
         let state = self.lock();
         Ok(VoiceOptions {
-            enabled: state.enabled && !state.bypassed,
+            enabled: state.effective_enabled(),
             params: state.params,
             block_ms,
             backend: signalsmith_voice_backend_factory(block_ms),
@@ -477,26 +496,21 @@ impl VoiceService {
         Ok(self.status())
     }
 
-    /// 自检、校准与设备恢复开始前临时旁路；只改运行状态，不写配置。
-    pub(crate) fn suspend(&self) -> VoiceSuspendState {
+    /// 自检、校准与设备恢复开始前叠加一层暂停；只改运行状态，不写配置。
+    ///
+    /// 暂停用计数而不是快照回写：暂停期间用户仍可启用、关闭或旁路变声，
+    /// 恢复时只解除这一层暂停，不能覆盖期间发生的命令。
+    pub(crate) fn suspend(&self) {
         let mut state = self.lock();
-        let saved = VoiceSuspendState {
-            enabled: state.enabled,
-            bypassed: state.bypassed,
-        };
-        state.bypassed = true;
+        state.suspended = state.suspended.saturating_add(1);
         state.operation = state.operation.wrapping_add(1);
-        if let Some(control) = &state.control {
-            control.request_disable();
-        }
-        saved
+        Self::apply_control(&state);
     }
 
-    /// 恢复暂停前的启用与旁路状态。
-    pub(crate) fn restore(&self, saved: VoiceSuspendState) {
+    /// 解除一层暂停；用户状态保持命令后的最新值。
+    pub(crate) fn restore(&self) {
         let mut state = self.lock();
-        state.enabled = saved.enabled;
-        state.bypassed = saved.bypassed;
+        state.suspended = state.suspended.saturating_sub(1);
         state.operation = state.operation.wrapping_add(1);
         Self::apply_control(&state);
     }
@@ -506,7 +520,7 @@ impl VoiceService {
             return;
         };
         control.set_params(state.params);
-        if state.enabled && !state.bypassed {
+        if state.effective_enabled() {
             control.request_enable();
         } else {
             control.request_disable();
@@ -562,14 +576,6 @@ impl VoiceService {
     }
 }
 
-/// 暂停前的启用与旁路状态，由调用方原样传回 [`VoiceService::restore`]。
-#[cfg(feature = "voice")]
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct VoiceSuspendState {
-    enabled: bool,
-    bypassed: bool,
-}
-
 #[cfg(feature = "voice")]
 fn validate_block_ms(block_ms: f32) -> Result<()> {
     anyhow::ensure!(
@@ -615,11 +621,13 @@ fn run_writer(shared: Arc<VoiceShared>) {
     }
 }
 
-/// 在进程级写入门内重读磁盘配置，只修改变声启用与激活预设后原子保存。
+/// 在进程级写入门内严格重读磁盘配置，只修改变声启用与激活预设后原子保存。
+///
+/// 读取失败时保留原文件并返回错误，不能把默认配置写回去覆盖音效库与预设。
 #[cfg(feature = "voice")]
 fn save_voice_snapshot(path: &Path, write: &VoiceWrite) -> Result<()> {
     crate::host::with_config_write(|| {
-        let mut config = Config::load_from(path);
+        let mut config = crate::host::load_config_for_write(path)?;
         config.voice.enabled = write.enabled;
         config.voice.active_preset = write.preset_id.clone();
         config.save_to(path)

@@ -436,32 +436,68 @@ fn 变声释放后重建使用最新配置() {
 #[cfg(feature = "voice")]
 #[test]
 fn 变声自检与校准期间临时旁路并在结束后恢复() {
-    let dir = TemporaryDir::new();
-    let mut host = preview_test_host();
-    host.voice =
-        VoiceService::new_with_path(&app_config::Config::default(), dir.0.join("config.toml"));
-    let control = VoiceControl::new(VoiceParams::neutral());
-    host.attach_voice_control(Some(control.clone()));
+    let (host, _backend, dir) = voice_fixture(true);
     host.voice_set_enabled(true).unwrap();
+    host.voice.flush_saves();
+    assert_eq!(host.voice_status().phase, "warmup");
 
-    host.with_suspended(None, || {
-        let status = host.voice_status();
-        assert!(status.bypassed, "自检期间必须临时旁路人声链");
-        assert_eq!(status.phase, "off", "旁路期间输出干声");
-        Ok(())
-    })
-    .unwrap();
+    host.voice.suspend();
+    let options = host
+        .voice
+        .prepare_options(crate::voice::DEFAULT_VOICE_BLOCK_MS)
+        .unwrap();
+    assert!(!options.enabled, "暂停期间重建会话也不得启用人声");
+    assert!(host.voice_status().bypassed);
+    assert_eq!(host.voice_status().phase, "off", "旁路期间输出干声");
 
+    // 生产释放路径会 detach 控制句柄，但暂停层必须保留到 restore。
+    host.release_inner();
+    assert!(host.voice_control.lock().unwrap().is_none());
+    assert!(host.voice_status().bypassed);
+    assert_eq!(host.voice_status().phase, "off");
+
+    host.voice.restore();
     let status = host.voice_status();
     assert!(status.enabled);
     assert!(!status.bypassed);
-    assert_eq!(control.phase(), VoicePhase::Warmup);
+
+    // 模拟恢复音频后绑定新会话句柄。
+    let rebuilt = VoiceControl::new(VoiceParams::neutral());
+    host.attach_voice_control(Some(rebuilt.clone()));
+    assert_eq!(rebuilt.phase(), VoicePhase::Warmup);
     host.voice.flush_saves();
     assert!(
         app_config::Config::load_from(&dir.0.join("config.toml"))
             .voice
             .enabled,
         "自检暂停与恢复不得改写启用配置"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 变声暂停期间的关闭命令不会被恢复覆盖() {
+    let (host, _backend, dir) = voice_fixture(true);
+    host.voice.suspend();
+    host.voice_set_enabled(false).unwrap();
+    assert!(
+        host.voice_status().bypassed,
+        "暂停层仍在时即使显式关闭也应保持干声"
+    );
+
+    host.release_inner();
+    host.voice.restore();
+
+    let status = host.voice_status();
+    assert!(!status.enabled, "恢复不能把暂停期间的关闭命令改回启用");
+    assert!(!status.bypassed);
+    assert_eq!(status.phase, "off");
+    host.voice.flush_saves();
+    assert!(
+        !app_config::Config::load_from(&dir.0.join("config.toml"))
+            .voice
+            .enabled,
+        "暂停期间的关闭命令必须保持落盘结果"
     );
 }
 

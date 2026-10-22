@@ -36,6 +36,11 @@ fn service(dir: &TemporaryDir) -> VoiceService {
 
 fn user_config() -> Config {
     let mut config = Config::default();
+    config.voice.enabled = true;
+    config.voice.active_preset = "builtin:male".into();
+    config.voice.bypass_hotkey = "F9".into();
+    config.voice.next_preset_hotkey = "F10".into();
+    config.voice.prev_preset_hotkey = "F8".into();
     config.voice_presets.push(app_config::VoicePreset {
         id: "user:test-abcdef".into(),
         name: "测试预设".into(),
@@ -294,7 +299,7 @@ fn 变声暂停期间临时旁路并在结束后恢复() {
     service.set_enabled(true).unwrap();
     service.flush_saves();
 
-    let saved = service.suspend();
+    service.suspend();
     assert!(service.status().bypassed);
     assert_eq!(control.phase(), VoicePhase::Off);
     service.flush_saves();
@@ -303,13 +308,60 @@ fn 变声暂停期间临时旁路并在结束后恢复() {
         "自检暂停不得改写启用配置"
     );
 
-    service.restore(saved);
+    service.restore();
     let status = service.status();
     assert!(!status.bypassed);
     assert!(status.enabled);
     assert_eq!(control.phase(), VoicePhase::Warmup);
     service.flush_saves();
     assert!(Config::load_from(&config_path(&dir)).voice.enabled);
+}
+
+#[test]
+fn 变声暂停期间命令不被恢复覆盖() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    service.set_enabled(true).unwrap();
+
+    service.suspend();
+    service.set_enabled(false).unwrap();
+    assert!(
+        service.status().bypassed,
+        "暂停层仍在时即使显式命令清除旁路也应保持干声"
+    );
+
+    service.restore();
+    let status = service.status();
+    assert!(!status.enabled, "恢复不能把暂停期间的关闭命令改回启用");
+    assert!(!status.bypassed);
+    assert_eq!(control.phase(), VoicePhase::Off);
+    service.flush_saves();
+    assert!(
+        !Config::load_from(&config_path(&dir)).voice.enabled,
+        "暂停期间的关闭命令必须保持落盘结果"
+    );
+}
+
+#[test]
+fn 变声多层暂停逐层恢复() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    service.set_enabled(true).unwrap();
+
+    service.suspend();
+    service.suspend();
+    service.restore();
+    assert!(service.status().bypassed, "还有一层暂停时不得提前启用");
+    assert_eq!(control.phase(), VoicePhase::Off);
+
+    service.restore();
+    let status = service.status();
+    assert!(!status.bypassed);
+    assert_eq!(control.phase(), VoicePhase::Warmup);
 }
 
 #[test]
@@ -384,6 +436,67 @@ fn 变声完整保存保留磁盘变声配置与用户预设() {
     let saved = Config::load_from(&path);
     assert_eq!(saved.voice, config.voice);
     assert_eq!(saved.voice_presets, config.voice_presets);
+}
+
+#[test]
+fn 变声配置读取失败不写盘并报告错误() {
+    let dir = TemporaryDir::new();
+    let path = config_path(&dir);
+    let original = vec![0xff, 0xfe, 0x00, b'['];
+    std::fs::write(&path, &original).unwrap();
+
+    let service = VoiceService::new_with_path(&Config::default(), path.clone());
+    service.set_enabled(true).unwrap();
+    service.flush_saves();
+
+    let status = service.status();
+    assert!(status.enabled);
+    assert!(
+        status
+            .save_error
+            .as_deref()
+            .is_some_and(|error| error.contains("读取配置文件失败")),
+        "读取失败必须进入保存错误，实际 {:?}",
+        status.save_error
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        original,
+        "读取失败时不得用默认配置覆盖原文件"
+    );
+
+    let error = crate::save_config_at(
+        &path,
+        Vec::new(),
+        false,
+        None,
+        None,
+        String::new(),
+        None,
+        None,
+        20,
+        0.0,
+        -6.0,
+        String::new(),
+    )
+    .unwrap_err();
+    assert!(error.contains("读取配置文件失败"));
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+}
+
+#[test]
+fn 变声配置缺失时按默认值创建() {
+    let dir = TemporaryDir::new();
+    let path = config_path(&dir);
+    assert!(!path.exists());
+
+    let service = VoiceService::new_with_path(&Config::default(), path.clone());
+    service.set_enabled(true).unwrap();
+    service.flush_saves();
+
+    assert!(service.status().save_error.is_none());
+    assert!(path.exists());
+    assert!(Config::load_from(&path).voice.enabled);
 }
 
 #[test]

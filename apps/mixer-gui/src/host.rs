@@ -218,6 +218,20 @@ pub(crate) fn with_config_write<T, E>(
     action()
 }
 
+/// 写入前的严格读取：只有文件不存在才用默认值。
+///
+/// 权限、编码等读取失败必须返回错误；否则整份默认配置会被写回磁盘，
+/// 抹掉音效库、热键与用户预设。
+pub(crate) fn load_config_for_write(path: &Path) -> Result<app_config::Config> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => Ok(app_config::Config::parse(&text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(app_config::Config::default())
+        }
+        Err(error) => Err(error).with_context(|| format!("读取配置文件失败: {}", path.display())),
+    }
+}
+
 // ─────────────────────────────────────────── 宿主
 
 struct Running {
@@ -1344,9 +1358,9 @@ impl AudioHost {
         test: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
         let _operation = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
-        // 自检、校准与设备恢复期间不使用人声；只暂停运行状态，不改配置。
+        // 自检、校准与设备恢复期间不使用人声；只叠加暂停层，不改配置。
         #[cfg(feature = "voice")]
-        let saved_voice = self.voice.suspend();
+        self.voice.suspend();
         let saved = self
             .running
             .lock()
@@ -1372,7 +1386,7 @@ impl AudioHost {
             None
         };
         #[cfg(feature = "voice")]
-        self.voice.restore(saved_voice);
+        self.voice.restore();
         if let Some(error) = restore_error {
             return Err(error);
         }

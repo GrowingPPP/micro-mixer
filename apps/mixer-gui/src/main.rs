@@ -762,7 +762,8 @@ pub(crate) fn save_config_at(
     hotkeys: String,
 ) -> Result<(), String> {
     crate::host::with_config_write(|| {
-        let mut c = Config::load_from(path);
+        let mut c =
+            crate::host::load_config_for_write(path).map_err(|error| format!("{error:#}"))?;
         c.sound_dirs = if dir.trim().is_empty() {
             Vec::new()
         } else {
