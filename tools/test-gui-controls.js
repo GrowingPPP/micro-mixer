@@ -2465,3 +2465,101 @@ test('窄窗口面板内部滚动且完成按钮可见', async () => {
   const footer = done.closest('.dialog-footer');
   assert.ok(footer && footer.parentElement === dialog, '完成按钮应位于对话框底部操作区');
 });
+
+// ── 三秒人声试听按钮 ───────────────────────────────────────
+
+const voicePreviewSnapshot = (state, patch = {}) => voiceSnapshot({
+  preview: { state, elapsed_ms: 0, reason: null, ...patch },
+});
+
+test('试听空闲时点击发送启动并按回复更新状态', async () => {
+  let starts = 0;
+  const app = await boot({ running: true, onInvoke(command) {
+    if (command === 'voice_preview_start') {
+      starts++;
+      return voicePreviewSnapshot('preparing', { generation: 2 });
+    }
+    if (command === 'voice_status') return voiceSnapshot();
+    if (command === 'status') return playbackStatus({ voice: voiceSnapshot() });
+    return voiceFixture(command);
+  } });
+  const button = app.document.getElementById('voicePreview');
+  assert.equal(button.textContent, '试听 3 秒');
+  assert.equal(button.disabled, false);
+
+  await button.emit('click');
+  await flush();
+  assert.equal(starts, 1, '空闲点击应发送启动命令');
+  assert.equal(button.textContent, '准备试听…');
+  assert.equal(app.calls.filter(call => call.command === 'voice_preview_stop').length, 0);
+});
+
+test('试听录制中显示进度并点击立即发送停止', async () => {
+  let stopped = 0;
+  const recording = voicePreviewSnapshot('recording', { elapsed_ms: 2000 });
+  const app = await boot({ running: true, onInvoke(command) {
+    if (command === 'voice_preview_stop') {
+      stopped++;
+      return voiceSnapshot({ generation: 3 });
+    }
+    if (command === 'voice_status') return recording;
+    if (command === 'status') return playbackStatus({ voice: recording });
+    return voiceFixture(command);
+  } });
+  const button = app.document.getElementById('voicePreview');
+  assert.equal(button.disabled, false, '录制中按钮必须可点击取消');
+  assert.match(button.textContent, /录制中 0:02/);
+  assert.match(button.textContent, /点击取消/);
+  assert.match(app.document.getElementById('previewHint').textContent, /录制 3 秒/);
+
+  await button.emit('click');
+  await flush();
+  assert.equal(stopped, 1, '第二次点击必须立即发送停止命令');
+  assert.equal(button.textContent, '试听 3 秒');
+  assert.equal(app.calls.filter(call => call.command === 'voice_preview_start').length, 0);
+});
+
+test('试听回放中点击发送停止且准备中可取消', async () => {
+  const playing = voicePreviewSnapshot('playing');
+  const playingApp = await boot({ running: true, onInvoke(command) {
+    if (command === 'voice_preview_stop') return voiceSnapshot({ generation: 3 });
+    if (command === 'voice_status') return playing;
+    if (command === 'status') return playbackStatus({ voice: playing });
+    return voiceFixture(command);
+  } });
+  const playingButton = playingApp.document.getElementById('voicePreview');
+  assert.equal(playingButton.textContent, '▶ 回放中 · 点击停止');
+  await playingButton.emit('click');
+  await flush();
+  assert.equal(playingApp.calls.filter(call => call.command === 'voice_preview_stop').length, 1);
+
+  const preparing = voicePreviewSnapshot('preparing');
+  const preparingApp = await boot({ running: true, onInvoke(command) {
+    if (command === 'voice_preview_stop') return voiceSnapshot({ generation: 3 });
+    if (command === 'voice_status') return preparing;
+    if (command === 'status') return playbackStatus({ voice: preparing });
+    return voiceFixture(command);
+  } });
+  const preparingButton = preparingApp.document.getElementById('voicePreview');
+  assert.equal(preparingButton.textContent, '准备试听…');
+  await preparingButton.emit('click');
+  await flush();
+  assert.equal(preparingApp.calls.filter(call => call.command === 'voice_preview_stop').length, 1);
+});
+
+test('试听启动失败显示具体原因并保留重试入口', async () => {
+  const failed = voicePreviewSnapshot('unavailable', {
+    reason: '试听输出失败：系统没有默认输出设备（试听需要它）',
+  });
+  const app = await boot({ running: true, onInvoke(command) {
+    if (command === 'voice_status') return failed;
+    if (command === 'status') return playbackStatus({ voice: failed });
+    return voiceFixture(command);
+  } });
+  const button = app.document.getElementById('voicePreview');
+  const hint = app.document.getElementById('previewHint');
+  assert.equal(button.disabled, false, '临时失败必须允许重试');
+  assert.equal(button.textContent, '试听 3 秒');
+  assert.match(hint.textContent, /试听输出失败/);
+  assert.match(button.title, /试听输出失败/);
+});

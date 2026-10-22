@@ -197,6 +197,8 @@ const voiceState = {
   loaded: false, enabled: false, bypassed: false,
   presetId: '', presetName: '', modified: false,
   draftAvailable: false, saveError: null,
+  // 试听状态由宿主快照提供；录制进度随 250 ms 轮询更新。
+  previewState: 'idle', previewElapsedMs: 0, previewReason: '',
   params: neutralVoiceParams(),
 };
 // 参数值直接对应 VoiceParams，开关不用哨兵值表达关闭。
@@ -223,7 +225,7 @@ let voicePresets = [];
 let voicePresetLoadVersion = 0;
 let voiceAppliedGeneration = -1;
 let voiceEditVersion = 0;
-const voicePending = { enabled: 0, preset: 0, params: 0, draft: 0 };
+const voicePending = { enabled: 0, preset: 0, params: 0, draft: 0, preview: 0 };
 let voiceLocalParams = new Set();
 let voiceParamTimer = null;
 let voiceNameMode = '';
@@ -735,13 +737,53 @@ function renderVoiceEditState() {
   el.voiceSaveChanges.disabled = !isUserVoicePreset() || !voiceState.modified;
 }
 
+function previewClock(ms) {
+  const seconds = Math.max(0, Math.floor((Number.isFinite(ms) ? ms : 0) / 1000));
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+}
+
 function syncVoicePreview() {
   const sessionAlive = state.running || state.standby;
+  const preview = voiceState.previewState;
+  const soundBusy = !!state.lastStatus?.preview_playing;
   const reason = !sessionAlive ? '音频未启动'
-    : state.lastStatus?.preview_playing ? '本机试听占用中' : '';
-  el.voicePreview.disabled = !!reason;
-  el.voicePreview.title = reason || '录制 3 秒后本机回放，不送给对方';
-  el.previewHint.textContent = reason || '试听只在本机回放，不送给对方。';
+    : preview === 'idle' && soundBusy ? '本机试听占用中'
+    : preview === 'unavailable' && voiceState.previewReason ? voiceState.previewReason
+    : '';
+
+  if (preview === 'recording') {
+    el.voicePreview.textContent = `● 录制中 ${previewClock(voiceState.previewElapsedMs)} · 点击取消`;
+  } else if (preview === 'playing') {
+    el.voicePreview.textContent = '▶ 回放中 · 点击停止';
+  } else if (preview === 'preparing') {
+    el.voicePreview.textContent = '准备试听…';
+  } else {
+    el.voicePreview.textContent = '试听 3 秒';
+  }
+
+  const active = preview === 'preparing' || preview === 'recording' || preview === 'playing';
+  // 只有“音频未启动”和“本机试听占用中”属于不可重试的禁用态；
+  // 输出失败、记录为空等原因保留按钮，用户可直接重试。
+  const hardUnavailable = reason === '音频未启动' || reason === '本机试听占用中';
+  el.voicePreview.disabled = !active && hardUnavailable;
+  el.voicePreview.title = reason
+    || (active ? '点击取消本次试听' : '录制 3 秒后本机回放，不送给对方');
+  el.previewHint.textContent = reason
+    || (preview === 'recording' ? '正在录制 3 秒人声，只在本机回放。'
+      : preview === 'playing' ? '回放只在本机，不送给对方。'
+      : '试听只在本机回放，不送给对方。');
+}
+
+function previewSnapshotFrom(snapshot) {
+  const preview = snapshot && typeof snapshot.preview === 'object' ? snapshot.preview : {};
+  const state = ['preparing', 'recording', 'playing', 'unavailable'].includes(preview.state)
+    ? preview.state : 'idle';
+  const elapsed = Number(preview.elapsed_ms);
+  return {
+    state,
+    elapsedMs: Number.isFinite(elapsed) ? Math.max(0, elapsed) : 0,
+    reason: typeof preview.reason === 'string' ? preview.reason : '',
+  };
 }
 
 function voicePresetOption(id) {
@@ -829,10 +871,14 @@ function applyVoiceSnapshot(snapshot, { fromPoll = false, requestVersion = null 
   const paramsPending = voicePending.params || voicePending.draft;
   const saveError = voiceSaveErrorFrom(snapshot);
   const draftAvailable = snapshot.draft_available === true;
-  // 同一代次下只有保存结果与草稿标记可能变化；其余字段相同则跳过重绘。
+  const preview = previewSnapshotFrom(snapshot);
+  // 同一代次下只有保存结果、草稿标记与试听进度可能变化；其余字段相同则跳过重绘。
   if (fromPoll && !voicePending.enabled && !presetPending && !paramsPending
       && Number.isFinite(generation) && generation === voiceAppliedGeneration
-      && saveError === voiceState.saveError && draftAvailable === voiceState.draftAvailable) {
+      && saveError === voiceState.saveError && draftAvailable === voiceState.draftAvailable
+      && preview.state === voiceState.previewState
+      && preview.elapsedMs === voiceState.previewElapsedMs
+      && preview.reason === voiceState.previewReason) {
     return;
   }
   voiceState.loaded = true;
@@ -854,6 +900,9 @@ function applyVoiceSnapshot(snapshot, { fromPoll = false, requestVersion = null 
   voiceState.draftAvailable = draftAvailable;
   voiceState.saveError = saveError;
   voiceState.bypassed = snapshot.bypassed === true;
+  voiceState.previewState = preview.state;
+  voiceState.previewElapsedMs = preview.elapsedMs;
+  voiceState.previewReason = preview.reason;
   if (Number.isFinite(generation)) voiceAppliedGeneration = Math.max(voiceAppliedGeneration, generation);
   renderVoice();
 }
@@ -898,6 +947,22 @@ async function openVoicePanel() {
 el.voiceEdit.addEventListener('click', openVoicePanel);
 el.voiceClose.addEventListener('click', closeModal);
 el.voiceDone.addEventListener('click', closeModal);
+
+el.voicePreview.addEventListener('click', () => {
+  if (el.voicePreview.disabled) return;
+  const active = ['preparing', 'recording', 'playing'].includes(voiceState.previewState);
+  const token = markVoicePending('preview');
+  if (active) {
+    // 第二次点击立即清掉进度；宿主停止命令照常排队执行。
+    voiceState.previewState = 'idle';
+    voiceState.previewElapsedMs = 0;
+    voiceState.previewReason = '';
+    renderVoice();
+  }
+  runVoiceCommand('preview', token,
+    active ? 'voice_preview_stop' : 'voice_preview_start', undefined,
+    active ? '停止人声试听失败' : '启动人声试听失败');
+});
 
 el.voiceEnabled.addEventListener('change', () => {
   const enabled = !!el.voiceEnabled.checked;

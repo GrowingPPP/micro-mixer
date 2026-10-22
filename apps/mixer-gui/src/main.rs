@@ -633,6 +633,25 @@ fn voice_restore_draft(host: State<'_, AudioHost>) -> Res<VoiceStatusDto> {
     host.voice_restore_draft().map_err(err)
 }
 
+/// 试听会等待旧试听输出关闭，必须在后台线程执行，不能阻塞 WebView。
+#[tauri::command]
+async fn voice_preview_start(app: tauri::AppHandle) -> Res<VoiceStatusDto> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<AudioHost>().voice_preview_start().map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+
+#[tauri::command]
+async fn voice_preview_stop(app: tauri::AppHandle) -> Res<VoiceStatusDto> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<AudioHost>().voice_preview_stop().map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+
 #[tauri::command]
 fn voice_set_hotkeys(
     host: State<'_, AudioHost>,
@@ -1260,6 +1279,8 @@ fn main() {
             voice_rename_preset,
             voice_delete_preset,
             voice_restore_draft,
+            voice_preview_start,
+            voice_preview_stop,
             voice_set_hotkeys,
             frontend_ready,
             load_config,

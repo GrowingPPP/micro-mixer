@@ -1393,3 +1393,104 @@ fn 遥控写入检查与退休在同一状态锁内() {
     let saved = Config::load_from(&path);
     assert!(saved.voice.enabled, "旧闭包不能覆盖退休前完成的配置写入");
 }
+
+// ── 三秒人声试听的状态机 ─────────────────────────────────────
+
+#[test]
+fn 试听状态经历准备录制回放与取消() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+
+    let generation = service.preview_begin();
+    let preview = service.status().preview;
+    assert_eq!(preview.state, "preparing");
+    assert_eq!(preview.elapsed_ms, 0);
+    assert!(preview.reason.is_none());
+    assert!(service.preview_is_current(generation));
+
+    service.preview_mark_recording(generation);
+    std::thread::sleep(Duration::from_millis(20));
+    let preview = service.status().preview;
+    assert_eq!(preview.state, "recording");
+    assert!(preview.elapsed_ms >= 10, "录制进度应来自实际经过时间");
+
+    service.preview_mark_playing(generation);
+    assert_eq!(service.status().preview.state, "playing");
+
+    service.preview_finish(generation);
+    let preview = service.status().preview;
+    assert_eq!(preview.state, "idle");
+    assert_eq!(preview.elapsed_ms, 0);
+}
+
+#[test]
+fn 旧试听完成不能覆盖新试听() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+
+    let old = service.preview_begin();
+    let current = service.preview_begin();
+    service.preview_mark_recording(current);
+
+    service.preview_finish(old);
+    service.preview_unavailable(old, "旧试听失败");
+
+    let preview = service.status().preview;
+    assert_eq!(preview.state, "recording", "旧代次结果不能改写新试听");
+    assert!(preview.reason.is_none());
+    assert!(service.preview_is_current(current));
+    assert!(!service.preview_is_current(old));
+}
+
+#[test]
+fn 切换预设与启停旁路取消试听() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+
+    let generation = service.preview_begin();
+    service.select_preset("builtin:male").unwrap();
+    assert_eq!(service.status().preview.state, "idle");
+    assert!(!service.preview_is_current(generation));
+
+    let generation = service.preview_begin();
+    service.set_enabled(false).unwrap();
+    assert_eq!(service.status().preview.state, "idle");
+    assert!(!service.preview_is_current(generation));
+
+    let generation = service.preview_begin();
+    service.set_bypass(true).unwrap();
+    assert_eq!(service.status().preview.state, "idle");
+    assert!(!service.preview_is_current(generation));
+}
+
+#[test]
+fn 试听不可用保留具体原因() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+
+    let generation = service.preview_begin();
+    service.preview_unavailable(generation, "音频未启动");
+    let preview = service.status().preview;
+    assert_eq!(preview.state, "unavailable");
+    assert_eq!(preview.reason.as_deref(), Some("音频未启动"));
+
+    // 下一次开始会替换旧原因。
+    service.preview_begin();
+    let preview = service.status().preview;
+    assert_eq!(preview.state, "preparing");
+    assert!(preview.reason.is_none());
+}
+
+#[test]
+fn 会话释放清除试听状态() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let generation = service.preview_begin();
+    service.preview_mark_recording(generation);
+
+    service.detach();
+
+    let preview = service.status().preview;
+    assert_eq!(preview.state, "idle");
+    assert!(!service.preview_is_current(generation));
+}

@@ -5,7 +5,11 @@
 //! 写入线程落盘：连续操作只保留最新待写快照，旧保存结果不能覆盖新状态。
 
 #[cfg(feature = "voice")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "voice")]
 use std::sync::{Arc, Condvar, Mutex};
+#[cfg(feature = "voice")]
+use std::time::Instant;
 
 use audio_core::voice::VoiceParams;
 use serde::{Deserialize, Serialize};
@@ -20,7 +24,7 @@ use anyhow::Result;
 use app_config::{builtin_voice_presets, Config, VoiceParamsConfig, VoicePreset};
 
 #[cfg(feature = "voice")]
-use audio_core::voice::{VoiceControl, VoicePhase};
+use audio_core::voice::{VoiceControl, VoicePhase, VoicePreviewControl};
 
 #[cfg(feature = "voice")]
 use audio_session::{signalsmith_voice_backend_factory, VoiceOptions};
@@ -116,7 +120,23 @@ pub(crate) struct VoicePresetDto {
     pub params: VoiceParamsDto,
 }
 
-/// 试听状态占位；录制与回放接入后由后续任务补全。
+/// 三秒试听的宿主状态；界面按状态显示按钮文案与进度。
+#[cfg(feature = "voice")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VoicePreviewStatus {
+    Idle,
+    /// 等待变声阶段稳定或输出仲裁，尚未写入记录区。
+    Preparing,
+    Recording {
+        elapsed_ms: u64,
+    },
+    Playing,
+    Unavailable {
+        reason: String,
+    },
+}
+
+/// 试听状态的界面形状；录制进度由状态快照计算。
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct VoicePreviewDto {
     pub state: String,
@@ -130,6 +150,35 @@ impl VoicePreviewDto {
             state: "idle".to_owned(),
             elapsed_ms: 0,
             reason: None,
+        }
+    }
+}
+
+#[cfg(feature = "voice")]
+impl From<&VoicePreviewStatus> for VoicePreviewDto {
+    fn from(status: &VoicePreviewStatus) -> Self {
+        match status {
+            VoicePreviewStatus::Idle => Self::idle(),
+            VoicePreviewStatus::Preparing => Self {
+                state: "preparing".to_owned(),
+                elapsed_ms: 0,
+                reason: None,
+            },
+            VoicePreviewStatus::Recording { elapsed_ms } => Self {
+                state: "recording".to_owned(),
+                elapsed_ms: *elapsed_ms,
+                reason: None,
+            },
+            VoicePreviewStatus::Playing => Self {
+                state: "playing".to_owned(),
+                elapsed_ms: 0,
+                reason: None,
+            },
+            VoicePreviewStatus::Unavailable { reason } => Self {
+                state: "unavailable".to_owned(),
+                elapsed_ms: 0,
+                reason: Some(reason.clone()),
+            },
         }
     }
 }
@@ -333,7 +382,11 @@ struct VoiceState {
     user_presets: Vec<VoicePreset>,
     draft: Option<VoiceDraft>,
     pending_save_rollback: Option<PendingSaveRollback>,
-    preview: VoicePreviewDto,
+    preview: VoicePreviewStatus,
+    /// 录制起点；进度由状态快照按实际经过时间计算。
+    preview_started: Option<Instant>,
+    /// 当前会话的试听记录句柄；命令取消时直接停止记录并清空记录区。
+    preview_control: Option<VoicePreviewControl>,
     save_error: Option<String>,
     control: Option<VoiceControl>,
     /// 用户命令与运行状态变更的代次；异步保存结果据此丢弃过期回复。
@@ -363,6 +416,8 @@ struct VoiceShared {
     writes_finished: Condvar,
     config_path: PathBuf,
     save: Arc<VoiceSaveFn>,
+    /// 试听代次；取消、替换与完成都推进它，音频输出回调据此立即静音。
+    preview_epoch: Arc<AtomicU64>,
     /// 回归测试在“代次检查完成、状态写入之前”暂停遥控命令。
     #[cfg(test)]
     remote_pause: Mutex<Option<RemoteWritePause>>,
@@ -434,7 +489,9 @@ impl VoiceService {
                     user_presets: config.voice_presets.clone(),
                     draft: None,
                     pending_save_rollback: None,
-                    preview: VoicePreviewDto::idle(),
+                    preview: VoicePreviewStatus::Idle,
+                    preview_started: None,
+                    preview_control: None,
                     save_error: None,
                     control: None,
                     operation: 0,
@@ -446,6 +503,7 @@ impl VoiceService {
                 writes_finished: Condvar::new(),
                 config_path: path,
                 save,
+                preview_epoch: Arc::new(AtomicU64::new(0)),
                 #[cfg(test)]
                 remote_pause: Mutex::new(None),
             }),
@@ -487,6 +545,7 @@ impl VoiceService {
             anyhow::ensure!(state.remote_epoch == epoch, "遥控路由已过期");
             #[cfg(test)]
             self.pause_remote_write();
+            Self::cancel_preview(&self.shared.preview_epoch, &mut state);
             Self::apply_enabled(&mut state, enabled);
             self.queue_write(&mut state);
         }
@@ -527,7 +586,13 @@ impl VoiceService {
     }
 
     pub(crate) fn status(&self) -> VoiceStatusDto {
-        let state = self.lock();
+        let mut state = self.lock();
+        let preview_started = state.preview_started;
+        if let (VoicePreviewStatus::Recording { elapsed_ms }, Some(started)) =
+            (&mut state.preview, preview_started)
+        {
+            *elapsed_ms = started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        }
         VoiceStatusDto {
             // 开关显示保存的启用值；暂停与临时旁路通过 bypassed 单独表达。
             enabled: state.enabled,
@@ -542,10 +607,119 @@ impl VoiceService {
             modified: state.params != state.saved_params,
             draft_available: state.draft.is_some(),
             params: state.params.into(),
-            preview: state.preview.clone(),
+            preview: (&state.preview).into(),
             save_error: state.save_error.clone(),
             generation: state.operation,
         }
+    }
+
+    /// 试听代次；输出回调持有同一份原子量以在取消后立即静音。
+    pub(crate) fn preview_epoch(&self) -> Arc<AtomicU64> {
+        self.shared.preview_epoch.clone()
+    }
+
+    /// 开始一次新试听：推进代次并进入准备状态。
+    pub(crate) fn preview_begin(&self) -> u64 {
+        let mut state = self.lock();
+        let generation = self
+            .shared
+            .preview_epoch
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        state.preview = VoicePreviewStatus::Preparing;
+        state.preview_started = None;
+        state.operation = state.operation.wrapping_add(1);
+        generation
+    }
+
+    /// 代次是否仍属于当前试听；宿主用同一原子量判断，测试直接断言这里。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn preview_is_current(&self, generation: u64) -> bool {
+        self.shared.preview_epoch.load(Ordering::Acquire) == generation
+    }
+
+    /// 记录区已开始写入；之后的进度由状态快照按经过时间计算。
+    pub(crate) fn preview_mark_recording(&self, generation: u64) {
+        let mut state = self.lock();
+        if self.shared.preview_epoch.load(Ordering::Acquire) != generation {
+            return;
+        }
+        state.preview = VoicePreviewStatus::Recording { elapsed_ms: 0 };
+        state.preview_started = Some(Instant::now());
+        state.operation = state.operation.wrapping_add(1);
+    }
+
+    pub(crate) fn preview_mark_playing(&self, generation: u64) {
+        let mut state = self.lock();
+        if self.shared.preview_epoch.load(Ordering::Acquire) != generation {
+            return;
+        }
+        state.preview = VoicePreviewStatus::Playing;
+        state.preview_started = None;
+        state.operation = state.operation.wrapping_add(1);
+    }
+
+    pub(crate) fn preview_finish(&self, generation: u64) {
+        let mut state = self.lock();
+        if self.shared.preview_epoch.load(Ordering::Acquire) != generation {
+            return;
+        }
+        state.preview = VoicePreviewStatus::Idle;
+        state.preview_started = None;
+        state.operation = state.operation.wrapping_add(1);
+    }
+
+    pub(crate) fn preview_unavailable(&self, generation: u64, reason: impl Into<String>) {
+        let mut state = self.lock();
+        if self.shared.preview_epoch.load(Ordering::Acquire) != generation {
+            return;
+        }
+        state.preview = VoicePreviewStatus::Unavailable {
+            reason: reason.into(),
+        };
+        state.preview_started = None;
+        state.operation = state.operation.wrapping_add(1);
+    }
+
+    /// 取消当前试听；旧代次的完成结果随后会被丢弃。
+    pub(crate) fn preview_cancel(&self) {
+        let mut state = self.lock();
+        Self::cancel_preview(&self.shared.preview_epoch, &mut state);
+    }
+
+    /// 没有可用会话时直接报告不可用原因，并终止可能残留的录制。
+    pub(crate) fn preview_unavailable_now(&self, reason: impl Into<String>) {
+        let mut state = self.lock();
+        Self::cancel_preview(&self.shared.preview_epoch, &mut state);
+        state.preview = VoicePreviewStatus::Unavailable {
+            reason: reason.into(),
+        };
+        state.preview_started = None;
+    }
+
+    /// 当前会话的试听记录句柄；未启动或已释放时为 `None`。
+    pub(crate) fn preview_control(&self) -> Option<VoicePreviewControl> {
+        self.lock().preview_control.clone()
+    }
+
+    /// 会话发布或释放时替换试听句柄；旧记录立即失效。
+    pub(crate) fn attach_preview(&self, control: Option<VoicePreviewControl>) {
+        let mut state = self.lock();
+        Self::cancel_preview(&self.shared.preview_epoch, &mut state);
+        state.preview_control = control;
+    }
+
+    /// 在状态锁内推进试听代次并清空记录区。
+    ///
+    /// 试听句柄的停止与复位只使用原子量，不阻塞音频回调。
+    fn cancel_preview(epoch: &AtomicU64, state: &mut VoiceState) {
+        epoch.fetch_add(1, Ordering::AcqRel);
+        if let Some(control) = &state.preview_control {
+            control.stop();
+        }
+        state.preview = VoicePreviewStatus::Idle;
+        state.preview_started = None;
+        state.operation = state.operation.wrapping_add(1);
     }
 
     pub(crate) fn presets(&self) -> Vec<VoicePresetDto> {
@@ -690,6 +864,8 @@ impl VoiceService {
     /// 会在暂停尚未结束时提前启用人声。
     pub(crate) fn detach(&self) {
         let mut state = self.lock();
+        Self::cancel_preview(&self.shared.preview_epoch, &mut state);
+        state.preview_control = None;
         state.control = None;
         state.bypassed = false;
     }
@@ -713,6 +889,7 @@ impl VoiceService {
         let block_ms = start.block_ms.unwrap_or(DEFAULT_VOICE_BLOCK_MS);
         validate_block_ms(block_ms)?;
         let mut state = self.lock();
+        Self::cancel_preview(&self.shared.preview_epoch, &mut state);
         state.operation = state.operation.wrapping_add(1);
         state.enabled = start.enabled;
         if let Some(params) = start.params {
@@ -725,6 +902,7 @@ impl VoiceService {
     pub(crate) fn set_enabled(&self, enabled: bool) -> Result<VoiceStatusDto> {
         {
             let mut state = self.lock();
+            Self::cancel_preview(&self.shared.preview_epoch, &mut state);
             Self::apply_enabled(&mut state, enabled);
             self.queue_write(&mut state);
         }
@@ -741,6 +919,7 @@ impl VoiceService {
     pub(crate) fn set_bypass(&self, bypass: bool) -> Result<VoiceStatusDto> {
         {
             let mut state = self.lock();
+            Self::cancel_preview(&self.shared.preview_epoch, &mut state);
             state.bypassed = bypass;
             state.operation = state.operation.wrapping_add(1);
             Self::apply_control(&state);
@@ -794,6 +973,8 @@ impl VoiceService {
             }
             // 重复选择当前预设不能丢弃正在编辑的参数。
             if state.preset_id != preset.id {
+                // 录制中的试听属于旧预设，必须立即取消，不能回放半段。
+                Self::cancel_preview(&self.shared.preview_epoch, &mut state);
                 if state.params != state.saved_params {
                     state.draft = Some(VoiceDraft {
                         source_preset_id: state.preset_id.clone(),
@@ -821,6 +1002,7 @@ impl VoiceService {
         anyhow::ensure!(!name.is_empty(), "预设名称不能为空");
         {
             let mut state = self.lock();
+            Self::cancel_preview(&self.shared.preview_epoch, &mut state);
             let id = Config {
                 voice_presets: state.user_presets.clone(),
                 ..Config::default()
@@ -914,7 +1096,7 @@ impl VoiceService {
             state.user_presets.remove(index);
             if state.preset_id == id {
                 // 先撤销试听与草稿，再关闭并回退，运行态不能保留已删除预设的痕迹。
-                state.preview = VoicePreviewDto::idle();
+                Self::cancel_preview(&self.shared.preview_epoch, &mut state);
                 state.draft = None;
                 state.pending_save_rollback = None;
                 state.bypassed = false;
@@ -949,6 +1131,8 @@ impl VoiceService {
                 .draft
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("没有可恢复的未保存修改"))?;
+            // 草稿会替换整套参数；进行中的试听不再代表当前声音。
+            Self::cancel_preview(&self.shared.preview_epoch, &mut state);
             let source = builtin_voice_presets()
                 .into_iter()
                 .find(|preset| preset.id == draft.source_preset_id)
@@ -984,6 +1168,8 @@ impl VoiceService {
     /// 恢复时只解除这一层暂停，不能覆盖期间发生的命令。
     pub(crate) fn suspend(&self) {
         let mut state = self.lock();
+        // 暂停会改变人声路径；进行中的试听不能跨阶段继续。
+        Self::cancel_preview(&self.shared.preview_epoch, &mut state);
         state.suspended = state.suspended.saturating_add(1);
         state.operation = state.operation.wrapping_add(1);
         Self::apply_control(&state);

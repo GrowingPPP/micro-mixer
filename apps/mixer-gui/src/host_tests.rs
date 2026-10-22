@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicUsize;
 #[cfg(feature = "voice")]
 use crate::voice::{VoiceParamsDto, VoiceService, VoiceStartConfig};
 #[cfg(feature = "voice")]
-use audio_core::voice::{VoiceBackend, VoiceParams, VoicePhase};
+use audio_core::voice::{VoiceBackend, VoiceParams, VoicePhase, VoicePreviewClip};
 
 type CloseBarrier = (mpsc::Sender<()>, Arc<Mutex<mpsc::Receiver<()>>>);
 
@@ -234,13 +234,18 @@ fn 被取代的启动归还宿主级槽位热键() {
 }
 
 #[cfg(feature = "voice")]
-struct FakeVoiceBackend;
+struct FakeVoiceBackend {
+    /// 放大系数用于区分干声与湿声，默认 1.0 保持既有回归的直通语义。
+    scale: f32,
+}
 
 #[cfg(feature = "voice")]
 impl VoiceBackend for FakeVoiceBackend {
     fn process(&mut self, input: &[f32], output: &mut [f32]) -> usize {
         let frames = input.len().min(output.len());
-        output[..frames].copy_from_slice(&input[..frames]);
+        for (out, sample) in output[..frames].iter_mut().zip(&input[..frames]) {
+            *out = *sample * self.scale;
+        }
         frames
     }
 
@@ -255,6 +260,11 @@ impl VoiceBackend for FakeVoiceBackend {
 
 #[cfg(feature = "voice")]
 fn voice_fixture(enabled: bool) -> (AudioHost, FakeBackend, TemporaryDir) {
+    voice_fixture_scaled(enabled, 1.0)
+}
+
+#[cfg(feature = "voice")]
+fn voice_fixture_scaled(enabled: bool, scale: f32) -> (AudioHost, FakeBackend, TemporaryDir) {
     let cfg = config();
     let backend = FakeBackend::default();
     let format = StreamFormat::stereo(44_100);
@@ -298,7 +308,7 @@ fn voice_fixture(enabled: bool) -> (AudioHost, FakeBackend, TemporaryDir) {
                 enabled,
                 params,
                 block_ms: crate::voice::DEFAULT_VOICE_BLOCK_MS,
-                backend: Box::new(|_| Ok(Box::new(FakeVoiceBackend))),
+                backend: Box::new(move |_| Ok(Box::new(FakeVoiceBackend { scale }))),
             }),
         },
         backend.clone(),
@@ -306,6 +316,7 @@ fn voice_fixture(enabled: bool) -> (AudioHost, FakeBackend, TemporaryDir) {
     )
     .unwrap();
     let control = session.voice_control();
+    let preview_control = session.voice_preview_control();
     let playback = session.playback.clone();
     host.next_generation.store(1, Ordering::Relaxed);
     host.audio_requests.register_session(1);
@@ -336,6 +347,7 @@ fn voice_fixture(enabled: bool) -> (AudioHost, FakeBackend, TemporaryDir) {
         cfg,
     });
     host.attach_voice_control(control);
+    host.attach_voice_preview(preview_control);
     (host, backend, dir)
 }
 
@@ -2810,4 +2822,491 @@ fn 变声热键命令校验跨组冲突并持久化() {
     assert_eq!(saved.voice.prev_preset_hotkey, "F7");
     assert_eq!(saved.hotkeys, vec!["F9".to_owned()], "音效热键保持不变");
     assert!(host.hotkeys.lock().unwrap().voice_bound(), "无会话也要绑定");
+}
+
+// ── 三秒人声试听 ─────────────────────────────────────────────
+
+#[cfg(feature = "voice")]
+type VoicePreviewPlayer =
+    Arc<dyn Fn(VoicePreviewClip, u64, Arc<AtomicU64>) -> Result<()> + Send + Sync>;
+
+#[cfg(feature = "voice")]
+fn install_voice_preview_player(host: &AudioHost) -> mpsc::Receiver<VoicePreviewClip> {
+    let (sender, receiver) = mpsc::channel();
+    let player: VoicePreviewPlayer = Arc::new(move |clip, _generation, _epoch| {
+        let _ = sender.send(clip);
+        Ok(())
+    });
+    *host.voice_preview_player.lock().unwrap() = Some(player);
+    receiver
+}
+
+#[cfg(feature = "voice")]
+fn install_blocking_voice_preview_player(
+    host: &AudioHost,
+) -> (mpsc::Receiver<VoicePreviewClip>, Arc<AtomicBool>) {
+    let (sender, receiver) = mpsc::channel();
+    let released = Arc::new(AtomicBool::new(false));
+    let flag = released.clone();
+    let player: VoicePreviewPlayer = Arc::new(move |clip, generation, epoch| {
+        let _ = sender.send(clip);
+        while epoch.load(Ordering::Acquire) == generation && !flag.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(())
+    });
+    *host.voice_preview_player.lock().unwrap() = Some(player);
+    (receiver, released)
+}
+
+#[cfg(feature = "voice")]
+fn install_failing_voice_preview_player(host: &AudioHost, message: &'static str) {
+    let player: VoicePreviewPlayer =
+        Arc::new(move |_clip, _generation, _epoch| anyhow::bail!("{message}"));
+    *host.voice_preview_player.lock().unwrap() = Some(player);
+}
+
+/// 采集与渲染同步推进；返回主输出 PCM，供转发断言使用。
+#[cfg(feature = "voice")]
+fn drive_voice(backend: &FakeBackend, frames: usize, sample: f32) -> Vec<f32> {
+    let input = vec![sample; frames * 2];
+    for callback in backend.captures.lock().unwrap().iter_mut() {
+        callback(&input);
+    }
+    let mut main = vec![0.0; frames * 2];
+    for (index, callback) in backend.outputs.lock().unwrap().iter_mut().enumerate() {
+        let mut output = vec![0.0; frames * 2];
+        callback(&mut output);
+        if index == 0 {
+            main = output;
+        }
+    }
+    main
+}
+
+#[cfg(feature = "voice")]
+fn wait_for(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if condition() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// 等录制真正开始后再推进回调，避免驱动速度快于试听线程启动。
+#[cfg(feature = "voice")]
+fn wait_voice_preview_recording(host: &AudioHost) {
+    assert!(
+        wait_for(Duration::from_secs(2), || host.voice_status().preview.state
+            == "recording"),
+        "试听应在阶段稳定后开始录制"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 启用状态试听记录渲染人声且音效不进入记录() {
+    let (host, backend, _dir) = voice_fixture_scaled(true, 0.5);
+    let clips = install_voice_preview_player(&host);
+    for _ in 0..200 {
+        drive_voice(&backend, 4_410, 0.3);
+    }
+    assert_eq!(
+        host.voice_status().phase,
+        "wet",
+        "驱动采集与渲染后应进入湿声"
+    );
+
+    let status = host.voice_preview_start().unwrap();
+    assert!(
+        matches!(status.preview.state.as_str(), "preparing" | "recording"),
+        "开始时不能报告旧状态：{}",
+        status.preview.state
+    );
+    wait_voice_preview_recording(&host);
+    assert!(host.play(0).unwrap(), "正式播放应与试听并存");
+
+    let mut main_peak = 0.0f32;
+    for index in 0..35 {
+        let output = drive_voice(&backend, 4_410, 0.3);
+        if index == 0 {
+            assert!(host.status().playing, "人声试听不能替换正式播放");
+        }
+        main_peak = main_peak.max(output.iter().fold(0.0f32, |m, s| m.max(s.abs())));
+    }
+    let clip = clips
+        .recv_timeout(Duration::from_secs(3))
+        .expect("三秒后应回放试听片段");
+    assert_eq!(clip.samples.len(), 44_100 * 3);
+    assert!(clip.post_limiter, "湿声试听来自渲染侧限幅之后");
+    assert!(
+        clip.samples[100_000..]
+            .iter()
+            .all(|sample| (sample - 0.15).abs() < 0.02),
+        "记录样本必须等于正式转发人声"
+    );
+    assert!(main_peak > 0.3, "主输出应混入音效，实际峰值 {main_peak}");
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 关闭状态试听不改变转发且能听到变声() {
+    let (host, backend, _dir) = voice_fixture_scaled(false, 0.5);
+    let clips = install_voice_preview_player(&host);
+
+    let status = host.voice_preview_start().unwrap();
+    assert!(matches!(
+        status.preview.state.as_str(),
+        "preparing" | "recording"
+    ));
+    wait_voice_preview_recording(&host);
+
+    let mut main = Vec::new();
+    for _ in 0..40 {
+        main = drive_voice(&backend, 4_410, 0.3);
+    }
+    let clip = clips
+        .recv_timeout(Duration::from_secs(3))
+        .expect("关闭状态也应完成三秒试听");
+    assert!(!clip.post_limiter, "采集预览需要应用试听限幅");
+    assert!(
+        clip.samples[10_000..]
+            .iter()
+            .all(|sample| (sample - 0.15).abs() < 0.01),
+        "试听应是变声后的人声"
+    );
+    assert!(
+        main[main.len() - 1_000..]
+            .iter()
+            .all(|sample| (sample - 0.3).abs() < 1e-3),
+        "转发必须保持原声，试听不改变对方听到的声音"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 试听与音效试听互斥() {
+    // 开始音效试听会取消正在录制的人声试听。
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let clips = install_voice_preview_player(&host);
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    for _ in 0..5 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+    assert_eq!(host.voice_status().preview.state, "recording");
+
+    let sound = FakeBackend::default();
+    launch_fake_preview(&host, &sound, Arc::new(vec![0.2; 88_200]));
+    assert_eq!(
+        host.voice_status().preview.state,
+        "idle",
+        "音效试听开始后必须取消人声试听"
+    );
+    assert!(host.voice_preview_thread.lock().unwrap().is_none());
+    assert!(clips.try_recv().is_err(), "被取消的录制不得进入回放");
+
+    // 开始人声试听会取消音效试听。
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let _clips = install_voice_preview_player(&host);
+    let sound = FakeBackend::default();
+    launch_fake_preview(&host, &sound, Arc::new(vec![0.2; 88_200]));
+    drain_primary(&backend);
+    let mut pcm = vec![0.0; 600];
+    sound.outputs.lock().unwrap()[0](&mut pcm);
+    assert!(host.status().preview_playing);
+
+    host.voice_preview_start().unwrap();
+    assert!(
+        !host.status().preview_playing,
+        "人声试听开始后不能再报告音效试听"
+    );
+    assert!(host.preview_thread.lock().unwrap().is_none());
+    pcm.fill(0.0);
+    sound.outputs.lock().unwrap()[0](&mut pcm);
+    assert!(
+        pcm.iter().all(|sample| *sample == 0.0),
+        "旧音效试听输出必须静音"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 全局停止取消录制与回放并清空记录() {
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let clips = install_voice_preview_player(&host);
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    for _ in 0..5 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+    host.stop_all().unwrap();
+    assert_eq!(host.voice_status().preview.state, "idle");
+    assert!(host.voice_preview_thread.lock().unwrap().is_none());
+    assert!(clips.try_recv().is_err(), "停止后不得播放半段录制");
+    let control = host.voice.preview_control().expect("会话仍应保留试听句柄");
+    assert!(!control.is_finished(), "取消后记录区不得报告完成");
+    assert!(control.take().is_none(), "取消后记录区必须清空");
+
+    // 回放中的全局停止同样立即生效。
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let (clips, _released) = install_blocking_voice_preview_player(&host);
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    for _ in 0..35 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+    clips
+        .recv_timeout(Duration::from_secs(3))
+        .expect("三秒后应进入回放");
+    assert_eq!(host.voice_status().preview.state, "playing");
+    host.stop_all().unwrap();
+    assert_eq!(host.voice_status().preview.state, "idle");
+    assert!(host.voice_preview_thread.lock().unwrap().is_none());
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 切换预设取消试听且不播放半段() {
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let clips = install_voice_preview_player(&host);
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    for _ in 0..10 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+    assert_eq!(host.voice_status().preview.state, "recording");
+
+    let status = host.voice_select_preset("builtin:male").unwrap();
+    assert_eq!(status.preview.state, "idle", "切换预设必须立即取消");
+    assert!(
+        wait_for(Duration::from_secs(1), || {
+            host.voice_status();
+            host.voice_preview_thread.lock().unwrap().is_none()
+        }),
+        "取消后录制线程必须退出"
+    );
+    assert!(clips.try_recv().is_err(), "取消后不得播放半段");
+    let control = host.voice.preview_control().unwrap();
+    assert!(control.take().is_none(), "记录区应被清空");
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 预热阶段显示准备中并在稳定后自动开始() {
+    let (host, backend, _dir) = voice_fixture_scaled(true, 1.0);
+    let clips = install_voice_preview_player(&host);
+
+    let status = host.voice_preview_start().unwrap();
+    assert_eq!(
+        status.preview.state, "preparing",
+        "预热阶段必须先显示准备中，不写记录区"
+    );
+
+    assert!(
+        wait_for(Duration::from_secs(2), || {
+            drive_voice(&backend, 4_410, 0.2);
+            matches!(
+                host.voice_status().preview.state.as_str(),
+                "recording" | "playing"
+            )
+        }),
+        "阶段稳定后应自动开始录制"
+    );
+    for _ in 0..35 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+    clips
+        .recv_timeout(Duration::from_secs(3))
+        .expect("稳定后应完成试听");
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 预热超时显示不可用原因且不写记录区() {
+    let (host, _backend, _dir) = voice_fixture_scaled(true, 1.0);
+    let _clips = install_voice_preview_player(&host);
+
+    let status = host.voice_preview_start().unwrap();
+    assert_eq!(status.preview.state, "preparing");
+    assert!(
+        wait_for(Duration::from_secs(3), || host.voice_status().preview.state
+            == "unavailable"),
+        "预热超过一秒必须返回不可用"
+    );
+    let preview = host.voice_status().preview;
+    let reason = preview.reason.unwrap_or_default();
+    assert!(
+        reason.contains("阶段") || reason.contains("准备"),
+        "预热超时必须说明具体原因，实际「{reason}」"
+    );
+    assert!(
+        !host.voice.preview_control().unwrap().is_finished(),
+        "超时前不得写入记录区"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 人声试听回放不进入虚拟麦克风() {
+    let (host, backend, _dir) = voice_fixture_scaled(false, 0.5);
+    let clips = install_voice_preview_player(&host);
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    let mut main = Vec::new();
+    for _ in 0..40 {
+        main = drive_voice(&backend, 4_410, 0.3);
+    }
+    let clip = clips
+        .recv_timeout(Duration::from_secs(3))
+        .expect("试听应完成");
+    assert!(clip.samples[10_000..]
+        .iter()
+        .all(|sample| (sample - 0.15).abs() < 0.01));
+    assert!(
+        main[main.len() - 1_000..]
+            .iter()
+            .all(|sample| (sample - 0.3).abs() < 1e-3),
+        "虚拟麦克风只能得到干声，试听样本不得混入"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 人声试听失败显示具体原因() {
+    // 未启动。
+    let host = preview_test_host();
+    let status = host.voice_preview_start().unwrap();
+    assert_eq!(status.preview.state, "unavailable");
+    assert_eq!(status.preview.reason.as_deref(), Some("音频未启动"));
+
+    // 会话释放后。
+    let (host, _backend, _dir) = voice_fixture_scaled(false, 1.0);
+    host.release();
+    let status = host.voice_preview_start().unwrap();
+    assert_eq!(status.preview.state, "unavailable");
+    assert_eq!(status.preview.reason.as_deref(), Some("音频未启动"));
+
+    // 输出设备失败。
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    install_failing_voice_preview_player(&host, "系统没有默认输出设备（试听需要它）");
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    for _ in 0..35 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+    assert!(
+        wait_for(Duration::from_secs(2), || {
+            let preview = host.voice_status().preview;
+            preview.state == "unavailable"
+                && preview
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("试听输出失败"))
+        }),
+        "输出设备失败必须显示具体原因"
+    );
+
+    // 记录为空。
+    let (host, _backend, _dir) = voice_fixture_scaled(false, 1.0);
+    host.voice_preview_start().unwrap();
+    assert!(
+        wait_for(Duration::from_secs(6), || {
+            let preview = host.voice_status().preview;
+            preview.state == "unavailable"
+                && preview
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("没有录到人声"))
+        }),
+        "没有录到人声必须给出明确提示"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 旧试听完成不覆盖新试听() {
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let (clips, _released) = install_blocking_voice_preview_player(&host);
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    for _ in 0..35 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+    let old = clips
+        .recv_timeout(Duration::from_secs(3))
+        .expect("第一段应进入回放");
+    assert_eq!(old.samples.len(), 44_100 * 3);
+    assert_eq!(host.voice_status().preview.state, "playing");
+
+    // 旧回放仍未结束时开始新试听；旧完成结果必须被丢弃。
+    let status = host.voice_preview_start().unwrap();
+    assert!(
+        matches!(status.preview.state.as_str(), "preparing" | "recording"),
+        "新试听不能被旧状态覆盖"
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        matches!(
+            host.voice_status().preview.state.as_str(),
+            "preparing" | "recording"
+        ),
+        "旧回放完成不能把新试听改成空闲"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 采集试听回放使用负三分贝限幅而渲染试听不重复限幅() {
+    let ceiling = 10.0f32.powf(-3.0 / 20.0);
+    for (post_limiter, expected) in [(false, ceiling), (true, 1.0)] {
+        let backend = FakeBackend::default();
+        let (opened_tx, opened_rx) = mpsc::channel();
+        *backend.opened.lock().unwrap() = Some(opened_tx);
+        let audio = Arc::new(PreviewAudioState {
+            gain: AtomicF32::new(1.0),
+            total_gain: Arc::new(AtomicF32::new(1.0)),
+            drained_frames: AtomicU64::new(0),
+            rendered_frames: AtomicU64::new(0),
+            total_frames: AtomicU64::new(0),
+            sample_rate: AtomicU32::new(0),
+            finished: AtomicBool::new(false),
+            previous_playback: None,
+            owner_observed_source_end: Mutex::new(None),
+        });
+        let generation = Arc::new(AtomicU64::new(9));
+        let playing = backend.clone();
+        let limit = preview_limit_for(post_limiter);
+        let worker = std::thread::spawn(move || {
+            play_samples_with_limit(
+                playing,
+                Arc::new(vec![1.0f32; 44_100 * 2]),
+                DeviceId::new("fake"),
+                StreamFormat::new(44_100, 2),
+                audio,
+                9,
+                generation,
+                limit,
+            )
+        });
+        opened_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // 第一块输出包含全部源样本；后续调用只用于排空限幅器尾部。
+        let mut pcm = vec![0.0; 44_100 * 2];
+        backend.outputs.lock().unwrap()[0](&mut pcm);
+        let peak = pcm.iter().fold(0.0f32, |max, sample| max.max(sample.abs()));
+        for _ in 0..3 {
+            let mut tail = vec![0.0; 4_410 * 2];
+            backend.outputs.lock().unwrap()[0](&mut tail);
+        }
+        worker.join().unwrap().unwrap();
+        assert!(
+            (peak - expected).abs() < 1e-4,
+            "post_limiter={post_limiter} 的输出峰值应为 {expected}，实际 {peak}"
+        );
+    }
 }

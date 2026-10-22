@@ -30,7 +30,9 @@ use hotkeys::{HotkeyGroup, HotkeyGroups, HotkeyManager, Hotkeys};
 use crate::voice::{VoiceHotkeyAction, VoiceHotkeyOutcome, VoiceService, DEFAULT_VOICE_BLOCK_MS};
 use crate::voice::{VoiceParamsDto, VoicePresetDto, VoiceStartConfig, VoiceStatusDto};
 #[cfg(feature = "voice")]
-use audio_core::voice::VoiceControl;
+use audio_core::voice::{
+    PreviewError, VoiceControl, VoicePhase, VoicePreviewClip, VoicePreviewControl,
+};
 
 // ─────────────────────────────────────────── DTO
 
@@ -478,7 +480,17 @@ pub struct AudioHost {
     /// 当前会话的控制句柄；待机保留，释放时丢弃。
     #[cfg(feature = "voice")]
     voice_control: Mutex<Option<VoiceControl>>,
+    /// 试听准备/录制/回放的所有者线程；取消时由控制线程收尾。
+    #[cfg(feature = "voice")]
+    voice_preview_thread: Mutex<Option<JoinHandle<()>>>,
+    /// 回归测试注入试听回放实现，避免测试依赖真实输出设备。
+    #[cfg(all(test, feature = "voice"))]
+    voice_preview_player: Mutex<Option<VoicePreviewPlayer>>,
 }
+
+#[cfg(all(test, feature = "voice"))]
+type VoicePreviewPlayer =
+    Arc<dyn Fn(VoicePreviewClip, u64, Arc<AtomicU64>) -> Result<()> + Send + Sync>;
 
 /// Only request publication and session registration use this short gate. It is
 /// never retained while decoding, opening / closing streams or waiting on audio.
@@ -995,6 +1007,8 @@ impl AudioHost {
         })?;
         #[cfg(feature = "voice")]
         let voice_control = session.voice_control();
+        #[cfg(feature = "voice")]
+        let voice_preview_control = session.voice_preview_control();
         let playback = session.playback.clone();
         let control = playback.control.clone();
         let stats = session.stats.clone();
@@ -1122,6 +1136,7 @@ impl AudioHost {
         if unpublished.is_none() {
             // 只把已发布的会话句柄交给命令层；被拒绝的会话随后直接关闭。
             self.attach_voice_control(voice_control);
+            self.attach_voice_preview(voice_preview_control);
         }
         if let Some(unpublished) = unpublished {
             self.discard_unpublished_session(unpublished);
@@ -1280,6 +1295,8 @@ impl AudioHost {
         if ticket.is_some_and(|t| !self.audio_request_is_current(t)) {
             return;
         }
+        #[cfg(feature = "voice")]
+        self.cancel_voice_preview_inner();
         self.stop_preview_inner();
         let admission = self
             .preview_control
@@ -1310,6 +1327,7 @@ impl AudioHost {
         if running.is_some() {
             // 会话释放后旧句柄不能再影响新会话，下一次启动重新构建。
             self.attach_voice_control(None);
+            self.attach_voice_preview(None);
         }
         if let Some(r) = running {
             r.playback.standby();
@@ -1818,6 +1836,8 @@ impl AudioHost {
             return Ok(());
         }
         self.stop_preview_inner();
+        #[cfg(feature = "voice")]
+        self.cancel_voice_preview_inner();
         let _admission = self
             .preview_control
             .lock()
@@ -2068,6 +2088,12 @@ impl AudioHost {
         let gain = sound_gain(gain_db)?;
         anyhow::ensure!(!sound_id.trim().is_empty(), "素材标识不能为空");
         anyhow::ensure!(!self.is_quitting(), "程序正在退出");
+        // 本机输出同一时间只允许一个试听；音效试听开始前先取消人声试听。
+        #[cfg(feature = "voice")]
+        {
+            let _operation = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            self.cancel_voice_preview_inner();
+        }
         // Allocate before any device lookup/decode. A stop during prepare must
         // invalidate this request rather than let it assign a fresh token later.
         let (token, session_generation, audio) = {
@@ -2239,11 +2265,26 @@ impl AudioHost {
     pub fn voice_status(&self) -> VoiceStatusDto {
         #[cfg(feature = "voice")]
         {
+            // 命令取消后工作线程会自行退出；轮询顺手回收已结束的所有者。
+            self.reap_voice_preview_thread();
             self.voice.status()
         }
         #[cfg(not(feature = "voice"))]
         {
             VoiceStatusDto::disabled()
+        }
+    }
+
+    #[cfg(feature = "voice")]
+    fn reap_voice_preview_thread(&self) {
+        let mut slot = self
+            .voice_preview_thread
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().is_some_and(JoinHandle::is_finished) {
+            if let Some(thread) = slot.take() {
+                let _ = thread.join();
+            }
         }
     }
 
@@ -2361,6 +2402,114 @@ impl AudioHost {
         #[cfg(not(feature = "voice"))]
         {
             anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    // ─────────────────────────────────────── 三秒人声试听
+
+    /// 开始三秒人声试听；与音效试听共用本机输出仲裁。
+    ///
+    /// 未启动或刚释放时以 `Unavailable` 报告原因，界面直接显示具体文案。
+    pub fn voice_preview_start(&self) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice_preview_start_inner()
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    /// 取消人声试听；第二次点击、预设切换与全局停止走同一清理路径。
+    pub fn voice_preview_stop(&self) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            let _operation = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            self.cancel_voice_preview_inner();
+            Ok(self.voice_status())
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    #[cfg(feature = "voice")]
+    fn voice_preview_start_inner(&self) -> Result<VoiceStatusDto> {
+        let _operation = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if self.is_quitting() {
+            self.voice.preview_unavailable_now("程序正在退出");
+            return Ok(self.voice_status());
+        }
+        let Some(preview) = self.voice.preview_control() else {
+            self.voice.preview_unavailable_now("音频未启动");
+            return Ok(self.voice_status());
+        };
+        let phase_control = self
+            .voice_control
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(phase_control) = phase_control else {
+            self.voice.preview_unavailable_now("音频未启动");
+            return Ok(self.voice_status());
+        };
+
+        // 本机输出互斥：音效试听及其输出线程必须先结束。
+        self.stop_preview_inner();
+        self.voice.preview_cancel();
+        let generation = self.voice.preview_begin();
+        let service = self.voice.clone();
+        let epoch = service.preview_epoch();
+
+        let mut slot = self
+            .voice_preview_thread
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(previous) = slot.take() {
+            let _ = previous.join();
+        }
+        #[cfg(test)]
+        let player = self
+            .voice_preview_player
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let job = VoicePreviewJob {
+            service,
+            preview,
+            phase_control,
+            generation,
+            epoch,
+            #[cfg(test)]
+            player,
+        };
+        match std::thread::Builder::new()
+            .name("voice-preview".into())
+            .spawn(move || run_voice_preview(job))
+        {
+            Ok(thread) => *slot = Some(thread),
+            Err(error) => {
+                self.voice
+                    .preview_unavailable(generation, format!("启动人声试听线程失败：{error}"));
+            }
+        }
+        drop(slot);
+        Ok(self.voice_status())
+    }
+
+    /// 取消录制或回放并等待所有者线程退出；记录区由试听句柄原子复位。
+    #[cfg(feature = "voice")]
+    fn cancel_voice_preview_inner(&self) {
+        self.voice.preview_cancel();
+        let thread = self
+            .voice_preview_thread
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(thread) = thread {
+            let _ = thread.join();
         }
     }
 
@@ -2645,9 +2794,175 @@ impl AudioHost {
         }
     }
 
+    /// 发布或释放本会话的试听记录句柄；旧试听立即失效。
+    #[cfg(feature = "voice")]
+    fn attach_voice_preview(&self, control: Option<VoicePreviewControl>) {
+        self.voice.attach_preview(control);
+    }
+
     pub fn record_error(&self, e: impl Into<String>) {
         *self.last_error.lock().unwrap_or_else(|x| x.into_inner()) = Some(e.into());
     }
+}
+
+/// 试听线程所需的全部句柄；音频回调不接触这些状态。
+#[cfg(feature = "voice")]
+struct VoicePreviewJob {
+    service: VoiceService,
+    preview: VoicePreviewControl,
+    phase_control: VoiceControl,
+    generation: u64,
+    epoch: Arc<AtomicU64>,
+    #[cfg(test)]
+    player: Option<VoicePreviewPlayer>,
+}
+
+/// 在控制线程完成准备、录制与回放；任何阶段都按代次丢弃旧结果。
+#[cfg(feature = "voice")]
+fn run_voice_preview(job: VoicePreviewJob) {
+    let VoicePreviewJob {
+        service,
+        preview,
+        phase_control,
+        generation,
+        epoch,
+        #[cfg(test)]
+        player,
+    } = job;
+
+    // 预热与淡出阶段不能写记录区；阶段稳定后自动开始，超时明确失败。
+    let prepare_deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let start = loop {
+        if epoch.load(Ordering::Acquire) != generation {
+            return;
+        }
+        match preview.start() {
+            Ok(start) => break start,
+            Err(PreviewError::Busy) => {
+                if std::time::Instant::now() >= prepare_deadline {
+                    service.preview_unavailable(generation, "变声阶段未稳定，试听已取消");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(PreviewError::AlreadyActive) => {
+                preview.stop();
+                if std::time::Instant::now() >= prepare_deadline {
+                    service.preview_unavailable(generation, "变声阶段未稳定，试听已取消");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(PreviewError::Unavailable) => {
+                service.preview_unavailable(generation, "试听记录区不可用");
+                return;
+            }
+        }
+    };
+    if epoch.load(Ordering::Acquire) != generation {
+        // 取消与启动竞争时立即归还记录区，避免留下无人取走的录制。
+        preview.stop();
+        return;
+    }
+    service.preview_mark_recording(generation);
+
+    let expected_phase = match start.source {
+        audio_core::voice::VoicePreviewSource::Capture => VoicePhase::Off,
+        audio_core::voice::VoicePreviewSource::Render => VoicePhase::Wet,
+    };
+    // 记录区固定三秒；允许半秒的设备回调与轮询余量。
+    let record_deadline = std::time::Instant::now() + Duration::from_millis(3_500);
+    let clip = loop {
+        if epoch.load(Ordering::Acquire) != generation {
+            return;
+        }
+        if preview.is_finished() {
+            match preview.take() {
+                Some(clip) => break clip,
+                None => {
+                    service.preview_unavailable(generation, "没有录到人声，试听已取消");
+                    return;
+                }
+            }
+        }
+        if phase_control.phase() != expected_phase {
+            preview.stop();
+            service.preview_unavailable(generation, "变声阶段已变化，试听已取消");
+            return;
+        }
+        if std::time::Instant::now() >= record_deadline {
+            preview.stop();
+            service.preview_unavailable(generation, "没有录到人声，试听已取消");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    if clip.samples.is_empty() {
+        service.preview_unavailable(generation, "没有录到人声，试听已取消");
+        return;
+    }
+    if epoch.load(Ordering::Acquire) != generation {
+        return;
+    }
+
+    service.preview_mark_playing(generation);
+    #[cfg(test)]
+    let result = match player {
+        Some(player) => player(clip, generation, epoch),
+        None => play_voice_clip(clip, generation, epoch),
+    };
+    #[cfg(not(test))]
+    let result = play_voice_clip(clip, generation, epoch);
+    match result {
+        Ok(()) => service.preview_finish(generation),
+        Err(error) => {
+            service.preview_unavailable(generation, format!("试听输出失败：{error:#}"));
+        }
+    }
+}
+
+/// 试听回放只走本机默认输出；采样率不同时复用现有试听重采样规则。
+#[cfg(feature = "voice")]
+fn play_voice_clip(clip: VoicePreviewClip, generation: u64, epoch: Arc<AtomicU64>) -> Result<()> {
+    anyhow::ensure!(!clip.samples.is_empty(), "没有录到人声，试听已取消");
+    let backend = CpalBackend::new();
+    let device = backend
+        .default_output()
+        .context("系统没有默认输出设备（试听需要它）")?;
+    let format = backend.output_format(&device, Some(StreamFormat::new(48_000, 2)))?;
+    let stereo: Vec<f32> = clip
+        .samples
+        .iter()
+        .flat_map(|sample| [*sample, *sample])
+        .collect();
+    let samples = if clip.sample_rate == format.sample_rate {
+        stereo
+    } else {
+        audio_session::resample_stereo(&stereo, clip.sample_rate, format.sample_rate)
+    };
+    anyhow::ensure!(!samples.is_empty(), "没有录到人声，试听已取消");
+    let audio = Arc::new(PreviewAudioState {
+        gain: AtomicF32::new(1.0),
+        total_gain: Arc::new(AtomicF32::new(1.0)),
+        drained_frames: AtomicU64::new(0),
+        rendered_frames: AtomicU64::new(0),
+        total_frames: AtomicU64::new(0),
+        sample_rate: AtomicU32::new(0),
+        finished: AtomicBool::new(false),
+        previous_playback: None,
+        #[cfg(test)]
+        owner_observed_source_end: Mutex::new(None),
+    });
+    play_samples_with_limit(
+        backend,
+        Arc::new(samples),
+        device,
+        format,
+        audio,
+        generation,
+        epoch,
+        preview_limit_for(clip.post_limiter),
+    )
 }
 
 /// 把一次热键事件路由到当前的变声状态。
@@ -2772,9 +3087,27 @@ fn bind_hotkeys_with_manager(
 
 // ─────────────────────────────────────────── 试听
 
+/// 试听回放的限幅模式。
+#[derive(Clone, Copy)]
+enum PreviewLimit {
+    /// 片段已通过正式人声路径限幅，不再重复限幅。
+    #[cfg_attr(not(feature = "voice"), allow(dead_code))]
+    None,
+    Ceiling(f32),
+}
+
+#[cfg(feature = "voice")]
+fn preview_limit_for(post_limiter: bool) -> PreviewLimit {
+    if post_limiter {
+        PreviewLimit::None
+    } else {
+        PreviewLimit::Ceiling(-3.0)
+    }
+}
+
 struct PreviewRender {
     cursor: audio_session::SampleCursor,
-    limiter: Limiter,
+    limiter: Option<Limiter>,
 }
 
 struct PreviewCursor(Arc<Mutex<Option<PreviewRender>>>);
@@ -2795,6 +3128,30 @@ fn play_samples(
     my_gen: u64,
     gen: Arc<AtomicU64>,
 ) -> Result<()> {
+    play_samples_with_limit(
+        backend,
+        samples_owned,
+        device,
+        fmt,
+        audio,
+        my_gen,
+        gen,
+        PreviewLimit::Ceiling(-1.0),
+    )
+}
+
+// 回放参数与现有 play_samples 一致，仅额外携带限幅模式；拆结构体会让调用点更长。
+#[allow(clippy::too_many_arguments)]
+fn play_samples_with_limit(
+    backend: impl AudioBackend,
+    samples_owned: Arc<Vec<f32>>,
+    device: DeviceId,
+    fmt: StreamFormat,
+    audio: Arc<PreviewAudioState>,
+    my_gen: u64,
+    gen: Arc<AtomicU64>,
+    limit: PreviewLimit,
+) -> Result<()> {
     if gen.load(Ordering::Acquire) != my_gen {
         return Ok(());
     }
@@ -2804,8 +3161,19 @@ fn play_samples(
     audio
         .total_frames
         .store(total_frames as u64, Ordering::Release);
-    let limiter = Limiter::with_channels(fmt.sample_rate, 2);
-    let latency_frames = limiter.latency_frames() as u64;
+    let limiter = match limit {
+        PreviewLimit::None => None,
+        PreviewLimit::Ceiling(ceiling_db) => Some(Limiter::new_with_channels(
+            fmt.sample_rate,
+            2,
+            ceiling_db,
+            2.0,
+            80.0,
+        )),
+    };
+    let latency_frames = limiter
+        .as_ref()
+        .map_or(0, |limiter| limiter.latency_frames()) as u64;
     let cursor = PreviewCursor(Arc::new(Mutex::new(Some(PreviewRender {
         cursor: audio_session::SampleCursor::new(samples_owned, 0.0),
         limiter,
@@ -2843,7 +3211,9 @@ fn play_samples(
                         render.cursor.render(&mut stereo, 2);
                         stereo[0] *= gain;
                         stereo[1] *= gain;
-                        render.limiter.process_in_place(&mut stereo);
+                        if let Some(limiter) = render.limiter.as_mut() {
+                            limiter.process_in_place(&mut stereo);
+                        }
                         let mono = (stereo[0] + stereo[1]) * 0.5;
                         frame.fill(mono);
                         if frame.len() > 1 {
