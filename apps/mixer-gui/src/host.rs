@@ -2221,6 +2221,64 @@ impl AudioHost {
         }
     }
 
+    pub fn voice_save_as_user_preset(&self, name: &str) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.save_as_user_preset(name)
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            let _ = name;
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    pub fn voice_save_preset(&self) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.save_preset()
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    pub fn voice_rename_preset(&self, id: &str, name: &str) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.rename_preset(id, name)
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            let _ = (id, name);
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    pub fn voice_delete_preset(&self, id: &str) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.delete_preset(id)
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            let _ = id;
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    pub fn voice_restore_draft(&self) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.restore_draft()
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
     #[cfg(feature = "voice")]
     fn attach_voice_control(&self, control: Option<VoiceControl>) {
         let mut slot = self.voice_control.lock().unwrap_or_else(|e| e.into_inner());

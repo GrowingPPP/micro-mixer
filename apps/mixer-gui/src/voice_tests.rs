@@ -34,6 +34,18 @@ fn service(dir: &TemporaryDir) -> VoiceService {
     VoiceService::new_with_path(&Config::default(), config_path(dir))
 }
 
+fn preset(id: &str, name: &str, pitch_semitones: f32) -> app_config::VoicePreset {
+    app_config::VoicePreset {
+        id: id.into(),
+        name: name.into(),
+        params: app_config::VoiceParamsConfig {
+            pitch_semitones,
+            ..app_config::VoiceParamsConfig::neutral()
+        },
+        unknown_lines: Vec::new(),
+    }
+}
+
 fn user_config() -> Config {
     let mut config = Config::default();
     config.voice.enabled = true;
@@ -524,4 +536,526 @@ fn 变声持久化与完整保存共用写入门() {
     holder.join().unwrap();
     service.flush_saves();
     assert!(Config::load_from(&path).voice.enabled);
+}
+
+// ─────────────────────────────────────────── 用户预设与草稿
+
+#[test]
+fn 切换预设保留未保存修改为草稿() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    service
+        .set_params(VoiceParamsDto {
+            pitch_semitones: 6.0,
+            ..VoiceParamsDto::default()
+        })
+        .unwrap();
+
+    let status = service.select_preset("builtin:male").unwrap();
+    assert_eq!(status.preset_id, "builtin:male");
+    assert_eq!(status.params.pitch_semitones, -4.0);
+    assert!(status.draft_available, "切换前有未保存修改时必须留下草稿");
+    assert!(!status.modified);
+
+    let status = service.restore_draft().unwrap();
+    assert_eq!(status.preset_id, "builtin:female");
+    assert_eq!(status.preset_name, "女声");
+    assert_eq!(status.params.pitch_semitones, 6.0);
+    assert!(status.modified, "恢复的草稿相对源预设仍是未保存修改");
+    assert!(!status.draft_available);
+}
+
+#[test]
+fn 新修改替换旧草稿() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    service
+        .set_params(VoiceParamsDto {
+            pitch_semitones: 5.0,
+            ..VoiceParamsDto::default()
+        })
+        .unwrap();
+    service.select_preset("builtin:male").unwrap();
+
+    service
+        .set_params(VoiceParamsDto {
+            pitch_semitones: -7.0,
+            ..VoiceParamsDto::default()
+        })
+        .unwrap();
+    service.select_preset("builtin:child").unwrap();
+
+    let status = service.restore_draft().unwrap();
+    assert_eq!(status.preset_id, "builtin:male");
+    assert_eq!(status.params.pitch_semitones, -7.0);
+    assert!(!status.draft_available);
+}
+
+#[test]
+fn 内置预设不能直接保存() {
+    let dir = TemporaryDir::new();
+    let path = config_path(&dir);
+    let original = Config::default();
+    original.save_to(&path).unwrap();
+    let service = VoiceService::new_with_path(&original, path.clone());
+    service
+        .set_params(VoiceParamsDto {
+            pitch_semitones: 6.0,
+            ..VoiceParamsDto::default()
+        })
+        .unwrap();
+
+    let error = service.save_preset().unwrap_err().to_string();
+    assert!(
+        error.contains("请另存为用户预设"),
+        "内置预设保存必须提示另存，实际 {error}"
+    );
+    assert_eq!(service.status().params.pitch_semitones, 6.0);
+
+    service.flush_saves();
+    let saved = Config::load_from(&path);
+    assert_eq!(saved.voice, original.voice);
+    assert!(saved.voice_presets.is_empty());
+}
+
+#[test]
+fn 另存为用户预设后成为当前预设() {
+    let dir = TemporaryDir::new();
+    let path = config_path(&dir);
+    let service = service(&dir);
+    service
+        .set_params(VoiceParamsDto {
+            pitch_semitones: 6.0,
+            formant_semitones: 2.0,
+            ..VoiceParamsDto::default()
+        })
+        .unwrap();
+
+    let status = service.save_as_user_preset("  我的预设  ").unwrap();
+    assert!(status.preset_id.starts_with("user:"));
+    assert_eq!(status.preset_name, "我的预设");
+    assert!(!status.modified);
+    assert!(service.presets().iter().any(|p| p.id == status.preset_id));
+
+    service.flush_saves();
+    let saved = Config::load_from(&path);
+    assert_eq!(saved.voice.active_preset, status.preset_id);
+    let preset = saved
+        .voice_presets
+        .iter()
+        .find(|preset| preset.id == status.preset_id)
+        .expect("用户预设必须写入配置");
+    assert_eq!(preset.name, "我的预设");
+    assert_eq!(preset.params.pitch_semitones, 6.0);
+    assert_eq!(preset.params.formant_semitones, 2.0);
+    assert_eq!(
+        VoiceParamsDto::from(params_from_config(preset.params)),
+        status.params
+    );
+    assert!(
+        service.save_as_user_preset("   ").is_err(),
+        "空名称必须被拒绝"
+    );
+}
+
+#[test]
+fn 保存修改更新用户预设() {
+    let dir = TemporaryDir::new();
+    let path = config_path(&dir);
+    let config = Config {
+        voice: app_config::VoiceConfig {
+            enabled: true,
+            active_preset: "user:alpha-000001".into(),
+            ..app_config::VoiceConfig::default()
+        },
+        voice_presets: vec![preset("user:alpha-000001", "甲", 3.0)],
+        ..Config::default()
+    };
+    let service = VoiceService::new_with_path(&config, path.clone());
+    service
+        .set_params(VoiceParamsDto {
+            pitch_semitones: 9.0,
+            ..VoiceParamsDto::default()
+        })
+        .unwrap();
+    assert!(service.status().modified);
+
+    let status = service.save_preset().unwrap();
+    assert_eq!(status.preset_id, "user:alpha-000001");
+    assert_eq!(status.preset_name, "甲");
+    assert!(!status.modified);
+    service.flush_saves();
+
+    let status = service.status();
+    assert!(status.save_error.is_none());
+    assert!(!status.modified);
+    let saved = Config::load_from(&path);
+    assert_eq!(saved.voice.active_preset, "user:alpha-000001");
+    assert_eq!(saved.voice_presets[0].params.pitch_semitones, 9.0);
+}
+
+#[test]
+fn 草稿源预设删除后应用到当前预设() {
+    let dir = TemporaryDir::new();
+    let config = Config {
+        voice: app_config::VoiceConfig {
+            active_preset: "user:alpha-000001".into(),
+            ..app_config::VoiceConfig::default()
+        },
+        voice_presets: vec![
+            preset("user:alpha-000001", "甲", 3.0),
+            preset("user:beta-000002", "乙", -3.0),
+        ],
+        ..Config::default()
+    };
+    let service = VoiceService::new_with_path(&config, config_path(&dir));
+    service
+        .set_params(VoiceParamsDto {
+            pitch_semitones: 8.0,
+            ..VoiceParamsDto::default()
+        })
+        .unwrap();
+    service.select_preset("user:beta-000002").unwrap();
+    service.delete_preset("user:alpha-000001").unwrap();
+    assert!(service.status().draft_available);
+
+    let status = service.restore_draft().unwrap();
+    assert_eq!(status.preset_id, "user:beta-000002");
+    assert_eq!(status.params.pitch_semitones, 8.0);
+    assert!(status.modified, "源预设删除后恢复的草稿仍属未保存修改");
+    assert!(!status.draft_available);
+}
+
+#[test]
+fn 重命名保持稳定预设标识() {
+    let dir = TemporaryDir::new();
+    let path = config_path(&dir);
+    let service = service(&dir);
+    let created = service.save_as_user_preset("旧名称").unwrap();
+    let id = created.preset_id;
+    service.flush_saves();
+
+    let renamed = service.rename_preset(&id, "  新名称  ").unwrap();
+    assert_eq!(renamed.preset_id, id, "重命名不能改变 ID");
+    assert_eq!(renamed.preset_name, "新名称");
+    service.flush_saves();
+
+    let saved = Config::load_from(&path);
+    let preset = saved
+        .voice_presets
+        .iter()
+        .find(|preset| preset.id == id)
+        .expect("重命名后预设仍在配置中");
+    assert_eq!(preset.name, "新名称");
+    assert_eq!(saved.voice.active_preset, id);
+
+    let selected = service.select_preset(&id).unwrap();
+    assert_eq!(selected.preset_id, id);
+    assert_eq!(selected.preset_name, "新名称");
+    assert!(
+        service.rename_preset(&id, "   ").is_err(),
+        "空名称必须被拒绝"
+    );
+}
+
+#[test]
+fn 删除当前用户预设回退女声并关闭() {
+    let dir = TemporaryDir::new();
+    let path = config_path(&dir);
+    let mut config = Config::default();
+    config.voice.enabled = true;
+    config.voice.active_preset = "user:alpha-000001".into();
+    config.voice_presets = vec![
+        preset("user:alpha-000001", "甲", 3.0),
+        preset("user:beta-000002", "乙", -3.0),
+    ];
+    let service = VoiceService::new_with_path(&config, path.clone());
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+
+    service
+        .set_params(VoiceParamsDto {
+            pitch_semitones: 8.0,
+            ..VoiceParamsDto::default()
+        })
+        .unwrap();
+    service.select_preset("user:beta-000002").unwrap();
+    service.select_preset("user:alpha-000001").unwrap();
+    assert!(service.status().draft_available);
+
+    let status = service.delete_preset("user:alpha-000001").unwrap();
+    assert_eq!(status.preset_id, "builtin:female");
+    assert_eq!(status.preset_name, "女声");
+    assert!(!status.enabled);
+    assert!(!status.bypassed);
+    assert!(!status.draft_available, "删除当前预设必须清除草稿");
+    assert_eq!(status.params.pitch_semitones, 4.0);
+    assert_eq!(control.params().pitch_semitones, 4.0);
+    assert_eq!(control.phase(), VoicePhase::Off);
+
+    service.flush_saves();
+    let saved = Config::load_from(&path);
+    assert!(!saved.voice.enabled);
+    assert_eq!(saved.voice.active_preset, "builtin:female");
+    assert_eq!(saved.voice_presets.len(), 1);
+    assert_eq!(saved.voice_presets[0].id, "user:beta-000002");
+}
+
+#[test]
+fn 删除非当前用户预设不影响当前状态() {
+    let dir = TemporaryDir::new();
+    let path = config_path(&dir);
+    let mut config = Config::default();
+    config.voice.enabled = true;
+    config.voice.active_preset = "user:alpha-000001".into();
+    config.voice_presets = vec![
+        preset("user:alpha-000001", "甲", 3.0),
+        preset("user:beta-000002", "乙", -3.0),
+    ];
+    let service = VoiceService::new_with_path(&config, path.clone());
+
+    service
+        .set_params(VoiceParamsDto {
+            pitch_semitones: 8.0,
+            ..VoiceParamsDto::default()
+        })
+        .unwrap();
+    service.select_preset("user:beta-000002").unwrap();
+    service.select_preset("user:alpha-000001").unwrap();
+    service
+        .set_params(VoiceParamsDto {
+            pitch_semitones: 9.0,
+            ..VoiceParamsDto::default()
+        })
+        .unwrap();
+    let before = service.status();
+    assert!(before.draft_available);
+
+    let after = service.delete_preset("user:beta-000002").unwrap();
+    assert_eq!(after.preset_id, before.preset_id);
+    assert_eq!(after.preset_name, before.preset_name);
+    assert_eq!(after.params, before.params);
+    assert_eq!(after.enabled, before.enabled);
+    assert_eq!(after.bypassed, before.bypassed);
+    assert_eq!(after.draft_available, before.draft_available);
+    assert_eq!(after.modified, before.modified);
+
+    service.flush_saves();
+    let saved = Config::load_from(&path);
+    assert_eq!(saved.voice_presets.len(), 1);
+    assert_eq!(saved.voice_presets[0].id, "user:alpha-000001");
+    let restored = service.restore_draft().unwrap();
+    assert_eq!(restored.preset_id, "user:alpha-000001");
+    assert_eq!(restored.params.pitch_semitones, 8.0);
+}
+
+#[test]
+fn 保存失败保留修改状态并可重试() {
+    let dir = TemporaryDir::new();
+    let blocker = dir.0.join("blocker");
+    std::fs::write(&blocker, "not a directory").unwrap();
+    let path = blocker.join("config.toml");
+    let service = VoiceService::new_with_path(&Config::default(), path.clone());
+    service
+        .set_params(VoiceParamsDto {
+            pitch_semitones: 6.0,
+            ..VoiceParamsDto::default()
+        })
+        .unwrap();
+
+    service.save_as_user_preset("失败预设").unwrap();
+    service.flush_saves();
+    let status = service.status();
+    assert_eq!(status.params.pitch_semitones, 6.0, "运行参数必须已生效");
+    assert!(
+        status
+            .save_error
+            .as_deref()
+            .is_some_and(|error| error.contains("保存变声配置失败")),
+        "保存失败必须报告，实际 {:?}",
+        status.save_error
+    );
+    assert!(status.modified, "保存失败必须保持未保存状态");
+    assert!(!path.exists());
+
+    std::fs::remove_file(&blocker).unwrap();
+    let retried = service.save_preset().unwrap();
+    assert_eq!(retried.preset_id, status.preset_id);
+    service.flush_saves();
+
+    let status = service.status();
+    assert!(status.save_error.is_none(), "重试成功后必须清除错误");
+    assert!(!status.modified);
+    let saved = Config::load_from(&path);
+    let preset = saved
+        .voice_presets
+        .iter()
+        .find(|preset| preset.id == status.preset_id)
+        .expect("重试成功后预设必须落盘");
+    assert_eq!(preset.params.pitch_semitones, 6.0);
+}
+
+#[test]
+fn 会话重启与待机保留草稿与修改() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let first = VoiceControl::new(VoiceParams::neutral());
+    service.attach(first);
+    service
+        .set_params(VoiceParamsDto {
+            pitch_semitones: 7.0,
+            ..VoiceParamsDto::default()
+        })
+        .unwrap();
+
+    service.detach();
+    let second = VoiceControl::new(VoiceParams::neutral());
+    service.attach(second.clone());
+    let status = service.status();
+    assert!(status.modified, "会话重建不得清除未保存修改");
+    assert_eq!(status.params.pitch_semitones, 7.0);
+    assert_eq!(second.params().pitch_semitones, 7.0);
+
+    service.select_preset("builtin:male").unwrap();
+    service.suspend();
+    service.restore();
+    service.flush_saves();
+    service.detach();
+    service.attach(VoiceControl::new(VoiceParams::neutral()));
+
+    let status = service.status();
+    assert!(status.draft_available, "待机与重建都不得清除草稿");
+    let restored = service.restore_draft().unwrap();
+    assert_eq!(restored.preset_id, "builtin:female");
+    assert_eq!(restored.params.pitch_semitones, 7.0);
+}
+
+#[test]
+fn 旧预设列表回复不能覆盖新选择() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let stale_generation = service.status().generation;
+    let stale_presets = service.presets();
+    assert!(stale_presets
+        .iter()
+        .any(|preset| preset.id == "builtin:female"));
+
+    let selected = service.select_preset("builtin:male").unwrap();
+    assert!(selected.generation > stale_generation);
+    assert!(
+        selected.is_stale_reply(stale_generation),
+        "代次落后的预设列表回复必须丢弃"
+    );
+    assert!(!selected.is_stale_reply(selected.generation));
+    assert_eq!(service.status().preset_id, "builtin:male");
+}
+
+#[test]
+fn 选择预设不清除临时旁路() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    service.set_enabled(true).unwrap();
+    service.set_bypass(true).unwrap();
+
+    let status = service.select_preset("builtin:male").unwrap();
+    assert!(status.bypassed, "选择预设不得清除临时旁路");
+    assert!(status.enabled);
+    assert_eq!(status.phase, "off");
+    assert_eq!(status.params.pitch_semitones, -4.0);
+    assert_eq!(control.params().pitch_semitones, -4.0);
+    assert_eq!(control.phase(), VoicePhase::Off);
+}
+
+#[test]
+fn 删除当前预设清除旁路并关闭() {
+    let dir = TemporaryDir::new();
+    let mut config = Config::default();
+    config.voice.enabled = true;
+    config.voice.active_preset = "user:alpha-000001".into();
+    config.voice_presets = vec![preset("user:alpha-000001", "甲", 3.0)];
+    let service = VoiceService::new_with_path(&config, config_path(&dir));
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+
+    service
+        .set_params(VoiceParamsDto {
+            pitch_semitones: 6.0,
+            ..VoiceParamsDto::default()
+        })
+        .unwrap();
+    service.select_preset("builtin:male").unwrap();
+    service.select_preset("user:alpha-000001").unwrap();
+    service.set_bypass(true).unwrap();
+    let status = service.status();
+    assert!(status.bypassed);
+    assert!(status.draft_available);
+
+    let status = service.delete_preset("user:alpha-000001").unwrap();
+    assert!(!status.bypassed, "删除当前预设必须清除旁路");
+    assert!(!status.enabled);
+    assert_eq!(status.phase, "off");
+    assert_eq!(status.preset_id, "builtin:female");
+    assert!(!status.draft_available);
+    assert_eq!(control.phase(), VoicePhase::Off);
+}
+
+#[test]
+fn 用户预设写入保留并发非变声配置() {
+    let dir = TemporaryDir::new();
+    let path = config_path(&dir);
+    let base = Config {
+        mic_gain_db: Some(-3.0),
+        voice: app_config::VoiceConfig {
+            bypass_hotkey: "F9".into(),
+            ..app_config::VoiceConfig::default()
+        },
+        ..Config::default()
+    };
+    base.save_to(&path).unwrap();
+
+    let service = VoiceService::new_with_path(&Config::default(), path.clone());
+    let mut concurrent = Config::load_from(&path);
+    concurrent.mic_gain_db = Some(-2.0);
+    concurrent.voice.bypass_hotkey = "F10".into();
+    concurrent.save_to(&path).unwrap();
+
+    let created = service.save_as_user_preset("写入门预设").unwrap();
+    service.flush_saves();
+
+    let saved = Config::load_from(&path);
+    assert_eq!(saved.mic_gain_db, Some(-2.0), "不得覆盖并发的非变声配置");
+    assert_eq!(saved.voice.bypass_hotkey, "F10", "不得覆盖并发的热键配置");
+    assert_eq!(saved.voice.active_preset, created.preset_id);
+    assert!(saved
+        .voice_presets
+        .iter()
+        .any(|preset| preset.id == created.preset_id));
+}
+
+#[test]
+fn 用户预设列表内置在前并按名称稳定排序() {
+    let dir = TemporaryDir::new();
+    let config = Config {
+        voice_presets: vec![
+            preset("user:zulu-000003", "B", 1.0),
+            preset("user:alpha-000001", "A", 2.0),
+            preset("user:beta-000002", "A", 3.0),
+        ],
+        ..Config::default()
+    };
+    let service = VoiceService::new_with_path(&config, config_path(&dir));
+
+    let presets = service.presets();
+    let builtin_count = builtin_voice_presets().len();
+    assert!(presets[..builtin_count].iter().all(|preset| preset.builtin));
+    let user_ids: Vec<_> = presets[builtin_count..]
+        .iter()
+        .map(|preset| preset.id.as_str())
+        .collect();
+    assert_eq!(
+        user_ids,
+        ["user:alpha-000001", "user:beta-000002", "user:zulu-000003"]
+    );
 }

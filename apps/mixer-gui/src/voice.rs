@@ -147,6 +147,16 @@ pub(crate) struct VoiceStatusDto {
     pub params: VoiceParamsDto,
     pub preview: VoicePreviewDto,
     pub save_error: Option<String>,
+    /// 状态快照的操作代次；异步回复低于当前代次时必须丢弃。
+    pub generation: u64,
+}
+
+impl VoiceStatusDto {
+    /// 回复是否早于当前状态。界面按同一代次规则丢弃旧的预设列表与轮询回复。
+    #[cfg(all(test, feature = "voice"))]
+    pub(crate) fn is_stale_reply(&self, generation: u64) -> bool {
+        generation < self.generation
+    }
 }
 
 impl VoiceStatusDto {
@@ -164,6 +174,7 @@ impl VoiceStatusDto {
             params: VoiceParamsDto::default(),
             preview: VoicePreviewDto::idle(),
             save_error: None,
+            generation: 0,
         }
     }
 }
@@ -192,9 +203,34 @@ fn phase_name(phase: VoicePhase) -> &'static str {
     }
 }
 
+/// 激活预设缺失或被删除时的回退目标，与配置层保持一致。
+#[cfg(feature = "voice")]
+const FALLBACK_PRESET_ID: &str = "builtin:female";
+
 #[cfg(feature = "voice")]
 fn params_from_config(params: VoiceParamsConfig) -> VoiceParams {
     VoiceParams {
+        pitch_semitones: params.pitch_semitones,
+        formant_semitones: params.formant_semitones,
+        gate_enabled: params.gate_enabled,
+        gate_db: params.gate_db,
+        eq_low_enabled: params.eq_low_enabled,
+        eq_low_db: params.eq_low_db,
+        eq_mid_enabled: params.eq_mid_enabled,
+        eq_mid_db: params.eq_mid_db,
+        eq_high_enabled: params.eq_high_enabled,
+        eq_high_db: params.eq_high_db,
+        drive_enabled: params.drive_enabled,
+        drive: params.drive,
+        robot_enabled: params.robot_enabled,
+        robot_hz: params.robot_hz,
+        robot_mix: params.robot_mix,
+    }
+}
+
+#[cfg(feature = "voice")]
+fn params_to_config(params: VoiceParams) -> VoiceParamsConfig {
+    VoiceParamsConfig {
         pitch_semitones: params.pitch_semitones,
         formant_semitones: params.formant_semitones,
         gate_enabled: params.gate_enabled,
@@ -223,13 +259,36 @@ fn preset_dto(preset: &VoicePreset) -> VoicePresetDto {
     }
 }
 
-/// 一次待落盘的启用状态与激活预设。
+/// 切换预设时留在宿主内存里的未保存修改；进程退出自然丢失。
+#[cfg(feature = "voice")]
+#[derive(Debug, Clone)]
+struct VoiceDraft {
+    source_preset_id: String,
+    params: VoiceParams,
+}
+
+/// 保存失败后用于恢复「未保存」判定的基线。
+#[cfg(feature = "voice")]
+#[derive(Debug, Clone)]
+struct PendingSaveRollback {
+    preset_id: String,
+    saved_params: VoiceParams,
+}
+
+/// 一次待落盘的完整变声状态。
+///
+/// 用户预设以服务内的权威列表整体替换配置里的 `[[voice_presets]]`，
+/// 而 `[voice]` 只覆盖服务拥有的字段；写线程严格重读磁盘，
+/// 因此并发修改的热键与其他配置不会被旧快照抹掉。
 #[cfg(feature = "voice")]
 #[derive(Debug, Clone)]
 struct VoiceWrite {
     generation: u64,
     enabled: bool,
     preset_id: String,
+    saved_params: VoiceParams,
+    rollback: Option<PendingSaveRollback>,
+    user_presets: Vec<VoicePreset>,
 }
 
 #[cfg(feature = "voice")]
@@ -243,11 +302,12 @@ struct VoiceState {
     suspended: u32,
     preset_id: String,
     preset_name: String,
-    /// 当前预设自身的参数，用于判断是否存在未保存修改。
+    /// 当前预设的保存基线；用户保存后立即前移，落盘失败时回滚。
     saved_params: VoiceParams,
     params: VoiceParams,
     user_presets: Vec<VoicePreset>,
-    draft_available: bool,
+    draft: Option<VoiceDraft>,
+    pending_save_rollback: Option<PendingSaveRollback>,
     preview: VoicePreviewDto,
     save_error: Option<String>,
     control: Option<VoiceControl>,
@@ -331,7 +391,8 @@ impl VoiceService {
                     saved_params: params,
                     params,
                     user_presets: config.voice_presets.clone(),
-                    draft_available: false,
+                    draft: None,
+                    pending_save_rollback: None,
                     preview: VoicePreviewDto::idle(),
                     save_error: None,
                     control: None,
@@ -361,10 +422,11 @@ impl VoiceService {
             preset_id: state.preset_id.clone(),
             preset_name: state.preset_name.clone(),
             modified: state.params != state.saved_params,
-            draft_available: state.draft_available,
+            draft_available: state.draft.is_some(),
             params: state.params.into(),
             preview: state.preview.clone(),
             save_error: state.save_error.clone(),
+            generation: state.operation,
         }
     }
 
@@ -467,6 +529,9 @@ impl VoiceService {
         Ok(self.status())
     }
 
+    /// 切换预设；切换前的未保存修改留在内存草稿里。
+    ///
+    /// 选择预设只更新参数与激活项，不改变启用状态，也不清除临时旁路。
     pub(crate) fn select_preset(&self, id: &str) -> Result<VoiceStatusDto> {
         let preset = builtin_voice_presets()
             .into_iter()
@@ -482,16 +547,188 @@ impl VoiceService {
         let params = params_from_config(preset.params);
         {
             let mut state = self.lock();
-            state.preset_id = preset.id;
-            state.preset_name = preset.name;
-            state.saved_params = params;
-            state.params = params;
-            state.operation = state.operation.wrapping_add(1);
-            if let Some(control) = &state.control {
-                control.set_params(params);
+            // 重复选择当前预设不能丢弃正在编辑的参数。
+            if state.preset_id != preset.id {
+                if state.params != state.saved_params {
+                    state.draft = Some(VoiceDraft {
+                        source_preset_id: state.preset_id.clone(),
+                        params: state.params,
+                    });
+                }
+                state.preset_id = preset.id;
+                state.preset_name = preset.name;
+                state.saved_params = params;
+                state.params = params;
+                state.pending_save_rollback = None;
+                state.operation = state.operation.wrapping_add(1);
+                if let Some(control) = &state.control {
+                    control.set_params(params);
+                }
+                self.queue_write(&mut state);
             }
-            // 选择预设只更新参数与激活项，不改变启用状态。
+        }
+        Ok(self.status())
+    }
+
+    /// 另存为用户预设：生成稳定 ID、写入完整预设列表并设为当前预设。
+    pub(crate) fn save_as_user_preset(&self, name: &str) -> Result<VoiceStatusDto> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "预设名称不能为空");
+        {
+            let mut state = self.lock();
+            let id = Config {
+                voice_presets: state.user_presets.clone(),
+                ..Config::default()
+            }
+            .new_user_preset_id(name);
+            let params = state.params;
+            state.user_presets.push(VoicePreset {
+                id: id.clone(),
+                name: name.to_owned(),
+                params: params_to_config(params),
+                unknown_lines: Vec::new(),
+            });
+            state.pending_save_rollback = Some(PendingSaveRollback {
+                preset_id: id.clone(),
+                saved_params: state.saved_params,
+            });
+            state.preset_id = id;
+            state.preset_name = name.to_owned();
+            state.saved_params = params;
+            state.operation = state.operation.wrapping_add(1);
             self.queue_write(&mut state);
+        }
+        Ok(self.status())
+    }
+
+    /// 保存当前用户预设；内置预设只能另存。
+    pub(crate) fn save_preset(&self) -> Result<VoiceStatusDto> {
+        {
+            let mut state = self.lock();
+            let id = state.preset_id.clone();
+            anyhow::ensure!(
+                !id.starts_with("builtin:"),
+                "内置预设不能保存，请另存为用户预设"
+            );
+            let index = state
+                .user_presets
+                .iter()
+                .position(|preset| preset.id == id)
+                .ok_or_else(|| anyhow::anyhow!("找不到变声预设「{id}」"))?;
+            let params = state.params;
+            state.user_presets[index].params = params_to_config(params);
+            let keeps_rollback = state
+                .pending_save_rollback
+                .as_ref()
+                .is_some_and(|rollback| rollback.preset_id == id);
+            if !keeps_rollback {
+                state.pending_save_rollback = Some(PendingSaveRollback {
+                    preset_id: id,
+                    saved_params: state.saved_params,
+                });
+            }
+            state.saved_params = params;
+            state.operation = state.operation.wrapping_add(1);
+            self.queue_write(&mut state);
+        }
+        Ok(self.status())
+    }
+
+    /// 只改名称，不改 ID；名称不要求唯一，排序按名称后 ID 稳定进行。
+    pub(crate) fn rename_preset(&self, id: &str, name: &str) -> Result<VoiceStatusDto> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "预设名称不能为空");
+        anyhow::ensure!(!id.starts_with("builtin:"), "内置预设不能重命名");
+        {
+            let mut state = self.lock();
+            let preset = state
+                .user_presets
+                .iter_mut()
+                .find(|preset| preset.id == id)
+                .ok_or_else(|| anyhow::anyhow!("找不到变声预设「{id}」"))?;
+            preset.name = name.to_owned();
+            if state.preset_id == id {
+                state.preset_name = name.to_owned();
+            }
+            state.operation = state.operation.wrapping_add(1);
+            self.queue_write(&mut state);
+        }
+        Ok(self.status())
+    }
+
+    /// 删除用户预设；删除当前预设时撤销草稿、旁路与试听，再回退并关闭变声。
+    pub(crate) fn delete_preset(&self, id: &str) -> Result<VoiceStatusDto> {
+        anyhow::ensure!(!id.starts_with("builtin:"), "内置预设不能删除");
+        {
+            let mut state = self.lock();
+            let index = state
+                .user_presets
+                .iter()
+                .position(|preset| preset.id == id)
+                .ok_or_else(|| anyhow::anyhow!("找不到变声预设「{id}」"))?;
+            state.user_presets.remove(index);
+            if state.preset_id == id {
+                // 先撤销试听与草稿，再关闭并回退，运行态不能保留已删除预设的痕迹。
+                state.preview = VoicePreviewDto::idle();
+                state.draft = None;
+                state.pending_save_rollback = None;
+                state.bypassed = false;
+                state.enabled = false;
+                let fallback = builtin_voice_presets()
+                    .into_iter()
+                    .find(|preset| preset.id == FALLBACK_PRESET_ID)
+                    .expect("内置回退预设必须存在");
+                let params = params_from_config(fallback.params);
+                state.preset_id = fallback.id;
+                state.preset_name = fallback.name;
+                state.saved_params = params;
+                state.params = params;
+                state.operation = state.operation.wrapping_add(1);
+                Self::apply_control(&state);
+            } else {
+                state.operation = state.operation.wrapping_add(1);
+            }
+            self.queue_write(&mut state);
+        }
+        Ok(self.status())
+    }
+
+    /// 恢复切换预设时留下的草稿。
+    ///
+    /// 源预设仍存在时切回源预设；源预设已被删除时把草稿应用到当前预设，
+    /// 并保持未保存状态。草稿只存在内存里，不排队写配置。
+    pub(crate) fn restore_draft(&self) -> Result<VoiceStatusDto> {
+        {
+            let mut state = self.lock();
+            let draft = state
+                .draft
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("没有可恢复的未保存修改"))?;
+            let source = builtin_voice_presets()
+                .into_iter()
+                .find(|preset| preset.id == draft.source_preset_id)
+                .or_else(|| {
+                    state
+                        .user_presets
+                        .iter()
+                        .find(|preset| preset.id == draft.source_preset_id)
+                        .cloned()
+                });
+            state.params = draft.params;
+            state.operation = state.operation.wrapping_add(1);
+            if let Some(preset) = source {
+                let switched = state.preset_id != preset.id;
+                state.preset_id = preset.id;
+                state.preset_name = preset.name;
+                state.saved_params = params_from_config(preset.params);
+                state.pending_save_rollback = None;
+                if switched {
+                    self.queue_write(&mut state);
+                }
+            }
+            if let Some(control) = &state.control {
+                control.set_params(state.params);
+            }
         }
         Ok(self.status())
     }
@@ -533,6 +770,9 @@ impl VoiceService {
             generation: state.save_generation,
             enabled: state.enabled,
             preset_id: state.preset_id.clone(),
+            saved_params: state.saved_params,
+            rollback: state.pending_save_rollback.clone(),
+            user_presets: state.user_presets.clone(),
         });
         if state.writer_active {
             return;
@@ -608,9 +848,22 @@ fn run_writer(shared: Arc<VoiceShared>) {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if write.generation == state.save_generation {
-            state.save_error = result
-                .err()
-                .map(|error| format!("保存变声配置失败: {error:#}"));
+            match result {
+                Ok(()) => {
+                    state.save_error = None;
+                    state.saved_params = write.saved_params;
+                    state.pending_save_rollback = None;
+                }
+                Err(error) => {
+                    state.save_error = Some(format!("保存变声配置失败: {error:#}"));
+                    // 只有保存命令会带基线；失败的保存不能把未保存修改显示成已保存。
+                    if let Some(rollback) = &write.rollback {
+                        if state.preset_id == rollback.preset_id {
+                            state.saved_params = rollback.saved_params;
+                        }
+                    }
+                }
+            }
         } else if let Err(error) = result {
             log::warn!(
                 "过期的变声配置保存失败（代次 {}）: {error:#}",
@@ -621,15 +874,17 @@ fn run_writer(shared: Arc<VoiceShared>) {
     }
 }
 
-/// 在进程级写入门内严格重读磁盘配置，只修改变声启用与激活预设后原子保存。
+/// 在进程级写入门内严格重读磁盘配置，写入服务拥有的变声字段后原子保存。
 ///
-/// 读取失败时保留原文件并返回错误，不能把默认配置写回去覆盖音效库与预设。
+/// 用户预设以权威列表整体替换；`[voice]` 的热键与未知键仍来自磁盘，
+/// 因此并发的非变声配置修改不会被旧快照覆盖。读取失败时保留原文件并返回错误。
 #[cfg(feature = "voice")]
 fn save_voice_snapshot(path: &Path, write: &VoiceWrite) -> Result<()> {
     crate::host::with_config_write(|| {
         let mut config = crate::host::load_config_for_write(path)?;
         config.voice.enabled = write.enabled;
         config.voice.active_preset = write.preset_id.clone();
+        config.voice_presets.clone_from(&write.user_presets);
         config.save_to(path)
     })
 }

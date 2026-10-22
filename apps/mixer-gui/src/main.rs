@@ -604,6 +604,35 @@ fn voice_select_preset(host: State<'_, AudioHost>, id: String) -> Res<VoiceStatu
     host.voice_select_preset(&id).map_err(err)
 }
 
+#[tauri::command]
+fn voice_save_as_user_preset(host: State<'_, AudioHost>, name: String) -> Res<VoiceStatusDto> {
+    host.voice_save_as_user_preset(&name).map_err(err)
+}
+
+#[tauri::command]
+fn voice_save_preset(host: State<'_, AudioHost>) -> Res<VoiceStatusDto> {
+    host.voice_save_preset().map_err(err)
+}
+
+#[tauri::command]
+fn voice_rename_preset(
+    host: State<'_, AudioHost>,
+    id: String,
+    name: String,
+) -> Res<VoiceStatusDto> {
+    host.voice_rename_preset(&id, &name).map_err(err)
+}
+
+#[tauri::command]
+fn voice_delete_preset(host: State<'_, AudioHost>, id: String) -> Res<VoiceStatusDto> {
+    host.voice_delete_preset(&id).map_err(err)
+}
+
+#[tauri::command]
+fn voice_restore_draft(host: State<'_, AudioHost>) -> Res<VoiceStatusDto> {
+    host.voice_restore_draft().map_err(err)
+}
+
 /// 前端加载完成后主动上报 —— 用来证明 WebView 真的渲染并执行了 JS。
 /// `--probe` 模式下会把它打印出来，供自动化验证。
 fn sound_item_dto(item: &app_config::SoundEntry) -> serde_json::Value {
@@ -1205,6 +1234,11 @@ fn main() {
             voice_set_bypass,
             voice_set_params,
             voice_select_preset,
+            voice_save_as_user_preset,
+            voice_save_preset,
+            voice_rename_preset,
+            voice_delete_preset,
+            voice_restore_draft,
             frontend_ready,
             load_config,
             save_config,
