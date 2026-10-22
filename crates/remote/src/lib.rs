@@ -102,6 +102,20 @@ impl Shared {
         *control = Some(ctl);
         *names = slots;
     }
+    /// 待机时清空播放入口，但保留停止处理器与变声路由。
+    ///
+    /// 手机停止仍是全局停止：人声试听可以在待机时继续录制，停止处理器只取消
+    /// 当前会话的试听，不重新发布播放控制，因此不会启动音效。
+    pub fn clear_playback(&self) {
+        let mut play = self.play_handler.lock().unwrap_or_else(|e| e.into_inner());
+        let mut control = self.control.lock().unwrap_or_else(|e| e.into_inner());
+        let mut names = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hook = self.on_play.lock().unwrap_or_else(|e| e.into_inner());
+        *play = None;
+        *control = None;
+        names.clear();
+        *hook = None;
+    }
     pub fn clear(&self) {
         let mut play = self.play_handler.lock().unwrap_or_else(|e| e.into_inner());
         let mut stop = self.stop_handler.lock().unwrap_or_else(|e| e.into_inner());
@@ -195,7 +209,8 @@ impl Shared {
         }
         ok
     }
-    pub fn stop_all(&self) {
+    /// 执行一次全局停止；返回是否真的有播放入口或停止处理器接住请求。
+    pub fn stop_all(&self) -> bool {
         let (handler, control) = {
             let handler = self.stop_handler.lock().unwrap_or_else(|e| e.into_inner());
             if handler.is_some() {
@@ -211,8 +226,12 @@ impl Shared {
         };
         if let Some(handler) = handler {
             handler();
+            true
         } else if let Some(control) = control {
             control.stop_all();
+            true
+        } else {
+            false
         }
     }
 }
@@ -359,6 +378,16 @@ fn handle(mut s: TcpStream, shared: &Shared) -> Result<()> {
         _ => {}
     }
 
+    // 停止不依赖播放路由：待机时播放控制已清除，但停止处理器仍要取消人声试听。
+    if path == "/stop" {
+        let body = if shared.stop_all() {
+            r#"{"ok":true,"action":"stop_all"}"#
+        } else {
+            r#"{"ok":false,"error":"音频未启动"}"#
+        };
+        return respond(&mut s, 200, "application/json", body);
+    }
+
     let Some(ctl) = ctl else {
         // 待机时播放路由已清除，但变声路由仍在：页面要能继续操作变声。
         if matches!(path, "/" | "/index.html") {
@@ -375,15 +404,6 @@ fn handle(mut s: TcpStream, shared: &Shared) -> Result<()> {
         "/" | "/index.html" => {
             let html = control_page(&slots, Some(&ctl), voice.as_ref());
             respond(&mut s, 200, "text/html; charset=utf-8", &html)
-        }
-        "/stop" => {
-            shared.stop_all();
-            respond(
-                &mut s,
-                200,
-                "application/json",
-                r#"{"ok":true,"action":"stop_all"}"#,
-            )
         }
         "/status" => {
             let st = ctl.stats();

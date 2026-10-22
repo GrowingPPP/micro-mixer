@@ -69,6 +69,29 @@ else
   echo "$JS_OUT" | tail -12
 fi
 
+# 默认构建已启用变声；这里再显式跑带 voice 特性的核心、会话、GUI 与遥控回归，
+# 避免 feature 统一后漏掉单独 crate 的特性构建。全部不接触音频设备。
+voice_suite() {
+  local label="$1"
+  shift
+  local status=0 out count
+  out=$("$@" 2>&1) || status=$?
+  count=$(echo "$out" | grep -E "^test result: ok\." | awk '{s+=$4} END {print s+0}')
+  if [ "$status" -eq 0 ] && [ "$count" -gt 0 ]; then
+    pass "$label" "$count 个"
+  else
+    fail "$label" "有失败项"
+    echo "$out" | grep -E "^(failures|error)" -A 4 | head -10 | sed 's/^/       /'
+  fi
+}
+voice_suite "变声核心回归" cargo test --locked -p audio-core --features voice
+# 最坏回调耗时门槛在单线程下测量，避免其他测试的调度抢占混入墙钟。
+voice_suite "变声实时耗时" cargo test --locked -p audio-core --features voice 实时回调 -- --ignored --test-threads=1
+voice_suite "变声含DSP耗时" cargo test --locked -p audio-core --features voice 含移调后端 -- --ignored --test-threads=1
+voice_suite "变声会话回归" cargo test --locked -p audio-session --features voice
+voice_suite "变声 GUI/宿主回归" cargo test --locked -p mixer-gui --features voice
+voice_suite "遥控链路回归" cargo test --locked -p remote
+
 if [ "$FAST" -eq 1 ]; then
   step "已跳过端到端（--fast）"
   echo

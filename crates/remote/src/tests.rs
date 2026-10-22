@@ -35,8 +35,10 @@ fn start(shared: Arc<Shared>) -> Server {
 
 fn get(port: u16, path: &str) -> String {
     let mut socket = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    // Workspace 并行测试会占满 CPU；给本地回环响应留出调度余量，
+    // 超时只影响测试等待，不放宽任何路由或内容断言。
     socket
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     write!(
         socket,
@@ -404,6 +406,34 @@ fn http_uses_unified_handlers_and_clear_then_set_restores_a_new_session() {
     assert_eq!(new_stops.load(Ordering::Relaxed), 1);
     assert_eq!(old_plays.load(Ordering::Relaxed), 1);
     assert_eq!(old_stops.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn 待机时停止请求不依赖播放控制即可到达宿主() {
+    let shared = Arc::new(Shared::default());
+    let stops = Arc::new(AtomicUsize::new(0));
+    let stop_count = stops.clone();
+    let stop: StopHandler = Arc::new(move || {
+        stop_count.fetch_add(1, Ordering::Relaxed);
+    });
+    shared.set_stop_handler(stop);
+    shared.set_voice_route(test_voice_route(
+        Arc::new(Mutex::new(TestVoiceState::new())),
+        Arc::new(Mutex::new(Vec::new())),
+    ));
+    let server = start(shared.clone());
+
+    let response = get(server.port, "/stop");
+    assert!(
+        response.contains("\"ok\":true") && response.contains("\"action\":\"stop_all\""),
+        "待机停止应成功并报告停止动作，实际 {response}"
+    );
+    assert_eq!(stops.load(Ordering::Relaxed), 1, "停止处理器必须被调用");
+    assert!(
+        shared.control.lock().unwrap().is_none(),
+        "待机停止不得重新发布播放控制"
+    );
+    assert!(!shared.play(0), "待机停止后不得通过回退控制启动播放");
 }
 
 #[test]

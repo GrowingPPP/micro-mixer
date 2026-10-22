@@ -932,6 +932,61 @@ fn 会话重启与待机保留草稿与修改() {
 }
 
 #[test]
+fn 完整链路待机重建释放组合不丢预设与草稿() {
+    let dir = TemporaryDir::new();
+    let service = VoiceService::new_with_path(&user_config(), config_path(&dir));
+    service.attach(VoiceControl::new(VoiceParams::neutral()));
+    service.select_preset("builtin:male").unwrap();
+    service
+        .set_params(VoiceParamsDto {
+            pitch_semitones: 7.0,
+            formant_semitones: 2.0,
+            ..VoiceParamsDto::default()
+        })
+        .unwrap();
+    let edited = service.select_preset("builtin:female").unwrap();
+    assert!(edited.enabled);
+    assert!(edited.draft_available, "切换预设应留下未保存草稿");
+    assert_eq!(service.status().preset_id, "builtin:female");
+
+    // 待机：运行控制保留，预设与草稿不变。
+    service.suspend();
+    let standby = service.status();
+    assert!(standby.enabled);
+    assert!(standby.draft_available);
+    assert_eq!(standby.preset_id, "builtin:female");
+
+    // 恢复并模拟设备重建：新控制句柄必须收到当前参数。
+    service.restore();
+    service.detach();
+    let rebuilt = VoiceControl::new(VoiceParams::neutral());
+    service.attach(rebuilt.clone());
+    let after_rebuild = service.status();
+    assert!(after_rebuild.enabled);
+    assert!(after_rebuild.draft_available);
+    assert_eq!(after_rebuild.preset_id, "builtin:female");
+    assert_eq!(
+        rebuilt.params(),
+        VoiceParams::from(after_rebuild.params),
+        "重建后的链必须沿用当前参数"
+    );
+
+    // 释放后再次接入：草稿仍保留，可恢复编辑前的预设。
+    service.detach();
+    let released = service.status();
+    assert!(released.draft_available, "释放不得清除草稿");
+    let third = VoiceControl::new(VoiceParams::neutral());
+    service.attach(third.clone());
+    let restored = service.restore_draft().unwrap();
+    assert_eq!(restored.preset_id, "builtin:male");
+    assert_eq!(restored.params.pitch_semitones, 7.0);
+    assert_eq!(restored.params.formant_semitones, 2.0);
+    assert!(!restored.draft_available);
+    assert_eq!(third.params().pitch_semitones, 7.0);
+    assert!(restored.enabled);
+}
+
+#[test]
 fn 旧预设列表回复不能覆盖新选择() {
     let dir = TemporaryDir::new();
     let service = service(&dir);

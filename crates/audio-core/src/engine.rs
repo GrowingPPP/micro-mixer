@@ -1793,8 +1793,8 @@ mod tests {
     use super::*;
     use crate::test_support::count_allocations;
     use crate::voice::{
-        VoiceBackend, VoiceParams, VoicePhase, VoicePreviewBuffer, VoicePreviewControl,
-        VoicePreviewSource, VoiceRuntime, VoiceSetup,
+        EffectChain, VoiceBackend, VoiceParams, VoicePhase, VoicePreviewBuffer,
+        VoicePreviewControl, VoicePreviewSource, VoiceRuntime, VoiceSetup,
     };
     use std::cell::Cell;
 
@@ -3530,6 +3530,7 @@ mod tests {
         let mut 单帧 = vec![0.0f32; 2];
         let 湿声等待 = 等待停止确认(&mut 湿声引擎, &mut 单帧);
         let 干声等待 = 等待停止确认(&mut 干声引擎, &mut 单帧);
+        eprintln!("停止尾部：湿声等待 {湿声等待} 帧，干声等待 {干声等待} 帧，淡出 {淡出帧} 帧");
 
         assert!(
             (淡出帧..淡出帧 + 2 * 路径前视帧()).contains(&干声等待),
@@ -5032,6 +5033,7 @@ mod tests {
         let 重复 = 湿偏移 - 干偏移;
         let 跳过 = 湿偏移 - 干偏移_关闭后;
         let 上限 = (变声延迟帧 + 变声块帧 + 路径前视帧()) as i64;
+        eprintln!("变声过渡：重复 {重复} 样本，跳过 {跳过} 样本，上限 {上限} 样本");
         assert!(
             重复 > 0 && 重复 <= 上限,
             "启用过渡重复 {重复} 样本，应在上限 {上限} 内"
@@ -5223,5 +5225,1291 @@ mod tests {
         }
         assert_eq!(control.phase(), VoicePhase::Wet);
         assert_eq!(control.params(), published);
+    }
+
+    // ─────────────────────────────────────────── 完整链路回归
+
+    /// 带试听记录区与控制句柄的会话引擎夹具。
+    struct 会话引擎 {
+        engine: EngineParts,
+        runtime: Arc<VoiceRuntime>,
+        control: VoiceControl,
+        preview: VoicePreviewControl,
+        buffer: Arc<VoicePreviewBuffer>,
+        block_frames: usize,
+    }
+
+    impl 会话引擎 {
+        fn 构造(
+            sample_rate: u32,
+            slots: Vec<SfxSlot>,
+            backend: Box<dyn VoiceBackend + Send>,
+        ) -> Self {
+            let runtime = Arc::new(VoiceRuntime::new());
+            let control = VoiceControl::with_runtime(runtime.clone(), VoiceParams::neutral());
+            let buffer = VoicePreviewBuffer::new(sample_rate, 3.0);
+            let preview = VoicePreviewControl::new(&control, buffer.clone());
+            let setup = VoiceSetup::with_control(control.clone(), 变声块毫秒, backend)
+                .with_preview(buffer.clone());
+            let engine = EngineParts::build_with_voice(
+                StreamFormat::new(sample_rate, 1),
+                StreamFormat::stereo(sample_rate),
+                slots,
+                变声缓冲毫秒,
+                Some(setup),
+            );
+            let block_frames = ((sample_rate as f32 * 变声块毫秒 / 1000.0).round() as usize).max(1);
+            Self {
+                engine,
+                runtime,
+                control,
+                preview,
+                buffer,
+                block_frames,
+            }
+        }
+
+        fn 推进(&mut self, input: &[f32]) -> Vec<f32> {
+            let mut out = vec![0.0f32; input.len() * 2];
+            self.engine.capture.process(input);
+            self.engine.render.process(&mut out);
+            左声道(&out)
+        }
+
+        /// 预填环形缓冲并推进到采集、渲染两侧都稳定的湿声。
+        fn 推进到湿声(&mut self, input: &[f32]) {
+            let mut out = vec![0.0f32; input.len() * 2];
+            for _ in 0..20 {
+                self.engine.capture.process(input);
+            }
+            self.runtime.request_enable();
+            for _ in 0..400 {
+                self.engine.capture.process(input);
+                self.engine.render.process(&mut out);
+                if self.runtime.phase() == VoicePhase::Wet
+                    && self.engine.render.voice_phase() == VoicePhase::Wet
+                {
+                    for _ in 0..8 {
+                        self.engine.capture.process(input);
+                        self.engine.render.process(&mut out);
+                    }
+                    return;
+                }
+            }
+            panic!("预热后应进入湿声，实际 {:?}", self.runtime.phase());
+        }
+    }
+
+    /// 与 [`会话引擎`] 采样率一致的测试正弦。
+    fn 采样率正弦(频率: f32, 起始帧: usize, 帧数: usize, sample_rate: u32) -> Vec<f32> {
+        (0..帧数)
+            .map(|index| {
+                let frame = 起始帧 + index;
+                (std::f32::consts::TAU * 频率 * frame as f32 / sample_rate as f32).sin() * 0.2
+            })
+            .collect()
+    }
+
+    fn 采样率单频幅度(samples: &[f32], hz: f32, sample_rate: u32) -> f32 {
+        let mut real = 0.0;
+        let mut imaginary = 0.0;
+        for (index, sample) in samples.iter().enumerate() {
+            let angle = std::f32::consts::TAU * hz * index as f32 / sample_rate as f32;
+            real += sample * angle.cos();
+            imaginary -= sample * angle.sin();
+        }
+        2.0 * (real * real + imaginary * imaginary).sqrt() / samples.len().max(1) as f32
+    }
+
+    fn 均方根(samples: &[f32]) -> f32 {
+        (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len().max(1) as f32)
+            .sqrt()
+    }
+
+    fn 全效果预设() -> VoiceParams {
+        VoiceParams {
+            gate_enabled: true,
+            gate_db: -60.0,
+            eq_low_enabled: true,
+            eq_low_db: 6.0,
+            eq_mid_enabled: true,
+            eq_mid_db: -3.0,
+            eq_high_enabled: true,
+            eq_high_db: 4.0,
+            drive_enabled: true,
+            drive: 0.3,
+            robot_enabled: true,
+            robot_hz: 50.0,
+            robot_mix: 0.5,
+            ..VoiceParams::neutral()
+        }
+    }
+
+    #[test]
+    fn 湿声切换预设不重置链且步进有界() {
+        for 回调帧 in [128usize, 256, 480] {
+            let (mut e, runtime, resets, backend_params) = 构造带记录变声引擎(变声延迟帧);
+            e.control.mic_gain_db.set(0.0);
+            e.control.sfx_gain_db.set(-100.0);
+            let 静音 = vec![0.0f32; 回调帧];
+            let mut out = vec![0.0f32; 回调帧 * 2];
+            for _ in 0..20 {
+                e.capture.process(&静音);
+            }
+            runtime.request_enable();
+            let mut 进入湿声 = false;
+            for _ in 0..400 {
+                e.capture.process(&静音);
+                e.render.process(&mut out);
+                if runtime.phase() == VoicePhase::Wet && e.render.voice_phase() == VoicePhase::Wet {
+                    进入湿声 = true;
+                    break;
+                }
+            }
+            assert!(进入湿声, "{回调帧} 帧回调预热后应进入湿声");
+
+            let mut fed = 0usize;
+            let mut 收集 = Vec::new();
+            for _ in 0..80 {
+                let input = 正弦输入(220.0, fed, 回调帧);
+                fed += 回调帧;
+                e.capture.process(&input);
+                e.render.process(&mut out);
+                收集.extend_from_slice(&左声道(&out));
+            }
+            let 切换前重置 = resets.load(Ordering::Relaxed);
+            let 切换前代次 = runtime.generation();
+            收集.clear();
+
+            // 切换只改变参数与无增益效果开关；恒等效果让输出仍由同一正弦构成。
+            let 预设 = VoiceParams {
+                pitch_semitones: 5.0,
+                formant_semitones: -3.0,
+                gate_enabled: true,
+                gate_db: -60.0,
+                eq_low_enabled: true,
+                eq_low_db: 0.0,
+                eq_mid_enabled: true,
+                eq_mid_db: 0.0,
+                eq_high_enabled: true,
+                eq_high_db: 0.0,
+                drive_enabled: true,
+                drive: 0.0,
+                robot_enabled: true,
+                robot_hz: 50.0,
+                robot_mix: 0.0,
+            };
+            e.voice_control()
+                .expect("变声会话应暴露控制句柄")
+                .set_params(预设);
+
+            for _ in 0..240 {
+                let input = 正弦输入(220.0, fed, 回调帧);
+                fed += 回调帧;
+                e.capture.process(&input);
+                e.render.process(&mut out);
+                收集.extend_from_slice(&左声道(&out));
+            }
+
+            assert_eq!(
+                resets.load(Ordering::Relaxed),
+                切换前重置,
+                "{回调帧} 帧回调切换预设不得重置后端"
+            );
+            assert_eq!(
+                runtime.generation(),
+                切换前代次,
+                "{回调帧} 帧回调切换预设不得推进运行代次"
+            );
+            assert_eq!(runtime.phase(), VoicePhase::Wet);
+            assert_eq!(
+                backend_params
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pitch_semitones,
+                5.0,
+                "新快照必须到达后端"
+            );
+            assert_eq!(
+                e.capture
+                    .voice
+                    .as_ref()
+                    .expect("带变声会话应存在 tee")
+                    .chain
+                    .0
+                    .overflowed_frames(),
+                0,
+                "{回调帧} 帧回调切换预设不得丢弃湿声"
+            );
+
+            let 输入步进 = 最大相邻步进(&正弦输入(220.0, 0, 4_800));
+            let 切换步进 = 最大相邻步进(&收集);
+            assert!(
+                切换步进 <= 输入步进 * 1.5 + 1e-5,
+                "{回调帧} 帧回调切换预设最大步进 {切换步进} 超过输入步进 {输入步进} 的 1.5 倍"
+            );
+
+            // 湿→湿切换不能跳过样本：用斜坡序号测量切换前后的传输偏移。
+            let control = e.voice_control().expect("变声会话应暴露控制句柄");
+            let mut 斜坡已喂 = 0usize;
+            let mut 斜坡输出 = vec![0.0f32; 回调帧 * 2];
+            control.set_params(VoiceParams::neutral());
+            for _ in 0..80 {
+                let input = 斜坡块(斜坡已喂, 回调帧);
+                e.capture.process(&input);
+                e.render.process(&mut 斜坡输出);
+                斜坡已喂 += 回调帧;
+            }
+            let 切换前偏移 = 变声偏移(&e, 斜坡已喂, 斜坡输出[斜坡输出.len() - 2]);
+            let 重置前 = resets.load(Ordering::Relaxed);
+            control.set_params(预设);
+            // 只跨过新参数生效所需的最少算法块，避免漂移校正在测量窗口内累积。
+            let 切换后回调数 = (变声块帧 / 回调帧).max(1) + 1;
+            for _ in 0..切换后回调数 {
+                let input = 斜坡块(斜坡已喂, 回调帧);
+                e.capture.process(&input);
+                e.render.process(&mut 斜坡输出);
+                斜坡已喂 += 回调帧;
+            }
+            let 切换后偏移 = 变声偏移(&e, 斜坡已喂, 斜坡输出[斜坡输出.len() - 2]);
+            eprintln!(
+                "{回调帧} 帧回调湿→湿切换偏移变化 {} 样本",
+                切换后偏移 - 切换前偏移
+            );
+            assert_eq!(
+                resets.load(Ordering::Relaxed),
+                重置前,
+                "{回调帧} 帧回调斜坡切换预设不得重置后端"
+            );
+            assert!(
+                (切换后偏移 - 切换前偏移).abs() <= 2,
+                "{回调帧} 帧回调湿→湿切换偏移变化 {} 样本，出现跳过或重复",
+                切换后偏移 - 切换前偏移
+            );
+        }
+    }
+
+    #[cfg(feature = "voice")]
+    fn 测量移调比(sample_rate: u32, semitones: f32) -> f32 {
+        use crate::voice::SignalsmithBackend;
+
+        let mut backend =
+            SignalsmithBackend::new(sample_rate, 变声块毫秒).expect("创建 Signalsmith 后端");
+        backend.set_params(VoiceParams {
+            pitch_semitones: semitones,
+            ..VoiceParams::neutral()
+        });
+        let block_frames = ((sample_rate as f32 * 变声块毫秒 / 1000.0).round() as usize).max(1);
+        let input = 采样率正弦(220.0, 0, sample_rate as usize * 2, sample_rate);
+        let mut block = vec![0.0f32; block_frames];
+        let mut wet = Vec::with_capacity(input.len());
+        for chunk in input.chunks(block_frames) {
+            let produced = backend.process(chunk, &mut block[..chunk.len()]);
+            wet.extend_from_slice(&block[..produced]);
+        }
+        let skip = (backend.latency_frames() + sample_rate as usize / 2).min(wet.len());
+        let tail = &wet[skip..];
+        let min_lag = (sample_rate as f32 / 500.0).floor() as usize;
+        let max_lag = (sample_rate as f32 / 200.0).ceil() as usize + 2;
+        let window = tail.len().min(sample_rate as usize);
+        let mut scores = vec![0.0f32; max_lag - min_lag + 1];
+        for lag in min_lag..=max_lag {
+            let count = window.saturating_sub(lag);
+            let mut sum = 0.0;
+            for index in 0..count {
+                sum += tail[index] * tail[index + lag];
+            }
+            scores[lag - min_lag] = sum / count.max(1) as f32;
+        }
+        let peak = (1..scores.len() - 1)
+            .max_by(|left, right| {
+                scores[*left]
+                    .partial_cmp(&scores[*right])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .expect("自相关应存在峰值");
+        let denominator = scores[peak - 1] - 2.0 * scores[peak] + scores[peak + 1];
+        let offset = if denominator.abs() > 1e-12 {
+            0.5 * (scores[peak - 1] - scores[peak + 1]) / denominator
+        } else {
+            0.0
+        };
+        let period = (min_lag + peak) as f32 + offset;
+        sample_rate as f32 / (period.max(1.0) * 220.0)
+    }
+
+    #[cfg(feature = "voice")]
+    fn 测量共振峰质心比(sample_rate: u32) -> f32 {
+        use crate::voice::{SignalsmithBackend, VoiceBackend};
+
+        let frames = sample_rate as usize * 2;
+        let 共振峰包络 = |hz: f32| {
+            let mut envelope = 0.04;
+            for (center, bandwidth, gain) in [
+                (700.0f32, 130.0f32, 1.0f32),
+                (1_220.0, 180.0, 0.7),
+                (2_600.0, 250.0, 0.5),
+            ] {
+                envelope += gain * (-((hz - center) / bandwidth).powi(2)).exp();
+            }
+            envelope
+        };
+        let harmonic: Vec<f32> = (0..frames)
+            .map(|index| {
+                let mut sample = 0.0;
+                for order in 1..=16 {
+                    let hz = 220.0 * order as f32;
+                    sample += (std::f32::consts::TAU * hz * index as f32 / sample_rate as f32)
+                        .sin()
+                        * 共振峰包络(hz)
+                        / order as f32;
+                }
+                sample * 0.02
+            })
+            .collect();
+        let block_frames = ((sample_rate as f32 * 变声块毫秒 / 1000.0).round() as usize).max(1);
+        let 处理后 = |formant_semitones: f32| {
+            let mut backend =
+                SignalsmithBackend::new(sample_rate, 变声块毫秒).expect("创建 Signalsmith 后端");
+            backend.set_params(VoiceParams {
+                formant_semitones,
+                ..VoiceParams::neutral()
+            });
+            let mut block = vec![0.0f32; block_frames];
+            let mut wet = Vec::with_capacity(harmonic.len());
+            for chunk in harmonic.chunks(block_frames) {
+                let produced = backend.process(chunk, &mut block[..chunk.len()]);
+                wet.extend_from_slice(&block[..produced]);
+            }
+            let skip = (backend.latency_frames() + sample_rate as usize / 2).min(wet.len());
+            wet[skip..].to_vec()
+        };
+        let neutral = 处理后(0.0);
+        let shifted = 处理后(7.0);
+        let 质心 = |samples: &[f32]| {
+            let mut weighted = 0.0;
+            let mut total = 0.0;
+            // 只测 220 Hz 的谐波包络，避免粗网格把共振峰变化稀释掉。
+            for order in 1..=16 {
+                let hz = 220.0 * order as f32;
+                let amplitude = 采样率单频幅度(samples, hz, sample_rate);
+                weighted += hz * amplitude;
+                total += amplitude;
+            }
+            weighted / total.max(1e-9)
+        };
+        质心(&shifted) / 质心(&neutral)
+    }
+
+    #[test]
+    fn 四十四点一千赫与四十八千赫参数一致() {
+        let mut 效果指标 = Vec::new();
+        for sample_rate in [44_100u32, 48_000] {
+            let mut chain = EffectChain::new(sample_rate);
+            chain.set_params(全效果预设());
+            let mut output = 采样率正弦(220.0, 0, sample_rate as usize, sample_rate);
+            chain.process_gate(&mut output);
+            chain.process_post(&mut output);
+            let steady = &output[sample_rate as usize / 2..];
+            let rms = 均方根(steady);
+            let bins: Vec<f32> = [170.0, 220.0, 270.0, 440.0, 660.0]
+                .iter()
+                .map(|hz| 采样率单频幅度(steady, *hz, sample_rate))
+                .collect();
+            // 绝对锚点：整体旁路效果链时 RMS、载波、边带与驱动谐波都会同时改变。
+            assert!(
+                rms > 0.25,
+                "{sample_rate} Hz 效果链不应被整体旁路，RMS {rms}"
+            );
+            assert!(
+                bins[0] > 0.1 && bins[2] > 0.1,
+                "{sample_rate} Hz 环形调制边带不足：170 Hz {} / 270 Hz {}",
+                bins[0],
+                bins[2]
+            );
+            assert!(
+                (bins[1] - 0.34).abs() <= 0.34 * 0.05,
+                "{sample_rate} Hz 220 Hz 载波应约为 0.34，实测 {}",
+                bins[1]
+            );
+            assert!(
+                bins[4] > 0.005,
+                "{sample_rate} Hz 软削波谐波不足，660 Hz 实测 {}",
+                bins[4]
+            );
+            效果指标.push((rms, bins));
+
+            let mut gate = EffectChain::new(sample_rate);
+            gate.set_params(VoiceParams {
+                gate_enabled: true,
+                gate_db: -20.0,
+                ..VoiceParams::neutral()
+            });
+            let mut quiet = 采样率正弦(440.0, 0, sample_rate as usize / 2, sample_rate)
+                .into_iter()
+                .map(|sample| sample * 0.05)
+                .collect::<Vec<_>>();
+            gate.process_gate(&mut quiet);
+            let quiet_peak = 取峰值(&quiet[sample_rate as usize / 4..]);
+            assert!(
+                quiet_peak < 0.001,
+                "{sample_rate} Hz 门限以下应衰减，峰值 {quiet_peak}"
+            );
+
+            assert_eq!(
+                VoicePreviewBuffer::new(sample_rate, 3.0).capacity(),
+                sample_rate as usize * 3,
+                "{sample_rate} Hz 试听容量应为三秒"
+            );
+        }
+        eprintln!(
+            "采样率效果指标：44.1k RMS {} 分量 {:?}；48k RMS {} 分量 {:?}",
+            效果指标[0].0, 效果指标[0].1, 效果指标[1].0, 效果指标[1].1
+        );
+        assert!(
+            (效果指标[0].0 - 效果指标[1].0).abs() < 效果指标[1].0 * 0.02,
+            "两种采样率的稳态电平应一致：44.1k {} / 48k {}",
+            效果指标[0].0,
+            效果指标[1].0
+        );
+        for (index, hz) in [170.0, 220.0, 270.0, 440.0, 660.0].iter().enumerate() {
+            let low = 效果指标[0].1[index];
+            let high = 效果指标[1].1[index];
+            assert!(
+                (low - high).abs() < high.abs().max(0.01) * 0.06,
+                "{hz} Hz 分量在两种采样率下不一致：44.1k {low} / 48k {high}"
+            );
+        }
+
+        for sample_rate in [44_100u32, 48_000] {
+            let block_frames = ((sample_rate as f32 * 变声块毫秒 / 1000.0).round() as usize).max(1);
+            let mut session = 会话引擎::构造(
+                sample_rate,
+                vec![构造槽位(vec![4.0f32; sample_rate as usize * 2], true)],
+                Box::new(DelayBackend::new(0)),
+            );
+            session.engine.control.mic_gain_db.set(0.0);
+            session.engine.control.sfx_gain_db.set(-100.0);
+            let 人声 = vec![0.2f32; block_frames];
+            session.推进到湿声(&人声);
+            let normal = session.推进(&人声);
+            let normal_peak = 取峰值(&normal[normal.len().saturating_sub(2_000)..]);
+            assert!(
+                (normal_peak - 0.2).abs() < 0.01,
+                "{sample_rate} Hz 正常人声应保持 0.2，实测 {normal_peak}"
+            );
+
+            let 过载 = vec![4.0f32; block_frames];
+            let mut path_peak = 0.0f32;
+            for _ in 0..200 {
+                path_peak = 取峰值(&session.推进(&过载));
+            }
+            assert!(
+                (path_peak - 路径限幅上限()).abs() < 0.02,
+                "{sample_rate} Hz 人声路径限幅应压到 −3 dBFS，实测 {path_peak}"
+            );
+
+            session.engine.control.sfx_gain_db.set(0.0);
+            assert!(session.engine.control.play(0));
+            let mut mixed_peak = 0.0f32;
+            for _ in 0..200 {
+                mixed_peak = 取峰值(&session.推进(&过载));
+            }
+            assert!(
+                (mixed_peak - 末端限幅上限()).abs() < 0.02,
+                "{sample_rate} Hz 合并过载应压到 −1 dBFS，实测 {mixed_peak}"
+            );
+            assert_eq!(
+                session.engine.stats.underruns.load(Ordering::Relaxed),
+                0,
+                "{sample_rate} Hz 不应欠载"
+            );
+        }
+
+        #[cfg(feature = "voice")]
+        {
+            let expected = 2.0f32.powf(7.0 / 12.0);
+            let ratio_44 = 测量移调比(44_100, 7.0);
+            let ratio_48 = 测量移调比(48_000, 7.0);
+            let 半音差 = |ratio: f32| 12.0 * (ratio / expected).log2().abs();
+            let 采样率差 = 12.0 * (ratio_44 / ratio_48).log2().abs();
+            eprintln!(
+                "移调比：44.1k {ratio_44}（偏离 {:.3} 半音），48k {ratio_48}（偏离 {:.3} 半音），\
+                 采样率差 {采样率差:.3} 半音",
+                半音差(ratio_44),
+                半音差(ratio_48)
+            );
+            assert!(
+                半音差(ratio_44) <= 0.6,
+                "44.1 kHz 移调比 {ratio_44} 偏离期望超过 0.6 半音"
+            );
+            assert!(
+                半音差(ratio_48) <= 0.6,
+                "48 kHz 移调比 {ratio_48} 偏离期望超过 0.6 半音"
+            );
+            assert!(
+                采样率差 <= 1.0,
+                "两种采样率移调差 {采样率差} 半音，超过设计门槛 1 半音：44.1k {ratio_44} / 48k {ratio_48}"
+            );
+
+            let formant_44 = 测量共振峰质心比(44_100);
+            let formant_48 = 测量共振峰质心比(48_000);
+            let formant_半音 = 12.0 * (formant_44 / formant_48).log2().abs();
+            eprintln!(
+                "共振峰 +7 半音质心比：44.1k {formant_44}，48k {formant_48}，差 {formant_半音:.3} 半音"
+            );
+            // 质心比不是名义半音倍数；绝对下限用于排除“formant 参数被忽略”时两端同为 1 的变异。
+            assert!(
+                formant_44 > 1.05 && formant_48 > 1.05,
+                "共振峰 +7 半音应抬升谐波包络质心：44.1k {formant_44} / 48k {formant_48}"
+            );
+            assert!(
+                formant_半音 <= 1.0,
+                "两种采样率共振峰搬移差 {formant_半音} 半音，超过设计门槛 1 半音：\
+                 44.1k {formant_44} / 48k {formant_48}"
+            );
+        }
+    }
+
+    #[test]
+    fn 十分钟混合运行无欠载无分配() {
+        const 总帧数: usize = 48_000 * 600;
+        const 回调帧: usize = 480;
+        let (mut session, 步数) = {
+            let session =
+                会话引擎::构造(48_000, Vec::new(), Box::new(DelayBackend::new(变声延迟帧)));
+            session.engine.control.mic_gain_db.set(0.0);
+            session.engine.control.sfx_gain_db.set(-100.0);
+            (session, 总帧数 / 回调帧)
+        };
+        let input: Vec<f32> = (0..回调帧)
+            .map(|index| (std::f32::consts::TAU * 200.0 * index as f32 / 48_000.0).sin() * 0.2)
+            .collect();
+        let mut out = vec![0.0f32; 回调帧 * 2];
+        for _ in 0..20 {
+            session.engine.capture.process(&input);
+        }
+
+        let 预设 = [
+            VoiceParams::neutral(),
+            VoiceParams {
+                pitch_semitones: 4.0,
+                gate_enabled: true,
+                gate_db: -55.0,
+                eq_low_enabled: true,
+                eq_low_db: 4.0,
+                eq_high_enabled: true,
+                eq_high_db: 3.0,
+                robot_enabled: true,
+                robot_hz: 70.0,
+                robot_mix: 0.4,
+                ..VoiceParams::neutral()
+            },
+            VoiceParams {
+                pitch_semitones: -5.0,
+                formant_semitones: 3.0,
+                eq_mid_enabled: true,
+                eq_mid_db: -4.0,
+                drive_enabled: true,
+                drive: 0.4,
+                ..VoiceParams::neutral()
+            },
+        ];
+
+        let mut 分配计数 = 0usize;
+        let mut 欠载 = 0u64;
+        let mut 溢出 = 0u64;
+        let mut 耗时 = Vec::with_capacity(步数);
+        let mut 比率最小 = f64::INFINITY;
+        let mut 比率最大 = f64::NEG_INFINITY;
+        let mut 贴上限步数 = 0usize;
+        let mut 稳态步数 = 0usize;
+        let mut 试听开始 = 0usize;
+        let mut 试听完成 = 0usize;
+        let mut 试听取消 = 0usize;
+        let mut 采集来源 = 0usize;
+        let mut 渲染来源 = 0usize;
+        let mut 渲染完成 = 0usize;
+        let mut 录制中参数更新 = 0usize;
+        let mut 启停中试听 = 0usize;
+        let mut 取消延迟最大 = 0.0f64;
+        let mut 试听中: Option<(usize, bool, bool, VoicePreviewSource)> = None;
+        let mut 待测取消: Option<std::time::Instant> = None;
+
+        session.engine.capture.process(&input);
+        session.engine.render.process(&mut out);
+
+        for step in 0..步数 {
+            if step % 600 == 0 {
+                session.control.set_params(预设[(step / 600) % 预设.len()]);
+            }
+            if step % 1200 == 600 {
+                if 试听中.is_some() {
+                    启停中试听 += 1;
+                }
+                match session.control.phase() {
+                    VoicePhase::Off => session.control.request_enable(),
+                    VoicePhase::Wet => session.control.request_disable(),
+                    VoicePhase::Warmup | VoicePhase::FadingOut => {}
+                }
+            }
+            // 在部分录制窗口内发布新参数，覆盖“录制中切预设立即取消”。
+            if let Some((起始, _, true, _)) = 试听中 {
+                if step == 起始 + 80 {
+                    session
+                        .control
+                        .set_params(预设[(step / 600 + 1) % 预设.len()]);
+                    录制中参数更新 += 1;
+                }
+            }
+            if let Some((起始, 完整录制, _, 来源)) = 试听中 {
+                if session.runtime.preview_snapshot().is_none() {
+                    试听中 = None;
+                    试听取消 += 1;
+                } else if 完整录制 && step - 起始 >= 330 && session.preview.is_finished() {
+                    if let Some(clip) = session.preview.take() {
+                        assert_eq!(clip.samples.len(), 48_000 * 3, "试听应为三秒");
+                        试听完成 += 1;
+                        if 来源 == VoicePreviewSource::Render {
+                            渲染完成 += 1;
+                        }
+                    }
+                    试听中 = None;
+                } else if !完整录制 && step - 起始 >= 100 {
+                    let started = std::time::Instant::now();
+                    session.preview.stop();
+                    待测取消 = Some(started);
+                    试听中 = None;
+                    试听取消 += 1;
+                }
+            }
+            // 0/500/1700 覆盖关闭态与待机前录制，1200 覆盖湿声态；
+            // 500/1700 会让随后的启停落入录制窗口。
+            let 试听时机 = matches!(step % 2400, 0 | 500 | 1200 | 1700);
+            if 试听中.is_none() && 试听时机 {
+                let phase = session.control.phase();
+                if let Ok(start) = session.preview.start() {
+                    assert!(start.generation > 0, "试听代次必须非零");
+                    match start.source {
+                        VoicePreviewSource::Capture => {
+                            assert_eq!(phase, VoicePhase::Off, "关闭态试听应走采集侧");
+                            采集来源 += 1;
+                        }
+                        VoicePreviewSource::Render => {
+                            assert_eq!(phase, VoicePhase::Wet, "湿声态试听应走渲染侧");
+                            渲染来源 += 1;
+                        }
+                    }
+                    试听开始 += 1;
+                    let cycle = step / 2400;
+                    let 完整录制 = step % 2400 == 1200 && cycle % 2 == 0;
+                    let 录制中更新 = step % 2400 == 1200 && cycle % 2 == 1;
+                    试听中 = Some((step, 完整录制, 录制中更新, start.source));
+                } else {
+                    assert!(
+                        !matches!(phase, VoicePhase::Off | VoicePhase::Wet),
+                        "稳定阶段应能开始试听，实际 {phase:?}"
+                    );
+                }
+            }
+
+            let started = std::time::Instant::now();
+            let allocations = count_allocations(|| {
+                session.engine.capture.process(&input);
+                session.engine.render.process(&mut out);
+            });
+            分配计数 += allocations;
+            耗时.push(started.elapsed().as_secs_f64());
+            if let Some(started) = 待测取消.take() {
+                取消延迟最大 = 取消延迟最大.max(started.elapsed().as_secs_f64());
+            }
+
+            欠载 = session.engine.stats.underruns.load(Ordering::Relaxed);
+            溢出 = session.engine.stats.overruns.load(Ordering::Relaxed);
+            if step >= 200 {
+                let ratio = session.engine.capture.resampler.ratio();
+                比率最小 = 比率最小.min(ratio);
+                比率最大 = 比率最大.max(ratio);
+                稳态步数 += 1;
+                if (ratio - 1.0).abs() >= 0.0199 {
+                    贴上限步数 += 1;
+                }
+            }
+        }
+
+        while session.control.phase() != VoicePhase::Off {
+            session.control.request_disable();
+            session.engine.capture.process(&input);
+            session.engine.render.process(&mut out);
+        }
+        if let Some((_, 完整录制, _, 来源)) = 试听中 {
+            if 完整录制 && session.preview.is_finished() {
+                if session.preview.take().is_some() {
+                    试听完成 += 1;
+                    if 来源 == VoicePreviewSource::Render {
+                        渲染完成 += 1;
+                    }
+                }
+            } else {
+                session.preview.stop();
+                试听取消 += 1;
+            }
+        }
+        if session.buffer.write_pos() != 0 {
+            session.preview.stop();
+        }
+
+        let mut 排序 = 耗时.clone();
+        排序.sort_by(f64::total_cmp);
+        let p50 = 排序[排序.len() / 2];
+        let p99 = 排序[(排序.len() as f64 * 0.99) as usize];
+        let 最大 = *排序.last().expect("应记录回调耗时");
+        eprintln!(
+            "十分钟混合运行：回调 {} 次，P50 {:.1} µs，P99 {:.1} µs，最大 {:.1} µs；\
+             漂移比率 {:.6}..{:.6}，贴上限 {}/{}；试听开始 {}（采集 {} / 渲染 {}）\
+             完成 {}（渲染 {}）取消 {}，录制中参数更新 {}，启停中试听 {}，\
+             取消延迟最大 {:.1} µs",
+            排序.len(),
+            p50 * 1e6,
+            p99 * 1e6,
+            最大 * 1e6,
+            比率最小,
+            比率最大,
+            贴上限步数,
+            稳态步数,
+            试听开始,
+            采集来源,
+            渲染来源,
+            试听完成,
+            渲染完成,
+            试听取消,
+            录制中参数更新,
+            启停中试听,
+            取消延迟最大 * 1e6
+        );
+
+        assert_eq!(分配计数, 0, "十分钟运行期间实时回调不得分配");
+        assert_eq!(欠载, 0, "十分钟运行期间不得欠载");
+        assert_eq!(溢出, 0, "十分钟运行期间不得溢出");
+        assert!(
+            比率最小 >= 0.98 && 比率最大 <= 1.02,
+            "漂移比率越界：{比率最小}..{比率最大}"
+        );
+        assert!(
+            贴上限步数 as f64 / (稳态步数.max(1) as f64) < 0.01,
+            "漂移比率不应长期贴住 ±2% 上限：{贴上限步数}/{}",
+            稳态步数
+        );
+        assert!(试听开始 >= 20, "混合运行覆盖的试听次数不足：{试听开始}");
+        assert!(采集来源 > 0, "应覆盖关闭态采集侧试听");
+        assert!(渲染来源 > 0, "应覆盖湿声态渲染侧试听");
+        assert!(渲染完成 > 0, "应至少完成一次渲染侧试听");
+        assert!(试听完成 >= 5, "混合运行应完成若干次试听：{试听完成}");
+        assert!(试听取消 > 0, "混合运行应覆盖试听取消");
+        assert!(录制中参数更新 > 0, "应覆盖录制窗口内的参数更新取消");
+        assert!(启停中试听 > 0, "应覆盖启停落在试听录制窗口内");
+        // P99 按设计门槛断言；并行测试进程的墙钟最大值包含调度抢占，
+        // 单次回调最坏耗时由专用的单线程实时预算回归断言。
+        assert!(
+            p99 <= 0.010 * 0.15,
+            "P99 回调耗时 {:.3} ms 超过 10 ms 周期的 15%",
+            p99 * 1e3
+        );
+        assert_eq!(session.control.phase(), VoicePhase::Off);
+    }
+
+    #[test]
+    #[ignore = "实时耗时门槛需要单线程运行，避免其他测试的调度噪声"]
+    fn 实时回调耗时不超过预算() {
+        for (回调帧, 周期毫秒) in [(128usize, 128.0 / 48.0), (256, 256.0 / 48.0), (480, 10.0)]
+        {
+            let mut session =
+                会话引擎::构造(48_000, Vec::new(), Box::new(DelayBackend::new(变声延迟帧)));
+            session.control.set_params(全效果预设());
+            session.engine.control.mic_gain_db.set(0.0);
+            session.engine.control.sfx_gain_db.set(-100.0);
+            session.推进到湿声(&vec![0.2f32; 变声块帧]);
+
+            let input = vec![0.2f32; 回调帧];
+            let mut out = vec![0.0f32; 回调帧 * 2];
+            let 目标帧数 = 48_000 * 10;
+            let mut fed = 0usize;
+            let mut 耗时 = Vec::with_capacity(目标帧数 / 回调帧 + 1);
+            while fed < 目标帧数 {
+                let frames = 回调帧.min(目标帧数 - fed);
+                let started = std::time::Instant::now();
+                session.engine.capture.process(&input[..frames]);
+                session.engine.render.process(&mut out[..frames * 2]);
+                耗时.push(started.elapsed().as_secs_f64());
+                fed += frames;
+            }
+            耗时.sort_by(f64::total_cmp);
+            let p99 = 耗时[(耗时.len() as f64 * 0.99) as usize];
+            let 最大 = *耗时.last().expect("应记录回调耗时");
+            eprintln!(
+                "实时预算：{回调帧} 帧回调（周期 {周期毫秒:.3} ms）P99 {:.1} µs，最大 {:.1} µs",
+                p99 * 1e6,
+                最大 * 1e6
+            );
+            assert!(
+                p99 <= 周期毫秒 / 1000.0 * 0.15,
+                "{回调帧} 帧回调 P99 {:.3} ms 超过周期 {周期毫秒:.3} ms 的 15%",
+                p99 * 1e3
+            );
+            assert!(
+                最大 < 周期毫秒 / 1000.0,
+                "{回调帧} 帧回调最大耗时 {:.3} ms 达到或超过周期 {周期毫秒:.3} ms",
+                最大 * 1e3
+            );
+            assert_eq!(
+                session.engine.stats.underruns.load(Ordering::Relaxed),
+                0,
+                "{回调帧} 帧回调不应欠载"
+            );
+        }
+    }
+
+    #[cfg(feature = "voice")]
+    #[test]
+    #[ignore = "包含 C++ 移调/共振峰后端，需单线程运行"]
+    fn 含移调后端的回调预算() {
+        use crate::voice::SignalsmithBackend;
+
+        for (回调帧, 周期毫秒) in [(128usize, 128.0 / 48.0), (480, 10.0)] {
+            let backend = Box::new(
+                SignalsmithBackend::new(48_000, 变声块毫秒).expect("创建 Signalsmith 后端"),
+            );
+            let mut session = 会话引擎::构造(48_000, Vec::new(), backend);
+            session.control.set_params(VoiceParams {
+                pitch_semitones: 4.0,
+                formant_semitones: 3.0,
+                ..全效果预设()
+            });
+            session.engine.control.mic_gain_db.set(0.0);
+            session.engine.control.sfx_gain_db.set(-100.0);
+            session.推进到湿声(&vec![0.2f32; 变声块帧]);
+
+            let input = vec![0.2f32; 回调帧];
+            let mut out = vec![0.0f32; 回调帧 * 2];
+            let 目标帧数 = 48_000 * 5;
+            let mut fed = 0usize;
+            let mut 耗时 = Vec::with_capacity(目标帧数 / 回调帧 + 1);
+            while fed < 目标帧数 {
+                let frames = 回调帧.min(目标帧数 - fed);
+                let started = std::time::Instant::now();
+                session.engine.capture.process(&input[..frames]);
+                session.engine.render.process(&mut out[..frames * 2]);
+                耗时.push(started.elapsed().as_secs_f64());
+                fed += frames;
+            }
+            let 分配 = count_allocations(|| {
+                session.engine.capture.process(&input);
+                session.engine.render.process(&mut out);
+            });
+            耗时.sort_by(f64::total_cmp);
+            let p99 = 耗时[(耗时.len() as f64 * 0.99) as usize];
+            let 最大 = *耗时.last().expect("应记录回调耗时");
+            eprintln!(
+                "含移调后端：{回调帧} 帧回调（周期 {周期毫秒:.3} ms）P99 {:.1} µs，最大 {:.1} µs",
+                p99 * 1e6,
+                最大 * 1e6
+            );
+            assert!(
+                p99 <= 周期毫秒 / 1000.0 * 0.15,
+                "{回调帧} 帧回调 P99 {:.3} ms 超过周期 {周期毫秒:.3} ms 的 15%",
+                p99 * 1e3
+            );
+            assert!(
+                最大 < 周期毫秒 / 1000.0,
+                "{回调帧} 帧回调最大耗时 {:.3} ms 达到或超过周期 {周期毫秒:.3} ms",
+                最大 * 1e3
+            );
+            assert_eq!(
+                session.engine.stats.underruns.load(Ordering::Relaxed),
+                0,
+                "{回调帧} 帧回调不应欠载"
+            );
+            assert_eq!(分配, 0, "{回调帧} 帧回调 Rust 侧不得分配");
+        }
+    }
+
+    #[test]
+    fn 停止尾部在效果链与试听下仍正确() {
+        let 淡出帧 = (48_000.0 * FADE_MS / 1000.0).round() as usize;
+        let mut session = 会话引擎::构造(
+            48_000,
+            vec![构造槽位(vec![0.25f32; 96_000], true)],
+            Box::new(DelayBackend::new(0)),
+        );
+        session.control.set_params(全效果预设());
+        session.engine.control.mic_gain_db.set(-100.0);
+        session.engine.control.sfx_gain_db.set(0.0);
+        let 人声 = vec![0.0f32; session.block_frames];
+        session.推进到湿声(&人声);
+        assert_eq!(session.engine.render.voice_phase(), VoicePhase::Wet);
+
+        session.preview.start().expect("湿声阶段应开始试听");
+        assert!(session.engine.control.play(0));
+        let mut 尾部峰值 = 0.0f32;
+        for _ in 0..10 {
+            session.engine.capture.process(&人声);
+            let mut out = vec![0.0f32; session.block_frames * 2];
+            session.engine.render.process(&mut out);
+            尾部峰值 = 取峰值(&out);
+        }
+        assert!(
+            尾部峰值 > 0.24,
+            "效果链下音效尾部不应提前消失，峰值 {尾部峰值}"
+        );
+
+        let mut 单帧 = [0.0f32; 2];
+        let 等待 = 等待停止确认(&mut session.engine, &mut 单帧);
+        let 至少等待 = 淡出帧 + 2 * 路径前视帧();
+        eprintln!("效果链与试听下停止等待 {等待} 帧，下限 {至少等待} 帧");
+        assert!(
+            等待 >= 至少等待,
+            "效果链与试听下停止在 {等待} 帧确认，早于音效限幅与末端尾部 {至少等待} 帧"
+        );
+        assert!(
+            等待 < 淡出帧 + 3 * 路径前视帧(),
+            "人声限幅尾部不应计入停止确认，实测 {等待} 帧"
+        );
+        assert!(
+            !session.preview.is_finished(),
+            "停止音效不得把试听记录误判为完成"
+        );
+    }
+
+    fn 低电平统计(samples: &[f32], threshold: f32) -> (f32, usize) {
+        let mut 连续 = 0usize;
+        let mut 最长 = 0usize;
+        let mut 最小 = f32::INFINITY;
+        for sample in samples {
+            let level = sample.abs();
+            最小 = 最小.min(level);
+            if level < threshold {
+                连续 += 1;
+                最长 = 最长.max(连续);
+            } else {
+                连续 = 0;
+            }
+        }
+        (最小, 最长)
+    }
+
+    /// 无洞测试用效果：环形调制混合较低，常量输入不会产生自然零点。
+    fn 无洞效果预设() -> VoiceParams {
+        VoiceParams {
+            gate_enabled: true,
+            gate_db: -60.0,
+            eq_low_enabled: true,
+            eq_low_db: 3.0,
+            eq_mid_enabled: true,
+            eq_mid_db: -2.0,
+            eq_high_enabled: true,
+            eq_high_db: 2.0,
+            drive_enabled: true,
+            drive: 0.2,
+            robot_enabled: true,
+            robot_hz: 50.0,
+            robot_mix: 0.1,
+            ..VoiceParams::neutral()
+        }
+    }
+
+    #[test]
+    fn 路径限幅与效果链同时运行无静音洞() {
+        for 回调帧 in [480usize, 256, 128, 441] {
+            // 常量过载人声：路径限幅必须真正介入，切换期间人声路不能出洞。
+            let mut voice =
+                会话引擎::构造(48_000, Vec::new(), Box::new(DelayBackend::new(变声延迟帧)));
+            voice.control.set_params(无洞效果预设());
+            voice.engine.control.mic_gain_db.set(0.0);
+            voice.engine.control.sfx_gain_db.set(-100.0);
+            let 常量人声 = vec![1.0f32; 回调帧];
+            let mut out = vec![0.0f32; 回调帧 * 2];
+            for _ in 0..20 {
+                voice.engine.capture.process(&常量人声);
+            }
+            for _ in 0..20 {
+                voice.engine.capture.process(&常量人声);
+                voice.engine.render.process(&mut out);
+            }
+            let mut 常量收集 = Vec::new();
+            let mut 常量路径 = Vec::new();
+            voice.control.request_enable();
+            for _ in 0..150 {
+                voice.engine.capture.process(&常量人声);
+                voice.engine.render.process(&mut out);
+                常量收集.extend_from_slice(&左声道(&out));
+                常量路径.extend_from_slice(
+                    &voice.engine.render.path_voice[..回调帧 * 2]
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|frame| frame[0])
+                        .collect::<Vec<_>>(),
+                );
+            }
+            assert_eq!(voice.control.phase(), VoicePhase::Wet);
+            let 人声路径峰值 = 取峰值(&常量路径);
+            assert!(
+                (人声路径峰值 - 路径限幅上限()).abs() < 0.02,
+                "{回调帧} 帧回调人声路径限幅应介入，路径峰值 {人声路径峰值}"
+            );
+            voice.control.request_disable();
+            for _ in 0..150 {
+                voice.engine.capture.process(&常量人声);
+                voice.engine.render.process(&mut out);
+                常量收集.extend_from_slice(&左声道(&out));
+            }
+            assert_eq!(voice.control.phase(), VoicePhase::Off);
+            let (常量最小, 常量最长低电平) = 低电平统计(&常量收集, 0.3);
+            eprintln!(
+                "{回调帧} 帧回调常量人声：最小值 {常量最小}，\
+                 最长低电平 {常量最长低电平} 帧"
+            );
+            assert!(
+                常量最小 > 0.3,
+                "{回调帧} 帧回调常量人声最小值 {常量最小}，出现静音洞"
+            );
+            assert_eq!(
+                常量最长低电平, 0,
+                "{回调帧} 帧回调常量人声出现 {常量最长低电平} 帧低电平"
+            );
+
+            // 过载正弦人声：路径限幅同样介入；只允许波形自身的过零，不允许长洞。
+            let mut fed = 0usize;
+            let mut 正弦路径 = Vec::new();
+            for _ in 0..40 {
+                let input: Vec<f32> = 正弦块(220.0, fed, 回调帧)
+                    .iter()
+                    .map(|sample| sample * 0.25)
+                    .collect();
+                fed += 回调帧;
+                voice.engine.capture.process(&input);
+                voice.engine.render.process(&mut out);
+            }
+            voice.control.request_enable();
+            let mut 正弦进入湿声 = false;
+            for _ in 0..200 {
+                let input: Vec<f32> = 正弦块(220.0, fed, 回调帧)
+                    .iter()
+                    .map(|sample| sample * 0.25)
+                    .collect();
+                fed += 回调帧;
+                voice.engine.capture.process(&input);
+                voice.engine.render.process(&mut out);
+                if voice.control.phase() == VoicePhase::Wet {
+                    正弦进入湿声 = true;
+                    break;
+                }
+            }
+            assert!(正弦进入湿声, "{回调帧} 帧回调正弦人声应进入湿声");
+            for _ in 0..20 {
+                let input: Vec<f32> = 正弦块(220.0, fed, 回调帧)
+                    .iter()
+                    .map(|sample| sample * 0.25)
+                    .collect();
+                fed += 回调帧;
+                voice.engine.capture.process(&input);
+                voice.engine.render.process(&mut out);
+            }
+            for _ in 0..100 {
+                let input: Vec<f32> = 正弦块(220.0, fed, 回调帧)
+                    .iter()
+                    .map(|sample| sample * 0.25)
+                    .collect();
+                fed += 回调帧;
+                voice.engine.capture.process(&input);
+                voice.engine.render.process(&mut out);
+                正弦路径.extend_from_slice(
+                    &voice.engine.render.path_voice[..回调帧 * 2]
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|frame| frame[0])
+                        .collect::<Vec<_>>(),
+                );
+            }
+            assert_eq!(voice.control.phase(), VoicePhase::Wet);
+            voice.control.request_disable();
+            for _ in 0..150 {
+                let input: Vec<f32> = 正弦块(220.0, fed, 回调帧)
+                    .iter()
+                    .map(|sample| sample * 0.25)
+                    .collect();
+                fed += 回调帧;
+                voice.engine.capture.process(&input);
+                voice.engine.render.process(&mut out);
+            }
+            assert_eq!(voice.control.phase(), VoicePhase::Off);
+            let 正弦峰值 = 取峰值(&正弦路径);
+            let (_, 正弦最长低电平) = 低电平统计(&正弦路径, 0.05);
+            eprintln!(
+                "{回调帧} 帧回调正弦人声路径：峰值 {正弦峰值}，\
+                 最长低电平 {正弦最长低电平} 帧"
+            );
+            assert!(
+                正弦峰值 <= 路径限幅上限() + 0.02 && 正弦峰值 > 0.5,
+                "{回调帧} 帧回调正弦人声路径限幅应介入，峰值 {正弦峰值}"
+            );
+            // 效果与限幅会让正弦过零附近的低电平略宽；0.5 ms 仍远小于任何可闻断音。
+            assert!(
+                正弦最长低电平 <= 24,
+                "{回调帧} 帧回调正弦人声出现 {正弦最长低电平} 帧低电平，超过自然过零长度"
+            );
+
+            // 音效恒定 0.3：音效路径保持精确基准，不被路径限幅或效果链破坏。
+            let mut mixed = 会话引擎::构造(
+                48_000,
+                vec![构造槽位(vec![0.3f32; 96_000], true)],
+                Box::new(DelayBackend::new(变声延迟帧)),
+            );
+            mixed.control.set_params(无洞效果预设());
+            mixed.engine.control.mic_gain_db.set(0.0);
+            mixed.engine.control.sfx_gain_db.set(0.0);
+            assert!(mixed.engine.control.play(0));
+            let mut fed = 0usize;
+            let mut 音效路 = Vec::new();
+            for _ in 0..40 {
+                let input: Vec<f32> = 正弦块(220.0, fed, 回调帧)
+                    .iter()
+                    .map(|sample| sample * 0.25)
+                    .collect();
+                fed += 回调帧;
+                mixed.engine.capture.process(&input);
+                mixed.engine.render.process(&mut out);
+            }
+            mixed.control.request_enable();
+            let mut 混合进入湿声 = false;
+            for _ in 0..200 {
+                let input: Vec<f32> = 正弦块(220.0, fed, 回调帧)
+                    .iter()
+                    .map(|sample| sample * 0.25)
+                    .collect();
+                fed += 回调帧;
+                mixed.engine.capture.process(&input);
+                mixed.engine.render.process(&mut out);
+                if mixed.control.phase() == VoicePhase::Wet {
+                    混合进入湿声 = true;
+                    break;
+                }
+            }
+            assert!(混合进入湿声, "{回调帧} 帧回调混合链路应进入湿声");
+            for _ in 0..20 {
+                let input: Vec<f32> = 正弦块(220.0, fed, 回调帧)
+                    .iter()
+                    .map(|sample| sample * 0.25)
+                    .collect();
+                fed += 回调帧;
+                mixed.engine.capture.process(&input);
+                mixed.engine.render.process(&mut out);
+            }
+            for _ in 0..100 {
+                let input: Vec<f32> = 正弦块(220.0, fed, 回调帧)
+                    .iter()
+                    .map(|sample| sample * 0.25)
+                    .collect();
+                fed += 回调帧;
+                mixed.engine.capture.process(&input);
+                mixed.engine.render.process(&mut out);
+                音效路.extend_from_slice(
+                    &mixed.engine.render.path_sfx[..回调帧 * 2]
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|frame| frame[0])
+                        .collect::<Vec<_>>(),
+                );
+            }
+            assert_eq!(mixed.control.phase(), VoicePhase::Wet);
+            let (音效最小, 音效最长低电平) = 低电平统计(&音效路, 0.25);
+            eprintln!(
+                "{回调帧} 帧回调音效路：最小值 {音效最小}，\
+                 最长低电平 {音效最长低电平} 帧"
+            );
+            assert!(
+                (音效最小 - 0.3).abs() < 1e-4,
+                "{回调帧} 帧回调音效路应保持 0.3，实测 {音效最小}"
+            );
+            assert_eq!(
+                音效最长低电平, 0,
+                "{回调帧} 帧回调音效路出现 {音效最长低电平} 帧低电平"
+            );
+            mixed.control.request_disable();
+            for _ in 0..150 {
+                let input: Vec<f32> = 正弦块(220.0, fed, 回调帧)
+                    .iter()
+                    .map(|sample| sample * 0.25)
+                    .collect();
+                fed += 回调帧;
+                mixed.engine.capture.process(&input);
+                mixed.engine.render.process(&mut out);
+            }
+            assert_eq!(mixed.control.phase(), VoicePhase::Off);
+            assert_eq!(
+                mixed.engine.stats.underruns.load(Ordering::Relaxed),
+                0,
+                "{回调帧} 帧回调不应欠载"
+            );
+        }
+    }
+
+    #[test]
+    fn 电平表读数在末端限幅之后() {
+        let mut session = 会话引擎::构造(
+            48_000,
+            vec![构造槽位(vec![4.0f32; 96_000], true)],
+            Box::new(DelayBackend::new(0)),
+        );
+        session.engine.control.mic_gain_db.set(0.0);
+        session.engine.control.sfx_gain_db.set(-100.0);
+        let 人声 = vec![4.0f32; session.block_frames];
+        session.推进到湿声(&人声);
+
+        let mut 单人声峰值 = f32::NEG_INFINITY;
+        for step in 0..200 {
+            session.engine.capture.process(&人声);
+            let mut out = vec![0.0f32; session.block_frames * 2];
+            session.engine.render.process(&mut out);
+            if step >= 150 {
+                单人声峰值 = 单人声峰值.max(session.engine.stats.snapshot().out_peak_db);
+            }
+        }
+        eprintln!(
+            "电平表单人声稳态峰值 {单人声峰值} dBFS；路径限幅状态 {:?}，最后块输出峰值 {}",
+            session.engine.render.path_state,
+            取峰值(&session.engine.render.mic[..session.block_frames * 2])
+        );
+        assert!(
+            单人声峰值 <= 20.0 * 路径限幅上限().log10() + 0.02,
+            "人声路径限幅后电平表不得超过 −3 dBFS，实测 {单人声峰值}"
+        );
+        assert!(
+            单人声峰值 > 20.0 * 路径限幅上限().log10() - 0.5,
+            "人声路径限幅应真正参与，电平表仅 {单人声峰值}"
+        );
+
+        session.engine.control.sfx_gain_db.set(0.0);
+        assert!(session.engine.control.play(0));
+        let mut 合并峰值 = f32::NEG_INFINITY;
+        for step in 0..200 {
+            session.engine.capture.process(&人声);
+            let mut out = vec![0.0f32; session.block_frames * 2];
+            session.engine.render.process(&mut out);
+            if step >= 150 {
+                合并峰值 = 合并峰值.max(session.engine.stats.snapshot().out_peak_db);
+            }
+        }
+        eprintln!("电平表合并稳态峰值 {合并峰值} dBFS");
+        assert!(
+            合并峰值 <= -1.0 + 0.02,
+            "末端限幅之后电平表不得超过 −1 dBFS，实测 {合并峰值}"
+        );
+        assert!(
+            合并峰值 > -1.5,
+            "末端安全限幅应真正参与，电平表仅 {合并峰值}"
+        );
     }
 }

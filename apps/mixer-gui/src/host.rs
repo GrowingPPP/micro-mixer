@@ -523,6 +523,15 @@ impl AudioRequestState {
         Some(self.current.fetch_add(1, Ordering::AcqRel) + 1)
     }
 
+    /// 只校验会话代次，不要求播放活跃；待机停止仍需取消本机试听。
+    fn reserve_for_generation(&self, generation: u64) -> Option<u64> {
+        let _publication = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        if self.generation.load(Ordering::Acquire) != generation {
+            return None;
+        }
+        Some(self.current.fetch_add(1, Ordering::AcqRel) + 1)
+    }
+
     fn register_session(&self, generation: u64) {
         let _publication = self.gate.lock().unwrap_or_else(|e| e.into_inner());
         self.generation.store(generation, Ordering::Release);
@@ -1271,8 +1280,9 @@ impl AudioHost {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
         {
-            sh.clear();
-            // 待机只关闭播放；变声路由重新发布，手机上仍可启用与切换预设。
+            // 待机只关闭播放入口；停止处理器与变声路由保留，手机仍能停止
+            // 正在录制的人声试听、启用变声与切换预设，且不会重新启动音效。
+            sh.clear_playback();
             #[cfg(feature = "voice")]
             sh.set_voice_route(self.voice.remote_route());
         }
@@ -1873,17 +1883,18 @@ impl AudioHost {
             // Only affect a preview associated with that exact session. Avoid
             // joining under a remote listener callback (listener shutdown could
             // otherwise wait on it). Serialize stop with preview/play submission.
-            let Some(ticket) = requests.reserve_for_session(&playback, generation) else {
+            // 待机时 playback 不活跃，但音效试听仍可能在本机播放，因此只按
+            // 会话代次校验，不能提前返回；播放本身仍只在活跃时停止。
+            let Some(ticket) = requests.reserve_for_generation(generation) else {
                 return;
             };
             let mut control = controls.lock().unwrap_or_else(|e| e.into_inner());
             if requests.current.load(Ordering::Acquire) != ticket {
                 return;
             }
-            if !playback.active()
-                || control
-                    .as_ref()
-                    .is_some_and(|c| c.session_generation != generation)
+            if control
+                .as_ref()
+                .is_some_and(|c| c.session_generation != generation)
             {
                 return;
             }
@@ -1891,7 +1902,9 @@ impl AudioHost {
                 preview_generation.fetch_add(1, Ordering::AcqRel);
                 *control = None;
             }
-            playback.stop_all();
+            if playback.active() {
+                playback.stop_all();
+            }
         })
     }
 

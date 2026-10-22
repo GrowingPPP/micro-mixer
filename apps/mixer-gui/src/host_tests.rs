@@ -559,7 +559,7 @@ fn 变声监听路径不接受人声() {
     let mut primary_tail = 0.0;
     for _ in 0..400 {
         for callback in backend.captures.lock().unwrap().iter_mut() {
-            callback(&vec![0.3; 4_410]);
+            callback(&vec![0.3; 4_410 * 2]);
         }
         let mut outputs = backend.outputs.lock().unwrap();
         let mut primary = vec![0.0; 4_410 * 2];
@@ -638,6 +638,104 @@ fn 待机与重建保留遥控变声路由释放后清除() {
     host.release();
     assert!(shared.voice_state().is_none(), "释放后变声接口不可用");
     assert!(shared.control.lock().unwrap().is_none());
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 待机时手机停止取消人声试听且不启动播放() {
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let clips = install_voice_preview_player(&host);
+    let shared = Arc::new(remote::Shared::default());
+    {
+        let running = host.running.lock().unwrap();
+        let playback = running.as_ref().unwrap().playback.clone();
+        shared.set_routed(
+            playback.control.clone(),
+            vec!["Good".into()],
+            host.play_handler(playback.clone(), 1),
+            host.remote_stop_handler(playback.clone(), 1),
+        );
+    }
+    shared.set_voice_route(host.voice.remote_route());
+    *host.remote.lock().unwrap() = Some(shared.clone());
+
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    for _ in 0..5 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+    assert_eq!(host.voice_status().preview.state, "recording");
+
+    host.stop();
+    assert!(!host.status().running);
+    assert!(host.status().passthrough);
+    assert!(shared.control.lock().unwrap().is_none());
+    assert_eq!(
+        host.voice_status().preview.state,
+        "recording",
+        "待机本身只关闭音效，人声试听仍在录制"
+    );
+
+    shared.stop_all();
+    assert_eq!(
+        host.voice_status().preview.state,
+        "idle",
+        "待机时手机停止必须取消人声试听"
+    );
+    assert!(
+        wait_for(Duration::from_secs(1), || {
+            host.voice_status();
+            host.voice_preview_thread.lock().unwrap().is_none()
+        }),
+        "取消后录制线程必须退出"
+    );
+    assert!(clips.try_recv().is_err(), "取消后不得播放半段录制");
+    assert!(!host.status().running, "停止不得启动播放");
+    assert!(host.status().passthrough);
+}
+
+#[test]
+fn 待机时手机停止取消音效试听() {
+    let (host, session_backend) = fixture();
+    let shared = host.remote.lock().unwrap().as_ref().unwrap().clone();
+    host.stop();
+    assert!(!host.status().running);
+    // 待机仍保留输出流；驱动一次让两路确认停止，试听才能开始。
+    drain_primary(&session_backend);
+    assert!(
+        host.running
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .playback
+            .stop_all_finished(),
+        "待机停止应先被两路输出确认"
+    );
+
+    // 待机允许本机音效试听；手机停止必须静音，而不是只报告成功。
+    let backend = FakeBackend::default();
+    launch_fake_preview(&host, &backend, Arc::new(vec![0.3; 88_200]));
+    // 新的试听会再次提交停止代次，驱动两路输出确认后才允许试听出声。
+    drain_primary(&session_backend);
+    let mut pcm = vec![0.0; 600];
+    backend.outputs.lock().unwrap()[0](&mut pcm);
+    assert!(
+        pcm.iter().any(|sample| sample.abs() > 0.1),
+        "待机应允许音效试听"
+    );
+
+    shared.stop_all();
+    pcm.fill(0.0);
+    backend.outputs.lock().unwrap()[0](&mut pcm);
+    assert!(
+        pcm.iter().all(|sample| *sample == 0.0),
+        "待机时手机停止必须静音音效试听"
+    );
+    assert!(!host.status().preview_playing);
+    assert!(host.preview_control.lock().unwrap().is_none());
+    assert!(!host.status().running, "停止不得启动播放");
+    assert!(host.status().passthrough);
 }
 
 #[test]
@@ -1729,7 +1827,9 @@ fn combo_newer_card_hotkey_phone_preview_or_shutdown_retires_queued_audio() {
                 "phone" => assert!(remote.play(0)),
                 "preview" => launch_fake_preview(&host, &preview, Arc::new(vec![0.3; 88_200])),
                 "stop" => host.stop_all().unwrap(),
-                "phone-stop" => remote.stop_all(),
+                "phone-stop" => {
+                    remote.stop_all();
+                }
                 "standby" => host.stop(),
                 "release" => host.release(),
                 _ => unreachable!(),
@@ -3094,6 +3194,130 @@ fn 切换预设取消试听且不播放半段() {
     assert!(clips.try_recv().is_err(), "取消后不得播放半段");
     let control = host.voice.preview_control().unwrap();
     assert!(control.take().is_none(), "记录区应被清空");
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 音效试听与人声试听互斥且全局停止取消() {
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let voice_clips = install_voice_preview_player(&host);
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    for _ in 0..5 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+
+    // 音效试听开始后，人声试听必须立即停止且不留下半段。
+    let sound = FakeBackend::default();
+    launch_fake_preview(&host, &sound, Arc::new(vec![0.2; 88_200]));
+    assert_eq!(host.voice_status().preview.state, "idle");
+    assert!(
+        wait_for(Duration::from_secs(1), || host
+            .voice_preview_thread
+            .lock()
+            .unwrap()
+            .is_none()),
+        "音效试听开始后录制线程必须退出"
+    );
+    assert!(voice_clips.try_recv().is_err(), "被取消的录制不得回放");
+
+    // 人声试听开始后，音效试听必须静音并释放输出线程。
+    host.voice_preview_start().unwrap();
+    assert!(!host.status().preview_playing);
+    assert!(host.preview_thread.lock().unwrap().is_none());
+    let mut pcm = vec![0.0; 600];
+    sound.outputs.lock().unwrap()[0](&mut pcm);
+    assert!(
+        pcm.iter().all(|sample| *sample == 0.0),
+        "旧音效试听输出必须静音"
+    );
+    wait_voice_preview_recording(&host);
+    for _ in 0..5 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+
+    // 全局停止同时取消录制，并等待所有者线程退出。
+    let started = std::time::Instant::now();
+    host.stop_all().unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(host.voice_status().preview.state, "idle");
+    assert!(
+        wait_for(Duration::from_secs(1), || host
+            .voice_preview_thread
+            .lock()
+            .unwrap()
+            .is_none()),
+        "全局停止后录制线程必须退出"
+    );
+    assert!(voice_clips.try_recv().is_err(), "停止后不得播放半段");
+    let control = host.voice.preview_control().expect("会话仍应保留试听句柄");
+    assert!(control.take().is_none(), "停止后记录区必须清空");
+    eprintln!(
+        "全局停止取消人声试听耗时 {:.1} ms",
+        elapsed.as_secs_f64() * 1000.0
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "全局停止不应阻塞界面，实测 {elapsed:?}"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 监听与自检不经过人声链() {
+    let (host, backend, _dir) = voice_fixture(true);
+    host.set_gains(0.0, 0.0);
+    host.set_looping(true);
+    assert!(host.play(0).unwrap());
+    let mut primary_tail = 0.0;
+    let mut monitor_tail = 0.0;
+    for _ in 0..400 {
+        for callback in backend.captures.lock().unwrap().iter_mut() {
+            callback(&vec![0.3; 4_410 * 2]);
+        }
+        let mut outputs = backend.outputs.lock().unwrap();
+        let mut primary = vec![0.0; 4_410 * 2];
+        outputs[0](&mut primary);
+        let mut monitor = vec![0.0; 4_410 * 2];
+        outputs[1](&mut monitor);
+        primary_tail = primary[primary.len() - 2_000..]
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+        monitor_tail = monitor[monitor.len() - 2_000..]
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+    }
+    assert!(primary_tail > 0.4, "主输出应同时收到湿声人声与音效");
+    assert!(
+        (monitor_tail - 0.2).abs() < 1e-3,
+        "监听只能收到音效 0.2，不得混入 0.3 的人声湿声，实测峰值 {monitor_tail}"
+    );
+    assert_eq!(host.voice_status().phase, "wet");
+
+    // 自检、校准与设备恢复共用的生产暂停入口：暂停期间必须旁路并回到干声。
+    let dir = TemporaryDir::new();
+    let mut selftest_host = preview_test_host();
+    selftest_host.voice =
+        VoiceService::new_with_path(&app_config::Config::default(), dir.0.join("config.toml"));
+    selftest_host
+        .voice
+        .attach(VoiceControl::new(VoiceParams::neutral()));
+    selftest_host.voice.set_enabled(true).unwrap();
+    selftest_host
+        .with_suspended(None, || {
+            assert!(
+                selftest_host.running.lock().unwrap().is_none(),
+                "自检期间设备会话必须已释放"
+            );
+            let paused = selftest_host.voice_status();
+            assert!(paused.bypassed, "自检期间人声链必须旁路");
+            assert_eq!(paused.phase, "off", "自检期间只能输出干声");
+            Ok(())
+        })
+        .unwrap();
+    let restored = selftest_host.voice_status();
+    assert!(restored.enabled, "自检结束后应恢复启用状态");
+    assert!(!restored.bypassed, "自检结束后应解除旁路");
 }
 
 #[cfg(feature = "voice")]

@@ -769,4 +769,161 @@ mod tests {
             robot_mix: 0.2,
         }
     }
+
+    fn 均方根(samples: &[f32]) -> f32 {
+        (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len().max(1) as f32)
+            .sqrt()
+    }
+
+    /// 幅度 0.2 的确定性谐波元音，前 400 ms 只有低电平底噪。
+    ///
+    /// 底噪用于观察噪声门是否在算法之前抑制它；元音起点用于观察算法
+    /// 是否把能量涂抹到起点之前。
+    fn 元音样本(sample_rate: usize) -> Vec<f32> {
+        let onset = sample_rate * 4 / 10;
+        let release_at = sample_rate * 9 / 10;
+        let mut seed = 0x1234_5678u32;
+        (0..sample_rate)
+            .map(|frame| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let noise = ((seed >> 8) as f32 / 16_777_216.0 * 2.0 - 1.0) * 0.003;
+                if !(onset..release_at).contains(&frame) {
+                    return noise;
+                }
+                let elapsed = (frame - onset) as f32 / sample_rate as f32;
+                let attack = (elapsed / 0.020).min(1.0);
+                let release = ((release_at - frame) as f32 / (sample_rate as f32 * 0.050)).min(1.0);
+                let envelope = attack.min(release);
+                let mut voiced = 0.0;
+                for harmonic in 1..=8 {
+                    voiced += (std::f32::consts::TAU * 220.0 * harmonic as f32 * frame as f32
+                        / sample_rate as f32)
+                        .sin()
+                        / harmonic as f32;
+                }
+                noise + voiced * 0.08 * envelope
+            })
+            .collect()
+    }
+
+    /// 用 2 ms 短时能量找到元音起点；用稳态能量的 25% 避免把预回声当起点。
+    fn 检测元音起点(output: &[f32], sample_rate: usize) -> usize {
+        let window = sample_rate / 500;
+        let steady = 均方根(&output[sample_rate * 6 / 10..sample_rate * 8 / 10]);
+        for start in (sample_rate / 5..output.len().saturating_sub(window)).step_by(window) {
+            if 均方根(&output[start..start + window]) > steady * 0.25 {
+                return start;
+            }
+        }
+        panic!("元音起点未出现");
+    }
+
+    /// 稳态窗口内的归一化自相关峰值，作为可懂度的周期性代理。
+    fn 周期性(samples: &[f32], sample_rate: usize) -> f32 {
+        let min_lag = sample_rate / 500;
+        let max_lag = sample_rate / 200;
+        let energy: f32 = samples.iter().map(|sample| sample * sample).sum();
+        let mut peak = 0.0f32;
+        for lag in min_lag..=max_lag.min(samples.len().saturating_sub(1)) {
+            let mut sum = 0.0;
+            for index in 0..samples.len() - lag {
+                sum += samples[index] * samples[index + lag];
+            }
+            peak = peak.max(sum / energy.max(1e-12));
+        }
+        peak
+    }
+
+    #[cfg(feature = "voice")]
+    fn 后端处理(
+        mut backend: super::super::SignalsmithBackend,
+        input: &[f32],
+        block_frames: usize,
+        params: VoiceParams,
+    ) -> Vec<f32> {
+        use super::super::VoiceBackend;
+
+        backend.set_params(params);
+        let mut block = vec![0.0f32; block_frames];
+        let mut wet = Vec::with_capacity(input.len());
+        for chunk in input.chunks(block_frames) {
+            let produced = backend.process(chunk, &mut block[..chunk.len()]);
+            wet.extend_from_slice(&block[..produced]);
+        }
+        wet
+    }
+
+    #[cfg(feature = "voice")]
+    #[test]
+    fn 噪声门前置与后置的涂抹对比() {
+        use super::super::{EffectChain, SignalsmithBackend};
+
+        const SAMPLE_RATE: usize = 48_000;
+        let params = VoiceParams {
+            pitch_semitones: 7.0,
+            gate_enabled: true,
+            gate_db: -30.0,
+            ..VoiceParams::neutral()
+        };
+        let input = 元音样本(SAMPLE_RATE);
+        let block_frames = SAMPLE_RATE / 100;
+
+        // 前置：门限先抑制底噪与静音，再交给移调算法。
+        let mut gate_before = EffectChain::new(SAMPLE_RATE as u32);
+        gate_before.set_params(params);
+        let mut gated_input = input.clone();
+        gate_before.process_gate(&mut gated_input);
+        let backend = SignalsmithBackend::new(SAMPLE_RATE as u32, 10.0).expect("创建后端");
+        let before = 后端处理(backend, &gated_input, block_frames, params);
+
+        // 后置：算法先处理含底噪与瞬态的输入，再经过同一个门限。
+        let backend = SignalsmithBackend::new(SAMPLE_RATE as u32, 10.0).expect("创建后端");
+        let mut after = 后端处理(backend, &input, block_frames, params);
+        let mut gate_after = EffectChain::new(SAMPLE_RATE as u32);
+        gate_after.set_params(params);
+        gate_after.process_gate(&mut after);
+
+        let mut 指标 = Vec::new();
+        for output in [&before, &after] {
+            let onset = 检测元音起点(output, SAMPLE_RATE);
+            // 去掉起点前最后 5 ms，避免把检测窗口自身覆盖到的起音算成预回声。
+            let pre_start = onset.saturating_sub(SAMPLE_RATE * 30 / 1000);
+            let pre_end = onset.saturating_sub(SAMPLE_RATE * 5 / 1000);
+            let pre = 均方根(&output[pre_start..pre_end]);
+            let steady =
+                &output[onset + SAMPLE_RATE * 100 / 1000..onset + SAMPLE_RATE * 300 / 1000];
+            let pre_echo = pre / 均方根(&output[onset..]);
+            let intelligibility = 周期性(steady, SAMPLE_RATE);
+            eprintln!(
+                "顺序指标：起点 {onset}，预回声 RMS {pre}，稳态 RMS {}，周期性 {intelligibility:.4}",
+                均方根(steady)
+            );
+            指标.push((pre_echo, intelligibility));
+        }
+
+        eprintln!(
+            "噪声门顺序对比：前置预回声 {:.4} / 周期性 {:.3}；后置预回声 {:.4} / 周期性 {:.3}",
+            指标[0].0, 指标[0].1, 指标[1].0, 指标[1].1
+        );
+        // 两种顺序的预回声都低于稳态 1%；前置没有明显劣于后置，
+        // 因此保留“噪声门 → 移调”的设计顺序。
+        assert!(
+            指标[0].0 <= 0.01 && 指标[1].0 <= 0.01,
+            "两种顺序的预回声都必须低于稳态 1%：前置 {:.4}，后置 {:.4}",
+            指标[0].0,
+            指标[1].0
+        );
+        assert!(
+            指标[0].0 <= 指标[1].0 + 0.005,
+            "前置门限的预回声 {:.4} 明显高于后置 {:.4} 时才需要改序",
+            指标[0].0,
+            指标[1].0
+        );
+        assert!(
+            指标[0].1 >= 指标[1].1 - 0.03,
+            "前置门限的周期性 {:.3} 不应低于后置 {:.3}",
+            指标[0].1,
+            指标[1].1
+        );
+    }
 }

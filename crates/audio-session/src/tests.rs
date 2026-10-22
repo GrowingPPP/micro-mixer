@@ -1393,6 +1393,104 @@ fn 变声后端工厂失败时不建立会话() {
 }
 
 #[test]
+fn 完整链路待机重建释放组合保留变声状态() {
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let params = VoiceParams {
+        pitch_semitones: 6.0,
+        formant_semitones: -2.0,
+        ..VoiceParams::neutral()
+    };
+    let session = 打开变声会话(&state, false, 变声选项(true, params, 测试变声后端(2.0, 0)));
+    let control = session.voice_control().expect("应返回控制句柄");
+    session.playback.set_gains(0.0, -100.0);
+    推进到稳定湿声(&state, &control, 0.0);
+    let generation = control.generation();
+
+    session.playback.standby();
+    assert_eq!(control.phase(), VoicePhase::Wet, "待机不得关闭变声");
+    assert_eq!(control.params(), params, "待机不得重置参数");
+    assert_eq!(control.generation(), generation, "待机不得推进代次");
+
+    session.playback.activate();
+    assert_eq!(control.phase(), VoicePhase::Wet, "恢复后应沿用湿声");
+    assert_eq!(control.params(), params);
+    let resumed = 送入并渲染稳定(&state, 变声测试块, 0.1, 8);
+    assert!(
+        resumed.iter().all(|sample| (*sample - 0.2).abs() < 1e-4),
+        "恢复后必须继续输出湿声"
+    );
+    drop(session);
+    assert_streams_closed_on_owner(&state);
+
+    // 设备重建：新会话接收同一份预设参数，但必须从预热开始。
+    let rebuilt = 打开变声会话(&state, false, 变声选项(true, params, 测试变声后端(3.0, 0)));
+    let fresh = rebuilt.voice_control().expect("重建会话应返回控制句柄");
+    assert_eq!(fresh.phase(), VoicePhase::Warmup, "新链必须先预热");
+    assert_eq!(fresh.params(), params, "重建不得丢失预设参数");
+    control.request_enable();
+    assert_eq!(
+        fresh.phase(),
+        VoicePhase::Warmup,
+        "旧会话句柄不得推进新会话"
+    );
+    rebuilt.playback.set_gains(0.0, -100.0);
+    推进到稳定湿声(&state, &fresh, 0.0);
+    let rebuilt_wet = 送入并渲染稳定(&state, 变声测试块, 0.1, 8);
+    assert!(
+        rebuilt_wet
+            .iter()
+            .all(|sample| (*sample - 0.3).abs() < 1e-4),
+        "重建后必须使用新后端处理同一个预设"
+    );
+    drop(rebuilt);
+    assert_streams_closed_on_owner(&state);
+}
+
+#[test]
+fn 四十四点一千赫与四十八千赫会话链路一致() {
+    for sample_rate in [44_100u32, 48_000] {
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let mut options = options(false);
+        options.input_format = StreamFormat::new(sample_rate, 1);
+        options.output_format = StreamFormat::stereo(sample_rate);
+        options.slots.clear();
+        options.voice = Some(变声选项(
+            true,
+            VoiceParams::neutral(),
+            测试变声后端(2.0, 0),
+        ));
+        let session = Session::open_with_backend(
+            options,
+            FakeBackend::primary(&state),
+            FakeBackend::monitor(&state),
+        )
+        .unwrap();
+        let control = session.voice_control().expect("应返回控制句柄");
+        session.playback.set_gains(0.0, -100.0);
+        推进到稳定湿声(&state, &control, 0.0);
+        let wet = 送入并渲染稳定(&state, 变声测试块, 0.1, 8);
+        assert!(
+            wet.iter().all(|sample| (*sample - 0.2).abs() < 1e-4),
+            "{sample_rate} Hz 会话应输出相同的湿声增益"
+        );
+        assert!(
+            session.voice_preview_control().is_some(),
+            "{sample_rate} Hz 会话应保留三秒试听控制"
+        );
+        assert_eq!(
+            session
+                .stats
+                .underruns
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "{sample_rate} Hz 会话不应欠载"
+        );
+        drop(session);
+        assert_streams_closed_on_owner(&state);
+    }
+}
+
+#[test]
 fn 启用变声的会话输出移调后的麦克风() {
     const 后端延迟帧: usize = 2_400;
     let state = Arc::new(Mutex::new(FakeState::default()));
