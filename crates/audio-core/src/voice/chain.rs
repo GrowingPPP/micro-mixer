@@ -770,6 +770,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "voice")]
     fn 均方根(samples: &[f32]) -> f32 {
         (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len().max(1) as f32)
             .sqrt()
@@ -779,6 +780,7 @@ mod tests {
     ///
     /// 底噪用于观察噪声门是否在算法之前抑制它；元音起点用于观察算法
     /// 是否把能量涂抹到起点之前。
+    #[cfg(feature = "voice")]
     fn 元音样本(sample_rate: usize) -> Vec<f32> {
         let onset = sample_rate * 4 / 10;
         let release_at = sample_rate * 9 / 10;
@@ -807,6 +809,7 @@ mod tests {
     }
 
     /// 用 2 ms 短时能量找到元音起点；用稳态能量的 25% 避免把预回声当起点。
+    #[cfg(feature = "voice")]
     fn 检测元音起点(output: &[f32], sample_rate: usize) -> usize {
         let window = sample_rate / 500;
         let steady = 均方根(&output[sample_rate * 6 / 10..sample_rate * 8 / 10]);
@@ -819,6 +822,7 @@ mod tests {
     }
 
     /// 稳态窗口内的归一化自相关峰值，作为可懂度的周期性代理。
+    #[cfg(feature = "voice")]
     fn 周期性(samples: &[f32], sample_rate: usize) -> f32 {
         let min_lag = sample_rate / 500;
         let max_lag = sample_rate / 200;

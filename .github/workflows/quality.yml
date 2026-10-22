@@ -47,6 +47,9 @@ jobs:
           }
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      # 不含变声后端的构建也必须无告警：变声专用的辅助代码要受 feature 约束。
+      - name: Clippy without the voice backend
+        run: cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings
       - run: cargo test --locked --workspace --all-targets
       - name: Voice backend tests (audio-core)
         run: cargo test --locked -p audio-core --features voice
