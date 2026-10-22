@@ -5582,6 +5582,66 @@ THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR I
 
 ### 115. MIT
 
+覆盖 1 个 crate：signalsmith-stretch 0.1.3
+
+
+```text
+MIT License
+
+Copyright (c) 2025 Signalsmith Audio
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+
+### 116. MIT
+
+覆盖 1 个 crate：signalsmith-stretch 0.1.3
+
+
+```text
+MIT License
+
+Copyright (c) 2022 Geraint Luff / Signalsmith Audio Ltd.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+
+### 117. MIT
+
 覆盖 1 个 crate：simd-adler32 0.3.10
 
 
@@ -5610,7 +5670,7 @@ SOFTWARE.
 ```
 
 
-### 116. MIT
+### 118. MIT
 
 覆盖 1 个 crate：smallvec 1.16.2
 
@@ -5644,7 +5704,7 @@ DEALINGS IN THE SOFTWARE.
 ```
 
 
-### 117. MIT
+### 119. MIT
 
 覆盖 1 个 crate：stable_deref_trait 1.2.1
 
@@ -5678,7 +5738,7 @@ DEALINGS IN THE SOFTWARE.
 ```
 
 
-### 118. MIT
+### 120. MIT
 
 覆盖 1 个 crate：strsim 0.11.1
 
@@ -5710,7 +5770,7 @@ SOFTWARE.
 ```
 
 
-### 119. MIT
+### 121. MIT
 
 覆盖 1 个 crate：swift-rs 1.0.8
 
@@ -5738,7 +5798,7 @@ SOFTWARE.
 ```
 
 
-### 120. MIT
+### 122. MIT
 
 覆盖 1 个 crate：synstructure 0.14.0
 
@@ -5754,7 +5814,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 ```
 
 
-### 121. MIT
+### 123. MIT
 
 覆盖 7 个 crate：tauri 2.12.2, tauri-build 2.7.1, tauri-codegen 2.7.1, tauri-macros 2.7.1, tauri-runtime 2.12.1, tauri-runtime-wry 2.12.1, tauri-utils 2.10.1
 
@@ -5784,7 +5844,7 @@ SOFTWARE.
 ```
 
 
-### 122. MIT
+### 124. MIT
 
 覆盖 1 个 crate：tauri-winres 0.3.6
 
@@ -5821,7 +5881,7 @@ DEALINGS IN THE SOFTWARE.
 ```
 
 
-### 123. MIT
+### 125. MIT
 
 覆盖 1 个 crate：tendril 0.5.1
 
@@ -5855,7 +5915,7 @@ DEALINGS IN THE SOFTWARE.
 ```
 
 
-### 124. MIT
+### 126. MIT
 
 覆盖 3 个 crate：time 0.3.55, time-core 0.1.9, time-macros 0.2.32
 
@@ -5883,7 +5943,7 @@ SOFTWARE.
 ```
 
 
-### 125. MIT
+### 127. MIT
 
 覆盖 1 个 crate：tokio 1.53.2
 
@@ -5913,7 +5973,7 @@ SOFTWARE.
 ```
 
 
-### 126. MIT
+### 128. MIT
 
 覆盖 1 个 crate：typenum 1.20.1
 
@@ -5943,7 +6003,7 @@ SOFTWARE.
 ```
 
 
-### 127. MIT
+### 129. MIT
 
 覆盖 1 个 crate：unicode-ident 1.0.26
 
@@ -5991,7 +6051,7 @@ authorization of the copyright holder.
 ```
 
 
-### 128. MIT
+### 130. MIT
 
 覆盖 1 个 crate：urlpattern 0.6.0
 
@@ -6021,7 +6081,7 @@ SOFTWARE.
 ```
 
 
-### 129. MIT
+### 131. MIT
 
 覆盖 1 个 crate：utf8parse 0.2.2
 
@@ -6055,7 +6115,7 @@ DEALINGS IN THE SOFTWARE.
 ```
 
 
-### 130. MIT
+### 132. MIT
 
 覆盖 1 个 crate：uuid 1.27.0
 
@@ -6090,7 +6150,7 @@ DEALINGS IN THE SOFTWARE.
 ```
 
 
-### 131. MIT
+### 133. MIT
 
 覆盖 1 个 crate：version_check 0.9.5
 
@@ -6118,7 +6178,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
 
-### 132. MIT
+### 134. MIT
 
 覆盖 1 个 crate：web-time 1.1.0
 
@@ -6148,7 +6208,7 @@ SOFTWARE.
 ```
 
 
-### 133. MIT
+### 135. MIT
 
 覆盖 1 个 crate：window-vibrancy 0.8.1
 
@@ -6178,7 +6238,7 @@ SOFTWARE.
 ```
 
 
-### 134. MIT
+### 136. MIT
 
 覆盖 1 个 crate：wry 0.57.0
 
@@ -6208,7 +6268,7 @@ SOFTWARE.
 ```
 
 
-### 135. MIT OR Apache-2.0
+### 137. MIT OR Apache-2.0
 
 覆盖 1 个 crate：typenum 1.20.1
 
@@ -6218,7 +6278,7 @@ MIT OR Apache-2.0
 ```
 
 
-### 136. MPL-2.0
+### 138. MPL-2.0
 
 覆盖 21 个 crate：cssparser 0.37.0, cssparser-macros 0.7.1, dtoa-short 0.3.5, option-ext 0.2.0, selectors 0.38.0, symphonia 0.5.5, symphonia-bundle-flac 0.5.5, symphonia-bundle-mp3 0.5.5 等 21 个
 
@@ -6600,7 +6660,7 @@ Exhibit B - "Incompatible With Secondary Licenses" Notice
 ```
 
 
-### 137. This project is dual-licensed under the Unlicense and MIT licenses.
+### 139. This project is dual-licensed under the Unlicense and MIT licenses.
 
 覆盖 7 个 crate：aho-corasick 1.1.5, byteorder 1.5.0, jiff 0.2.38, jiff-core 0.1.1, memchr 2.8.3, same-file 1.0.6, walkdir 2.5.0
 
@@ -6612,7 +6672,7 @@ You may use this code under the terms of either license.
 ```
 
 
-### 138. Unlicense
+### 140. Unlicense
 
 覆盖 8 个 crate：aho-corasick 1.1.5, byteorder 1.5.0, byteorder-lite 0.1.0, jiff 0.2.38, jiff-core 0.1.1, memchr 2.8.3, same-file 1.0.6, walkdir 2.5.0
 
@@ -6645,7 +6705,7 @@ For more information, please refer to <http://unlicense.org/>
 ```
 
 
-### 139. windowing service for Tauri.
+### 141. windowing service for Tauri.
 
 覆盖 1 个 crate：wry 0.57.0
 

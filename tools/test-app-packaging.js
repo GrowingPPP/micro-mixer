@@ -77,9 +77,13 @@ test('第三方声明包含变声依赖并随双端产物分发', () => {
       `${crate} must be listed in the shipped notices`);
   }
   assert.match(notices, /Copyright 2024 Colin Marc/,
-    'Signalsmith Stretch copyright must be retained');
+    'Signalsmith Stretch wrapper copyright must be retained');
+  assert.match(notices, /Copyright \(c\) 2022 Geraint Luff \/ Signalsmith Audio Ltd\./,
+    'vendored Signalsmith Stretch header copyright must be retained');
+  assert.match(notices, /Copyright \(c\) 2025 Signalsmith Audio/,
+    'vendored Signalsmith Linear header copyright must be retained');
   assert.match(notices, /Permission is hereby granted, free of charge/,
-    'Signalsmith Stretch MIT text must be retained');
+    'Signalsmith MIT text must be retained');
 
   const mac = fs.readFileSync(path.join(root, 'apps/mixer-gui/build-app.sh'), 'utf8');
   const copyIntoApp = 'cp "$REPO_ROOT/THIRD-PARTY-NOTICES.md" "$APP/Contents/Resources/THIRD-PARTY-NOTICES.md"';
