@@ -56,6 +56,10 @@ impl<B: Backend> BlockAdapter<B> {
         produced
     }
 
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
     pub fn overflow_count(&self) -> u64 {
         self.overflow
     }

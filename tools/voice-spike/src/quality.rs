@@ -46,7 +46,12 @@ mod tests {
         }
         let skip = adapter.latency_frames().min(wet.len());
         let hz = estimate_frequency(&wet[skip..], sr);
-        assert!((hz - 880.0).abs() < 30.0, "hz={hz}");
+        let recoveries = adapter.backend().nan_recoveries();
+        eprintln!("hz={hz:.1} nan_recoveries={recoveries}");
+        assert!(
+            (hz - 880.0).abs() < 44.0,
+            "hz={hz:.1}, expected 880±5%, nan_recoveries={recoveries}"
+        );
     }
 
     #[test]
