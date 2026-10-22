@@ -47,7 +47,9 @@ node --test tools/test-remote-controls.js tools/test-app-packaging.js
 因此默认 `cargo build/clippy/test --workspace` 会编译 C++，本地与 `quality.yml` 双端 CI
 都需要可用的 C++ 工具链，并设置 `LIBCLANG_PATH`。`quality.yml` 在 macOS/Windows 安装 LLVM，
 并在默认特性门禁之外显式运行 `cargo test -p audio-core --features voice` 与
-`cargo test -p audio-session --features voice`。
+`cargo test -p audio-session --features voice`，以及
+`cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings`
+（不含变声后端的构建也必须无告警）。
 
 `tools/win-cross-check.sh` 以 `--no-default-features` 运行，不编译 C++，也不要求上述工具；
 它只证明不依赖变声后端的 Windows 目标源码可编译，替换不了 Windows 原生 CI 与真机构建。
@@ -66,6 +68,7 @@ GUI 布局变更同时检查默认与最小窗口、明暗主题、长名称和�
 ```sh
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings
 cargo test --locked --workspace --all-targets
 node --check apps/mixer-gui/dist/main.js
 node --check apps/mixer-gui/dist/theme.js
