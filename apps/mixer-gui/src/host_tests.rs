@@ -601,6 +601,33 @@ fn standby_rejects_gui_and_remote_triggers_and_activate_restores_remote() {
     assert_eq!(host.status().monitor_plays, 1);
 }
 
+#[cfg(feature = "voice")]
+#[test]
+fn 待机与重建保留遥控变声路由释放后清除() {
+    let (mut host, _backend) = fixture();
+    let dir = TemporaryDir::new();
+    host.voice =
+        VoiceService::new_with_path(&app_config::Config::default(), dir.0.join("config.toml"));
+    let shared = host.remote.lock().unwrap().as_ref().unwrap().clone();
+
+    shared.set_voice_route(host.voice.remote_route());
+    assert!(shared.voice_state().is_some());
+
+    host.stop();
+    assert!(shared.control.lock().unwrap().is_none());
+    assert!(shared.voice_state().is_some(), "待机仍可遥控变声");
+    assert!(shared.voice_set_enabled(true), "待机启用变声必须生效");
+    assert!(host.status().voice.unwrap().enabled);
+    host.voice.flush_saves();
+
+    host.activate(None).unwrap();
+    assert!(shared.voice_state().is_some(), "重建后必须重新发布变声路由");
+
+    host.release();
+    assert!(shared.voice_state().is_none(), "释放后变声接口不可用");
+    assert!(shared.control.lock().unwrap().is_none());
+}
+
 #[test]
 fn live_gains_update_source_metadata_saved_settings_and_both_render_paths() {
     let (host, backend) = fixture();

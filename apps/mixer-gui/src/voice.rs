@@ -5,6 +5,8 @@
 //! 写入线程落盘：连续操作只保留最新待写快照，旧保存结果不能覆盖新状态。
 
 #[cfg(feature = "voice")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "voice")]
 use std::sync::{Arc, Condvar, Mutex};
 
 use audio_core::voice::VoiceParams;
@@ -361,6 +363,8 @@ struct VoiceShared {
     writes_finished: Condvar,
     config_path: PathBuf,
     save: Arc<VoiceSaveFn>,
+    /// 手机遥控路由的代次；发布新路由或释放会话后，旧闭包不能再改状态。
+    remote_epoch: AtomicU64,
 }
 
 /// 宿主变声状态与命令入口。
@@ -433,7 +437,51 @@ impl VoiceService {
                 writes_finished: Condvar::new(),
                 config_path: path,
                 save,
+                remote_epoch: AtomicU64::new(0),
             }),
+        }
+    }
+
+    /// 构造手机遥控路由；调用后先前发布的路由立即退休。
+    ///
+    /// 路由跨音频重启存活：待机与重建只重新发布，释放会话时才退休。
+    pub(crate) fn remote_route(&self) -> remote::VoiceRoute {
+        let epoch = self.shared.remote_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let state = self.clone();
+        let enable = self.clone();
+        let preset = self.clone();
+        remote::VoiceRoute {
+            state: Arc::new(move || state.remote_state()),
+            set_enabled: Arc::new(move |enabled| {
+                enable.remote_route_is_current(epoch) && enable.set_enabled(enabled).is_ok()
+            }),
+            select_preset: Arc::new(move |id| {
+                preset.remote_route_is_current(epoch) && preset.select_preset(id).is_ok()
+            }),
+        }
+    }
+
+    /// 让所有已发布的路由失效；用于释放会话或关闭遥控。
+    pub(crate) fn retire_remote_route(&self) {
+        self.shared.remote_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn remote_route_is_current(&self, epoch: u64) -> bool {
+        self.shared.remote_epoch.load(Ordering::Acquire) == epoch
+    }
+
+    fn remote_state(&self) -> remote::VoiceRemoteState {
+        let status = self.status();
+        remote::VoiceRemoteState {
+            enabled: status.enabled,
+            bypassed: status.bypassed,
+            preset_id: status.preset_id,
+            preset_name: status.preset_name,
+            presets: self
+                .presets()
+                .into_iter()
+                .map(|preset| (preset.id, preset.name))
+                .collect(),
         }
     }
 

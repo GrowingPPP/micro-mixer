@@ -1295,3 +1295,60 @@ fn 人声热键保存不覆盖变声状态与预设() {
     assert_eq!(saved.voice.active_preset, "builtin:male");
     assert_eq!(saved.voice_presets, expected_presets);
 }
+
+#[test]
+fn 遥控路由读取变声状态与用户预设() {
+    let dir = TemporaryDir::new();
+    let service = VoiceService::new_with_path(&user_config(), config_path(&dir));
+    let route = service.remote_route();
+
+    let state = (route.state)();
+
+    assert!(state.enabled);
+    assert_eq!(state.preset_id, "builtin:male");
+    assert_eq!(state.preset_name, "男声");
+    assert!(state
+        .presets
+        .iter()
+        .any(|(id, name)| id == "user:test-abcdef" && name == "测试预设"));
+}
+
+#[test]
+fn 遥控路由启用写入宿主配置且选择预设不启用() {
+    let dir = TemporaryDir::new();
+    let path = config_path(&dir);
+    let service = VoiceService::new_with_path(&Config::default(), path.clone());
+    let route = service.remote_route();
+
+    assert!((route.select_preset)("builtin:male"));
+    assert!(!(route.state)().enabled, "选择预设不能隐式启用变声");
+    assert!(!(route.select_preset)("missing"), "未知预设必须失败");
+    assert_eq!((route.state)().preset_id, "builtin:male");
+
+    assert!((route.set_enabled)(true));
+    assert!((route.state)().enabled);
+    service.flush_saves();
+    let saved = Config::load_from(&path);
+    assert!(saved.voice.enabled, "遥控启用必须写入宿主配置");
+    assert_eq!(saved.voice.active_preset, "builtin:male");
+}
+
+#[test]
+fn 退休的遥控路由不能改变状态() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let retired = service.remote_route();
+    let current = service.remote_route();
+
+    assert!(!(retired.set_enabled)(true), "旧路由不能启用变声");
+    assert!(
+        !(retired.select_preset)("builtin:male"),
+        "旧路由不能切换预设"
+    );
+    let status = service.status();
+    assert!(!status.enabled);
+    assert_eq!(status.preset_id, "builtin:female");
+
+    assert!((current.set_enabled)(true));
+    assert!(service.status().enabled);
+}

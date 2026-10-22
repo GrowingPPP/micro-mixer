@@ -1067,6 +1067,8 @@ impl AudioHost {
                             self.play_handler(playback.clone(), generation),
                             self.remote_stop_handler(playback.clone(), generation),
                         );
+                        #[cfg(feature = "voice")]
+                        sh.set_voice_route(self.voice.remote_route());
                     }
                     println!("[遥控] 已就绪: {}", urls.join("  "));
                     // 防火墙会拦住未签名程序的入站连接，手机就连不上 —— 直接给出放行命令
@@ -1092,6 +1094,8 @@ impl AudioHost {
                     .unwrap_or_else(|e| e.into_inner())
                     .as_ref()
                 {
+                    #[cfg(feature = "voice")]
+                    self.voice.retire_remote_route();
                     sh.clear(); // 关掉开关后，手机端会显示"音频未启动"
                 }
             }
@@ -1136,6 +1140,8 @@ impl AudioHost {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
         {
+            #[cfg(feature = "voice")]
+            self.voice.retire_remote_route();
             shared.clear();
         }
         self.end_session_hotkeys();
@@ -1182,6 +1188,8 @@ impl AudioHost {
                 .clone());
         }
         if let Some(shared) = g.as_ref() {
+            #[cfg(feature = "voice")]
+            self.voice.retire_remote_route();
             shared.clear();
         }
         *server = None;
@@ -1249,6 +1257,9 @@ impl AudioHost {
             .as_ref()
         {
             sh.clear();
+            // 待机只关闭播放；变声路由重新发布，手机上仍可启用与切换预设。
+            #[cfg(feature = "voice")]
+            sh.set_voice_route(self.voice.remote_route());
         }
     }
 
@@ -1285,6 +1296,8 @@ impl AudioHost {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
         {
+            #[cfg(feature = "voice")]
+            self.voice.retire_remote_route();
             sh.clear();
         }
         let running = self
@@ -1415,6 +1428,8 @@ impl AudioHost {
                     self.play_handler(playback.clone(), generation),
                     self.remote_stop_handler(playback.clone(), generation),
                 );
+                #[cfg(feature = "voice")]
+                sh.set_voice_route(self.voice.remote_route());
             }
         }
         playback.activate();
