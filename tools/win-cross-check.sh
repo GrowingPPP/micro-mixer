@@ -19,6 +19,12 @@
 # ⚠️ **这个桩只能用于 `cargo check`，绝不能用于出包。**
 #    真的在 Windows 上构建时用的是系统自带的 `rc.exe`，不需要这套东西。
 #
+# ## 为什么加 `--no-default-features`
+#
+# 默认构建会编译 C++ 变声后端，需要 Windows 的 C++ 工具链，而本机交叉检查没有。
+# 这里只验证不依赖 C++ 后端的 Rust 代码能为 Windows 目标编译；变声后端是否可编译
+# 由 Windows 原生 CI 与真机构建负责，本脚本不替代。
+#
 # 用法：
 #   tools/win-cross-check.sh            # 检查整个 workspace
 #   tools/win-cross-check.sh mixer-gui  # 只检查某个 crate
@@ -59,6 +65,7 @@ chmod +x "$STUB_DIR/llvm-rc"
 echo "── Windows 交叉编译检查 ──"
 echo "  目标: $TARGET"
 echo "  说明: 用桩替代 llvm-rc（仅让构建脚本通过；check 不链接，.res 内容用不到）"
+echo "  变声: 变声代码未参与本次交叉检查；Windows 原生 CI 与真机构建才是权威"
 echo
 
 if [ $# -gt 0 ]; then
@@ -70,7 +77,7 @@ else
 fi
 
 export PATH="$STUB_DIR:$PATH"
-out=$(cargo check --locked --all-targets --target "$TARGET" "${ARGS[@]}" 2>&1)
+out=$(cargo check --locked --all-targets --target "$TARGET" --no-default-features "${ARGS[@]}" 2>&1)
 rc=$?
 
 if [ $rc -eq 0 ]; then

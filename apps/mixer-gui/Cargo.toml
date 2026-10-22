@@ -26,7 +26,8 @@ tauri = { version = "2", features = ["tray-icon", "image-png"] }
 rfd = "0.15"
 
 [features]
-default = []
+# 默认启用变声；关闭后仍可编译，运行期对变声请求返回明确错误。
+default = ["voice"]
 voice = ["audio-session/voice"]
 
 [dev-dependencies]
