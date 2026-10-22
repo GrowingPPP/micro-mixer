@@ -213,6 +213,30 @@ test('变声状态轮询更新开关旁路与当前预设', async () => {
   assert.ok(h.presetButtons[1].classList.contains('on'));
 });
 
+test('点击后启动的轮询不能覆盖先完成的命令结果', async () => {
+  const h = harness();
+  const enable = h.context.voiceEnable(true);
+  await flush();
+  const poll = h.context.pollVoice();
+  await flush();
+  assert.deepEqual(h.requests.map(r => r.path), ['/voice/enable/1', '/voice/status']);
+
+  h.requests[0].finish(true, {
+    enabled: true, bypassed: false, preset_id: 'builtin:male', preset_name: '男声',
+  });
+  await enable;
+  assert.equal(h.fields.venable.checked, true);
+  assert.equal(h.fields.vpreset.textContent, '男声');
+
+  h.requests[1].finish(true, {
+    enabled: false, bypassed: true, preset_id: 'builtin:female', preset_name: '女声',
+  });
+  await poll;
+  assert.equal(h.fields.venable.checked, true, '命令完成后到达的旧轮询必须丢弃');
+  assert.equal(h.fields.vpreset.textContent, '男声');
+  assert.equal(h.fields.vbypass.hidden, true);
+});
+
 test('退休会话的旧轮询回复不覆盖新的变声状态', async () => {
   const h = harness();
   const poll = h.context.pollVoice();

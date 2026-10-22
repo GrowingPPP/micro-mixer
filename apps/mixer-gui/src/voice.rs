@@ -5,8 +5,6 @@
 //! 写入线程落盘：连续操作只保留最新待写快照，旧保存结果不能覆盖新状态。
 
 #[cfg(feature = "voice")]
-use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "voice")]
 use std::sync::{Arc, Condvar, Mutex};
 
 use audio_core::voice::VoiceParams;
@@ -343,6 +341,8 @@ struct VoiceState {
     save_generation: u64,
     pending_write: Option<VoiceWrite>,
     writer_active: bool,
+    /// 手机遥控路由代次；与状态写入共用同一把锁，退休后旧闭包不能写入。
+    remote_epoch: u64,
 }
 
 #[cfg(feature = "voice")]
@@ -363,8 +363,16 @@ struct VoiceShared {
     writes_finished: Condvar,
     config_path: PathBuf,
     save: Arc<VoiceSaveFn>,
-    /// 手机遥控路由的代次；发布新路由或释放会话后，旧闭包不能再改状态。
-    remote_epoch: AtomicU64,
+    /// 回归测试在“代次检查完成、状态写入之前”暂停遥控命令。
+    #[cfg(test)]
+    remote_pause: Mutex<Option<RemoteWritePause>>,
+}
+
+/// 让测试确定性地构造“检查后、写入前”窗口；暂停期间状态锁仍由命令持有。
+#[cfg(all(test, feature = "voice"))]
+struct RemoteWritePause {
+    checked: std::sync::mpsc::Sender<()>,
+    resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
 /// 宿主变声状态与命令入口。
@@ -433,11 +441,13 @@ impl VoiceService {
                     save_generation: 0,
                     pending_write: None,
                     writer_active: false,
+                    remote_epoch: 0,
                 }),
                 writes_finished: Condvar::new(),
                 config_path: path,
                 save,
-                remote_epoch: AtomicU64::new(0),
+                #[cfg(test)]
+                remote_pause: Mutex::new(None),
             }),
         }
     }
@@ -446,28 +456,59 @@ impl VoiceService {
     ///
     /// 路由跨音频重启存活：待机与重建只重新发布，释放会话时才退休。
     pub(crate) fn remote_route(&self) -> remote::VoiceRoute {
-        let epoch = self.shared.remote_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let epoch = {
+            let mut state = self.lock();
+            state.remote_epoch = state.remote_epoch.wrapping_add(1);
+            state.remote_epoch
+        };
         let state = self.clone();
         let enable = self.clone();
         let preset = self.clone();
         remote::VoiceRoute {
             state: Arc::new(move || state.remote_state()),
             set_enabled: Arc::new(move |enabled| {
-                enable.remote_route_is_current(epoch) && enable.set_enabled(enabled).is_ok()
+                enable.set_enabled_for_remote(enabled, epoch).is_ok()
             }),
-            select_preset: Arc::new(move |id| {
-                preset.remote_route_is_current(epoch) && preset.select_preset(id).is_ok()
-            }),
+            select_preset: Arc::new(move |id| preset.select_preset_for_remote(id, epoch).is_ok()),
         }
     }
 
     /// 让所有已发布的路由失效；用于释放会话或关闭遥控。
+    ///
+    /// 递增与状态写入使用同一把锁；退休返回后，旧闭包不可能再写入状态。
     pub(crate) fn retire_remote_route(&self) {
-        self.shared.remote_epoch.fetch_add(1, Ordering::AcqRel);
+        let mut state = self.lock();
+        state.remote_epoch = state.remote_epoch.wrapping_add(1);
     }
 
-    fn remote_route_is_current(&self, epoch: u64) -> bool {
-        self.shared.remote_epoch.load(Ordering::Acquire) == epoch
+    fn set_enabled_for_remote(&self, enabled: bool, epoch: u64) -> Result<VoiceStatusDto> {
+        {
+            let mut state = self.lock();
+            anyhow::ensure!(state.remote_epoch == epoch, "遥控路由已过期");
+            #[cfg(test)]
+            self.pause_remote_write();
+            Self::apply_enabled(&mut state, enabled);
+            self.queue_write(&mut state);
+        }
+        Ok(self.status())
+    }
+
+    #[cfg(test)]
+    fn pause_remote_write(&self) {
+        let pause = self
+            .shared
+            .remote_pause
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(pause) = pause {
+            let _ = pause.checked.send(());
+            let _ = pause
+                .resume
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .recv();
+        }
     }
 
     fn remote_state(&self) -> remote::VoiceRemoteState {
@@ -684,13 +725,17 @@ impl VoiceService {
     pub(crate) fn set_enabled(&self, enabled: bool) -> Result<VoiceStatusDto> {
         {
             let mut state = self.lock();
-            state.enabled = enabled;
-            state.bypassed = false;
-            state.operation = state.operation.wrapping_add(1);
-            Self::apply_control(&state);
+            Self::apply_enabled(&mut state, enabled);
             self.queue_write(&mut state);
         }
         Ok(self.status())
+    }
+
+    fn apply_enabled(state: &mut VoiceState, enabled: bool) {
+        state.enabled = enabled;
+        state.bypassed = false;
+        state.operation = state.operation.wrapping_add(1);
+        Self::apply_control(state);
     }
 
     pub(crate) fn set_bypass(&self, bypass: bool) -> Result<VoiceStatusDto> {
@@ -720,6 +765,14 @@ impl VoiceService {
     ///
     /// 选择预设只更新参数与激活项，不改变启用状态，也不清除临时旁路。
     pub(crate) fn select_preset(&self, id: &str) -> Result<VoiceStatusDto> {
+        self.select_preset_inner(id, None)
+    }
+
+    fn select_preset_for_remote(&self, id: &str, epoch: u64) -> Result<VoiceStatusDto> {
+        self.select_preset_inner(id, Some(epoch))
+    }
+
+    fn select_preset_inner(&self, id: &str, remote_epoch: Option<u64>) -> Result<VoiceStatusDto> {
         let preset = builtin_voice_presets()
             .into_iter()
             .find(|preset| preset.id == id)
@@ -734,6 +787,11 @@ impl VoiceService {
         let params = params_from_config(preset.params);
         {
             let mut state = self.lock();
+            if let Some(epoch) = remote_epoch {
+                anyhow::ensure!(state.remote_epoch == epoch, "遥控路由已过期");
+                #[cfg(test)]
+                self.pause_remote_write();
+            }
             // 重复选择当前预设不能丢弃正在编辑的参数。
             if state.preset_id != preset.id {
                 if state.params != state.saved_params {

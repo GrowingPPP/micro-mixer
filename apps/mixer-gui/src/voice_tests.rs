@@ -1352,3 +1352,44 @@ fn 退休的遥控路由不能改变状态() {
     assert!((current.set_enabled)(true));
     assert!(service.status().enabled);
 }
+
+#[test]
+fn 遥控写入检查与退休在同一状态锁内() {
+    let dir = TemporaryDir::new();
+    let path = config_path(&dir);
+    let service = VoiceService::new_with_path(&Config::default(), path.clone());
+    let retired = service.remote_route();
+    let stale_enable = retired.set_enabled.clone();
+    let (checked_tx, checked_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    *service.shared.remote_pause.lock().unwrap() = Some(RemoteWritePause {
+        checked: checked_tx,
+        resume: Mutex::new(resume_rx),
+    });
+
+    let command = std::thread::spawn(move || (retired.set_enabled)(true));
+    checked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    let (retired_tx, retired_rx) = mpsc::channel();
+    let retiring = service.clone();
+    let retire = std::thread::spawn(move || {
+        retiring.retire_remote_route();
+        retired_tx.send(()).unwrap();
+    });
+    assert!(
+        retired_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+        "退休必须等待已经通过代次检查的遥控写入完成"
+    );
+
+    resume_tx.send(()).unwrap();
+    assert!(command.join().unwrap(), "退休前通过检查的命令应完成写入");
+    retired_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    retire.join().unwrap();
+
+    assert!(service.status().enabled);
+    assert!(!stale_enable(false), "退休后的旧闭包必须失败");
+    assert!(service.status().enabled, "旧闭包不能改变状态");
+    service.flush_saves();
+    let saved = Config::load_from(&path);
+    assert!(saved.voice.enabled, "旧闭包不能覆盖退休前完成的配置写入");
+}

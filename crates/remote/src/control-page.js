@@ -3,6 +3,7 @@
 // operation which the computer may already have accepted.
 let commandTail = Promise.resolve();
 let commandChoice = 0;
+let commandDone = 0;
 let pollSerial = 0;
 
 function pct(db) {
@@ -46,7 +47,12 @@ async function submit(path, message, element) {
     }
   });
   commandTail = command;
-  await command;
+  try {
+    await command;
+  } finally {
+    // 命令完成（无论成功或失败）都会让之前启动的轮询快照过期。
+    commandDone++;
+  }
 }
 
 function hit(path, element) {
@@ -68,15 +74,21 @@ function voicePick(element) {
   );
 }
 
-// 状态轮询只更新显示，不占用命令队列。命令开始后，轮询期间发出的旧回复
-// 按代次丢弃，避免旧会话状态覆盖刚生效的开关或预设。
+// 状态轮询只更新显示，不占用命令队列。只有轮询启动于最后一次命令完成之后，
+// 且期间没有新命令开始或完成时，结果才可应用；否则旧快照会覆盖刚生效的状态。
 async function pollVoice() {
   const serial = ++pollSerial;
   const choice = commandChoice;
+  const done = commandDone;
   try {
     const response = await fetch('/voice/status');
     const result = await response.json();
-    if (serial === pollSerial && choice === commandChoice && result.ok) {
+    if (
+      serial === pollSerial
+      && choice === commandChoice
+      && done === commandDone
+      && result.ok
+    ) {
       applyVoice(result);
     }
   } catch (error) {
