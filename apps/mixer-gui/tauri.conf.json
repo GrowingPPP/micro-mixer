@@ -37,6 +37,10 @@
     "macOS": {
       "minimumSystemVersion": "11.0"
     },
+    "resources": {
+      "../../LICENSE": "LICENSE",
+      "../../THIRD-PARTY-NOTICES.md": "THIRD-PARTY-NOTICES.md"
+    },
     "shortDescription": "将本地音频与麦克风人声混合，让对方听到",
     "longDescription": "将本地音频与麦克风人声实时混合，通过虚拟音频设备传给语音、会议、直播或游戏中的对方。支持音效切换、单独调音量、循环播放、仅自己可听的试听和手机遥控。",
     "copyright": "Copyright (c) 2026 zhangguanghui <1003986591@qq.com>",

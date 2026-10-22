@@ -61,6 +61,45 @@ function Copy-DistributionDocuments([string]$SourceRoot, [string]$Destination) {
     }
 }
 
+function Test-DistributionResources($Config, [string]$ConfigDirectory) {
+    # 许可证与第三方声明必须由 bundle.resources 装进安装目录：只复制到安装包旁边的文件
+    # 不会出现在用户机器上，而静态编入 exe 的 Signalsmith 等代码要求随二进制保留版权声明。
+    # 源路径相对 tauri.conf.json 所在目录解析，目标是安装根目录下的同名文件。
+    $resources = $null
+    if ($null -ne $Config.bundle) { $resources = $Config.bundle.resources }
+    if ($null -eq $resources) {
+        throw 'tauri.conf.json 缺少 bundle.resources：安装目录不会包含许可证与第三方声明'
+    }
+    foreach ($name in @('LICENSE', 'THIRD-PARTY-NOTICES.md')) {
+        $source = $null
+        foreach ($entry in $resources.PSObject.Properties) {
+            if ($entry.Value -ceq $name) { $source = $entry.Name; break }
+        }
+        if ($null -eq $source) { throw "bundle.resources 没有把 $name 安装到安装根目录" }
+        $path = [IO.Path]::GetFullPath((Join-Path $ConfigDirectory $source))
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "bundle.resources 指向的文件不存在：$path"
+        }
+    }
+}
+
+function Find-NsisInstallerScript([string]$WorkRoot) {
+    # Tauri 在 target\release\nsis\<架构>\ 下生成 installer.nsi；其中的 File 指令决定
+    # 哪些文件被装进安装目录，是不运行安装器就能核对安装内容的唯一依据。
+    if (-not (Test-Path -LiteralPath $WorkRoot -PathType Container)) { return $null }
+    return Get-ChildItem -LiteralPath $WorkRoot -Filter 'installer.nsi' -File -Recurse -ErrorAction SilentlyContinue |
+           Sort-Object LastWriteTime -Descending | Select-Object -First 1
+}
+
+function Get-MissingNsisResources([string]$ScriptText) {
+    # 返回脚本没有收录的文件名（逗号分隔，全部收录时为空串）。文件名必须作为路径分量出现，
+    # 避免脚本里别处出现的 LICENSE 字样造成误判。
+    $missing = New-Object System.Collections.Generic.List[string]
+    if ($ScriptText -notmatch '[\\/=]LICENSE(?![\w.-])') { $missing.Add('LICENSE') }
+    if ($ScriptText -notmatch 'THIRD-PARTY-NOTICES\.md') { $missing.Add('THIRD-PARTY-NOTICES.md') }
+    return ($missing -join ', ')
+}
+
 $tauriConfig = Get-Content -Raw -Encoding UTF8 (Join-Path $PSScriptRoot 'tauri.conf.json') | ConvertFrom-Json
 $AppName = Get-TauriProductName $tauriConfig
 
@@ -162,6 +201,45 @@ if ($TestSmokeHarness) {
         $rejected = $false
         try { Copy-DistributionDocuments $incompleteSource $docTarget | Out-Null } catch { $rejected = $true }
         if (-not $rejected) { throw '缺少第三方声明时不得生成安装包目录' }
+        # 安装资源声明：仓库当前配置必须通过；缺失、改名或指向不存在文件的声明必须被拒绝。
+        Test-DistributionResources $tauriConfig $PSScriptRoot
+        $resourceCases = @(
+            [pscustomobject]@{ bundle = [pscustomobject]@{} },
+            [pscustomobject]@{ bundle = [pscustomobject]@{ resources = [pscustomobject]@{ '../../LICENSE' = 'LICENSE' } } },
+            [pscustomobject]@{ bundle = [pscustomobject]@{ resources = [pscustomobject]@{
+                '../../LICENSE' = 'docs/LICENSE'; '../../THIRD-PARTY-NOTICES.md' = 'THIRD-PARTY-NOTICES.md' } } },
+            [pscustomobject]@{ bundle = [pscustomobject]@{ resources = [pscustomobject]@{
+                '../../LICENSE' = 'LICENSE'; '../../NO-SUCH-NOTICES.md' = 'THIRD-PARTY-NOTICES.md' } } }
+        )
+        foreach ($case in $resourceCases) {
+            $rejected = $false
+            try { Test-DistributionResources $case $PSScriptRoot } catch { $rejected = $true }
+            if (-not $rejected) { throw '缺失、改名或指向不存在文件的安装资源声明被误判为通过' }
+        }
+        # NSIS 脚本核对：没有脚本时返回空；收录两份文件才通过；缺任意一份都必须指出。
+        $nsisRoot = Join-Path $testDir 'nsis-work'
+        $nsisArch = Join-Path $nsisRoot 'x64'
+        New-Item -ItemType Directory -Path $nsisArch -Force | Out-Null
+        if ($null -ne (Find-NsisInstallerScript $nsisRoot)) { throw '没有 installer.nsi 时不得返回脚本' }
+        if ($null -ne (Find-NsisInstallerScript (Join-Path $testDir 'no-such-dir'))) { throw '目录不存在时不得返回脚本' }
+        $goodScript = @('File /a "/oname=LICENSE" "C:\repo\LICENSE"',
+                        'File /a "/oname=THIRD-PARTY-NOTICES.md" "C:\repo\THIRD-PARTY-NOTICES.md"') -join "`n"
+        [IO.File]::WriteAllText((Join-Path $nsisArch 'installer.nsi'), $goodScript)
+        $foundScript = Find-NsisInstallerScript $nsisRoot
+        if ($null -eq $foundScript) { throw '应找到 installer.nsi' }
+        if ((Get-MissingNsisResources (Get-Content -Raw -Encoding UTF8 -LiteralPath $foundScript.FullName)) -ne '') {
+            throw '收录两份文件的 NSIS 脚本应通过核对'
+        }
+        $incompleteScripts = @{
+            'MUI_PAGE_LICENSE' = 'LICENSE, THIRD-PARTY-NOTICES.md'
+            'File "C:\repo\LICENSE"' = 'THIRD-PARTY-NOTICES.md'
+            'File "C:\repo\THIRD-PARTY-NOTICES.md"' = 'LICENSE'
+        }
+        foreach ($text in $incompleteScripts.Keys) {
+            if ((Get-MissingNsisResources $text) -cne $incompleteScripts[$text]) {
+                throw "缺少安装资源的 NSIS 脚本被误判：$text"
+            }
+        }
         $plainBuildArguments = @(Get-TauriBuildArguments $true)
         if (($plainBuildArguments -join ' ') -ne 'build --no-bundle' -or
             $plainBuildArguments -contains '--bundles') { throw 'NoInstaller 构建参数错误' }
@@ -196,7 +274,7 @@ if ($TestSmokeHarness) {
             try { Test-SmokeResult $case.Exit $case.Output | Out-Null } catch { $rejected = $true }
             if (-not $rejected) { throw '失败或不完整结果被误判为通过' }
         }
-        Ok '冒烟门禁回归通过：产品名/安装包筛选 + 分发文件 + 构建参数 + WAV + 正常完成 + 6 类失败/不完整结果'
+        Ok '冒烟门禁回归通过：产品名/安装包筛选 + 分发文件 + 安装资源声明与 NSIS 脚本核对 + 构建参数 + WAV + 正常完成 + 6 类失败/不完整结果'
     } finally {
         Remove-Item -Recurse -Force $testDir
     }
@@ -218,6 +296,14 @@ if (-not (Test-Path 'node_modules')) {
     if ($LASTEXITCODE -ne 0) { Bad 'npm install 失败'; exit 1 }
 }
 Ok 'Tauri CLI 依赖就绪'
+
+try {
+    Test-DistributionResources $tauriConfig $PSScriptRoot
+} catch {
+    Bad $_.Exception.Message
+    exit 1
+}
+Ok '许可证与第三方声明已声明为安装资源（bundle.resources）'
 
 # WebView2 是 Tauri 在 Windows 上的运行时依赖。
 # Win11 自带；Win10 可能没有 —— 装的时候会静默失败，界面一片空白，很难查。
@@ -297,13 +383,27 @@ if ($NoInstaller) {
     }
     Ok "安装包：$($nsis.Name)（$([math]::Round($nsis.Length / 1MB, 1)) MB）"
     Write-Host "     $($nsis.FullName)"
+
+    # 核对安装包的资源清单确实收录了许可证与第三方声明；不运行安装器，也不改动本机环境。
+    $nsisScript = Find-NsisInstallerScript (Join-Path $Root 'target\release\nsis')
+    if ($null -eq $nsisScript) {
+        Warn '没找到 Tauri 生成的 installer.nsi，无法核对安装内容；请在真机安装后确认安装目录含 LICENSE 与 THIRD-PARTY-NOTICES.md'
+    } else {
+        $missingResources = Get-MissingNsisResources (Get-Content -Raw -Encoding UTF8 -LiteralPath $nsisScript.FullName)
+        if ($missingResources -ne '') {
+            Bad "NSIS 脚本没有收录：${missingResources}（$($nsisScript.FullName)）"
+            exit 1
+        }
+        Ok 'NSIS 脚本收录了 LICENSE 与 THIRD-PARTY-NOTICES.md'
+    }
 }
 
-# 安装包本身只含 exe；许可证与第三方声明放在同一交付目录，随安装包一起分发。
-# 变声的 C++ 后端由 cc 静态编入 exe，不需要额外 DLL；安装包与 CRT/DLL 完整性
-# 仍需 Windows 真机安装验收。
+# 安装目录里的许可证与第三方声明来自 tauri.conf.json 的 bundle.resources。这里另放一份到
+# 交付目录，不安装也能查看；缺少任一源文件时直接失败。变声的 C++ 后端由 cc 静态编入 exe，
+# 但未设置静态 CRT，msvcp140.dll / vcruntime140.dll 是否缺失、安装后目录是否真含这两份文件，
+# 仍需 Windows 真机安装验收，构建脚本不能替代。
 Copy-DistributionDocuments $Root $distDir
-Ok "LICENSE 与第三方声明：$distDir"
+Ok "LICENSE 与第三方声明（交付目录副本）：$distDir"
 
 # ── 4. 下一步 ──────────────────────────────────────────────────
 Step '4/4' '下一步'

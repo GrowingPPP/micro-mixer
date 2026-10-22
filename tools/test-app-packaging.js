@@ -102,6 +102,42 @@ test('第三方声明包含变声依赖并随双端产物分发', () => {
     'Windows distribution documents must include the notices');
 });
 
+// Windows 安装包只含 exe 与 bundle.resources 声明的文件；复制到安装包旁边的文件不会出现在
+// 用户机器上。静态编入 exe 的 Signalsmith 等代码要求随二进制保留版权声明。
+test('Windows 安装包通过 bundle.resources 把许可证与第三方声明装进安装根目录', () => {
+  const resources = config.bundle.resources;
+  assert.ok(resources && !Array.isArray(resources),
+    'bundle.resources 必须用映射写法，才能固定安装后的文件名');
+  const configDir = path.join(root, 'apps/mixer-gui');
+  for (const name of ['LICENSE', 'THIRD-PARTY-NOTICES.md']) {
+    const sources = Object.entries(resources).filter(([, target]) => target === name).map(([source]) => source);
+    assert.equal(sources.length, 1, `${name} 必须恰好被安装一次到安装根目录`);
+    const resolved = path.resolve(configDir, sources[0]);
+    assert.equal(resolved, path.join(root, name), `${name} 的源路径必须相对配置目录指向仓库根目录的同名文件`);
+    assert.ok(fs.existsSync(resolved), `${resolved} 不存在，安装包会缺少该文件`);
+  }
+  // 目标不能带目录前缀：安装目录里要能直接看到这两个文件。
+  for (const target of Object.values(resources)) {
+    assert.ok(!target.includes('/') && !target.includes('\\'), `${target} 不应放进子目录`);
+  }
+
+  const windows = fs.readFileSync(path.join(root, 'apps/mixer-gui/build-app-windows.ps1'), 'utf8');
+  assert.ok(windows.includes('Test-DistributionResources $tauriConfig $PSScriptRoot'),
+    '构建前必须核对安装资源声明');
+  assert.ok(windows.indexOf('Test-DistributionResources $tauriConfig $PSScriptRoot') <
+    windows.indexOf("& \"$Root\\node_modules\\.bin\\tauri.cmd\""), '声明核对必须早于构建');
+  assert.ok(windows.includes('Get-MissingNsisResources'), '构建后必须核对 NSIS 脚本收录项');
+  assert.match(windows, /Find-NsisInstallerScript \(Join-Path \$Root 'target\\release\\nsis'\)/);
+});
+
+test('macOS App 包内的许可证文件名与安装资源声明一致且签名前放入', () => {
+  const mac = fs.readFileSync(path.join(root, 'apps/mixer-gui/build-app.sh'), 'utf8');
+  for (const name of Object.values(config.bundle.resources)) {
+    assert.ok(mac.includes(`"$APP/Contents/Resources/${name}"`),
+      `macOS 脚本必须把 ${name} 放在 Contents/Resources 根目录，与 bundle.resources 的落点一致`);
+  }
+});
+
 test('macOS permission prompts identify the same application as the bundle metadata', () => {
   const plist = fs.readFileSync(path.join(root, 'apps/mixer-gui/Info.plist'), 'utf8');
   for (const key of ['NSMicrophoneUsageDescription', 'NSDownloadsFolderUsageDescription',
