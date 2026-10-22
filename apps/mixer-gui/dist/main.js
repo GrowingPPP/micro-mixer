@@ -174,7 +174,7 @@ el.btnUtilityClose.addEventListener('click', closeModal);
 let state = { running: false, slots: [], items: [], lastStatus: null,
                monitorDevice: null, remoteUrl: null, activeTag: null, devices: [],
                lastDeviceLost: null, lastPanicSeen: null, lastStalled: null,
-               lastMonitorError: null,
+               lastMonitorError: null, voiceNoticeGeneration: 0,
                silentSecs: 0, micHelpShown: false, micHelpDismissed: false };
 
 // ── 变声状态与音效播放状态分开缓存 ───────────────────────────
@@ -1447,6 +1447,12 @@ async function poll(choice = audioChoice) {
     state.slots = st.slots || [];
     if (st.voice) {
       applyVoiceSnapshot(st.voice, { fromPoll: true, requestVersion: voiceVersionAtRequest });
+    }
+    // 人声热键提示按代次只展示一次；恢复后宿主会把消息清空。
+    const voiceNoticeGeneration = Number(st.voice_notice_generation) || 0;
+    if (voiceNoticeGeneration > state.voiceNoticeGeneration) {
+      state.voiceNoticeGeneration = voiceNoticeGeneration;
+      if (st.voice_notice) toast(st.voice_notice);
     }
 
     // 顶栏：三种状态必须一眼分得清 ——

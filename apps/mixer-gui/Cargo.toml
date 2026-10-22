@@ -29,5 +29,9 @@ rfd = "0.15"
 default = []
 voice = ["audio-session/voice"]
 
+[dev-dependencies]
+# 宿主生命周期回归注入不注册系统热键的管理器替身。
+hotkeys = { path = "../../crates/hotkeys", features = ["test-support"] }
+
 [lints]
 workspace = true

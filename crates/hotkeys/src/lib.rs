@@ -70,7 +70,7 @@ use global_hotkey::GlobalHotKeyManager;
 use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use std::sync::Arc;
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", test, feature = "test-support"))]
 mod owner;
 
 // ─────────────────────────────────────────── 平台：事件循环
@@ -330,7 +330,7 @@ pub struct HotkeyManager {
 enum ManagerOwner {
     #[cfg(not(target_os = "windows"))]
     Native(GlobalHotKeyManager),
-    #[cfg(any(target_os = "windows", test))]
+    #[cfg(any(target_os = "windows", test, feature = "test-support"))]
     Worker(owner::OwnerClient),
 }
 
@@ -346,7 +346,7 @@ impl HotkeyManager {
                     |key| manager.unregister(key).map_err(Into::into),
                 )
             }
-            #[cfg(any(target_os = "windows", test))]
+            #[cfg(any(target_os = "windows", test, feature = "test-support"))]
             ManagerOwner::Worker(owner) => owner.register(keys),
         }
     }
@@ -360,9 +360,57 @@ impl HotkeyManager {
                 self.events.discard_pending();
                 result
             }
-            #[cfg(any(target_os = "windows", test))]
+            #[cfg(any(target_os = "windows", test, feature = "test-support"))]
             ManagerOwner::Worker(owner) => owner.unregister(keys),
         }
+    }
+}
+
+/// 宿主回归使用的不注册系统热键的管理器替身。
+///
+/// 仅供 `test-support` 特性下的测试构建使用；生产构建不会编译这段代码。
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RecordingManager {
+        registrations: Arc<AtomicUsize>,
+    }
+
+    impl owner::NativeManager for RecordingManager {
+        fn register(&self, _: HotKey) -> Result<()> {
+            self.registrations.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn unregister(&self, _: HotKey) -> Result<()> {
+            Ok(())
+        }
+
+        fn pump(&self) {}
+    }
+
+    /// 返回共享管理器与累计注册次数；次数用于断言重建不重复绑定。
+    pub fn manager() -> Result<(Arc<HotkeyManager>, Arc<AtomicUsize>)> {
+        let events = Arc::new(EventInbox::default());
+        let registrations = Arc::new(AtomicUsize::new(0));
+        let worker_counts = registrations.clone();
+        let owner = owner::OwnerClient::spawn(
+            move || {
+                Ok(RecordingManager {
+                    registrations: worker_counts,
+                })
+            },
+            events.clone(),
+        )?;
+        Ok((
+            Arc::new(HotkeyManager {
+                inner: ManagerOwner::Worker(owner),
+                events,
+            }),
+            registrations,
+        ))
     }
 }
 
@@ -585,7 +633,8 @@ pub enum HotkeyGroup {
 
 /// 音效槽位与人声效果共用一个平台管理器，但分属两组独立绑定。
 ///
-/// 待机只把槽位键还给游戏，人声效果热键继续可用；释放会话时两组都注销。
+/// 槽位集合随音频会话启停：待机只归还槽位按键，会话释放时丢弃该集合。
+/// 变声集合从程序启动保留到进程退出，因此无音频会话时仍能切换待用预设。
 /// 两个轮询器必须由同一个消费者排水：global-hotkey 的事件通道是进程共享的，
 /// 分别调用 [`HotkeyPoller::poll`] 会让先调用者吞掉另一组的按键。
 #[derive(Default)]
@@ -648,25 +697,37 @@ impl HotkeyGroups {
         }
     }
 
-    /// 释放会话时注销两组；一组失败不阻止另一组归还按键。
+    /// 音频会话结束：注销并丢弃槽位集合；变声集合跨会话保留。
     ///
-    /// 集合在这里一并丢弃，确保平台句柄的析构仍发生在调用方调度的主线程上。
-    pub fn release(&mut self) -> Result<()> {
+    /// 集合在这里丢弃，确保平台句柄的析构发生在调用方调度的线程上。
+    pub fn end_session(&mut self) -> Result<()> {
         self.slot_poller = None;
-        self.voice_poller = None;
         let mut slots = self.slot_hotkeys.take();
-        let mut voice = self.voice_hotkeys.take();
-        let slot_result = match slots.as_mut() {
-            Some(hotkeys) => hotkeys.unbind_all(),
-            None => Ok(()),
-        };
-        let voice_result = match voice.as_mut() {
+        let result = match slots.as_mut() {
             Some(hotkeys) => hotkeys.unbind_all(),
             None => Ok(()),
         };
         drop(slots);
+        result
+    }
+
+    /// 注销并丢弃变声集合；只在进程退出或显式关闭时调用。
+    pub fn clear_voice(&mut self) -> Result<()> {
+        self.voice_poller = None;
+        let mut voice = self.voice_hotkeys.take();
+        let result = match voice.as_mut() {
+            Some(hotkeys) => hotkeys.unbind_all(),
+            None => Ok(()),
+        };
         drop(voice);
-        slot_result.and(voice_result)
+        result
+    }
+
+    /// 进程退出：两组都注销并丢弃。
+    pub fn shutdown(&mut self) -> Result<()> {
+        let slots = self.end_session();
+        let voice = self.clear_voice();
+        slots.and(voice)
     }
 
     pub fn rebind_slots(&mut self, keys: &[String]) -> Result<()> {

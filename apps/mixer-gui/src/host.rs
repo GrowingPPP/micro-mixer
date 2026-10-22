@@ -119,6 +119,9 @@ pub struct StatusDto {
     /// 送往虚拟麦克风的短时 RMS（dBFS）
     pub out_rms_db: f32,
     pub hotkeys_active: bool,
+    /// 人声效果热键的一次性提示；界面按代次只展示一次。
+    pub voice_notice: Option<String>,
+    pub voice_notice_generation: u64,
     pub last_error: Option<String>,
     pub uptime_secs: f32,
     pub remote_urls: Vec<String>,
@@ -164,6 +167,8 @@ impl StatusDto {
             out_peak_db: -100.0,
             out_rms_db: -100.0,
             hotkeys_active: false,
+            voice_notice: None,
+            voice_notice_generation: 0,
             last_error: None,
             uptime_secs: 0.0,
             remote_urls: Vec::new(),
@@ -239,8 +244,6 @@ struct Running {
     session: Session,
     playback: Arc<Playback>,
     stats: Arc<EngineStats>,
-    shutdown: Arc<AtomicBool>,
-    hotkey_thread: Option<JoinHandle<()>>,
     slots_meta: Vec<SlotDto>,
     out_device: String,
     in_device: String,
@@ -249,8 +252,6 @@ struct Running {
     monitor_error: Mutex<Option<String>>,
     started_at: std::time::Instant,
     skipped_notes: Vec<String>,
-    /// 音效槽位与人声效果两组绑定共用一个平台管理器。
-    hotkeys: Arc<Mutex<HotkeyGroups>>,
     cfg_key: String,
     cfg: StartConfig,
 }
@@ -407,6 +408,28 @@ pub fn install_panic_hook() {
     }));
 }
 
+/// 人声热键提示按代次展示一次，避免 250 ms 轮询反复弹出。
+#[derive(Default)]
+pub(crate) struct VoiceNoticeState {
+    pub(crate) generation: u64,
+    pub(crate) message: Option<String>,
+}
+
+fn set_voice_notice(state: &Mutex<VoiceNoticeState>, message: impl Into<String>) {
+    let mut notice = state.lock().unwrap_or_else(|e| e.into_inner());
+    notice.generation = notice.generation.wrapping_add(1);
+    notice.message = Some(message.into());
+}
+
+fn clear_voice_notice(state: &Mutex<VoiceNoticeState>) {
+    let mut notice = state.lock().unwrap_or_else(|e| e.into_inner());
+    if notice.message.take().is_some() {
+        notice.generation = notice.generation.wrapping_add(1);
+    }
+}
+
+type SlotAction = Arc<dyn Fn(usize) -> bool + Send + Sync>;
+
 #[derive(Default)]
 pub struct AudioHost {
     quitting: AtomicBool,
@@ -418,10 +441,17 @@ pub struct AudioHost {
     /// 会话之外也保存音量，试听与启动中的用户调整共用这一份状态。
     gains: Mutex<HostGains>,
     next_generation: AtomicU64,
-    /// 热键线程需要把动作失败写回状态，因此与宿主共享同一错误槽。
-    last_error: Arc<Mutex<Option<String>>>,
+    last_error: Mutex<Option<String>>,
+    /// 人声热键的可见提示；独立于启动错误，界面按代次只展示一次。
+    voice_notice: Arc<Mutex<VoiceNoticeState>>,
     /// 进程内唯一的平台热键管理器；音效与变声热键都用它绑定。
     hotkey_manager: Arc<Mutex<Option<Arc<HotkeyManager>>>>,
+    /// 槽位随会话、变声随进程；由同一个轮询线程排水。
+    hotkeys: Arc<Mutex<HotkeyGroups>>,
+    /// 当前会话的槽位动作；待机或释放后清空，防止旧会话继续响应。
+    slot_action: Arc<Mutex<Option<SlotAction>>>,
+    hotkey_shutdown: Arc<AtomicBool>,
+    hotkey_thread: Mutex<Option<JoinHandle<()>>>,
     /// 试听代号：每次试听自增，旧的那次看到代号变了就自行停止。
     /// 用它避免连点多个音效时声音叠在一起。
     preview_gen: Arc<AtomicU64>,
@@ -583,6 +613,10 @@ impl AudioHost {
     pub fn status(&self) -> StatusDto {
         let (preview_sound_id, preview_playing, preview_playhead_secs, preview_duration_secs) =
             self.preview_status();
+        let (voice_notice_generation, voice_notice) = {
+            let notice = self.voice_notice.lock().unwrap_or_else(|e| e.into_inner());
+            (notice.generation, notice.message.clone())
+        };
         // 变声状态来自宿主的控制侧快照，不读取音频线程内部状态。
         #[cfg(feature = "voice")]
         let voice = Some(self.voice.status());
@@ -615,6 +649,8 @@ impl AudioHost {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
+            s.voice_notice = voice_notice;
+            s.voice_notice_generation = voice_notice_generation;
             s.voice = voice;
             return s;
         };
@@ -647,11 +683,13 @@ impl AudioHost {
             limiter_db: st.limiter_gain_db,
             out_peak_db: st.out_peak_db,
             out_rms_db: st.out_rms_db,
-            hotkeys_active: r
+            hotkeys_active: self
                 .hotkeys
                 .lock()
                 .map(|groups| groups.slots_bound())
                 .unwrap_or(false),
+            voice_notice,
+            voice_notice_generation,
             last_error: self
                 .last_error
                 .lock()
@@ -957,7 +995,6 @@ impl AudioHost {
         let playback = session.playback.clone();
         let control = playback.control.clone();
         let stats = session.stats.clone();
-        let shutdown = Arc::new(AtomicBool::new(false));
         let slot_specs: Vec<_> = slots_meta.iter().map(|s| s.hotkey.clone()).collect();
         #[cfg(feature = "voice")]
         let voice_specs = self.voice.hotkey_specs();
@@ -965,69 +1002,50 @@ impl AudioHost {
         let voice_specs: Vec<String> = Vec::new();
         let has_slot_keys = slot_specs.iter().any(|spec| !spec.trim().is_empty());
         let has_voice_keys = voice_specs.iter().any(|spec| !spec.trim().is_empty());
-        let voice_keys_allowed = if has_slot_keys || has_voice_keys {
+        let voice_bound = self
+            .hotkeys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .voice_bound();
+        let disjoint_ok = if has_slot_keys || has_voice_keys {
             match hotkeys::validate_disjoint(&[&slot_specs, &voice_specs]) {
                 Ok(()) => true,
                 Err(error) => {
-                    // 热键冲突不能阻止音频启动；槽位照常绑定，变声热键跳过并在界面提示。
-                    println!("[热键] ❌ 人声效果热键校验失败: {error:#}");
-                    self.record_error(format!("人声效果热键未绑定: {error:#}"));
+                    // 冲突不能阻止音频启动：变声热键常驻时让槽位退让，否则槽位优先。
+                    self.record_voice_notice(format!("热键冲突，未绑定：{error:#}"));
                     false
                 }
             }
         } else {
             true
         };
-
-        let mut slot_hotkeys = None;
-        if has_slot_keys {
+        let bind_slots = has_slot_keys && (disjoint_ok || !voice_bound);
+        let slot_hotkeys = if bind_slots {
             match self.bind_hotkeys_on_main_thread(app, &slot_specs) {
                 Ok((hotkeys, how)) => {
                     println!("[热键] 绑定成功（{how}）");
-                    slot_hotkeys = Some(hotkeys);
-                }
-                Err(error) => println!("[热键] ❌ 绑定失败: {error:#}"),
-            }
-        }
-        let mut voice_hotkeys = None;
-        if has_voice_keys && voice_keys_allowed {
-            match self.bind_hotkeys_on_main_thread(app, &voice_specs) {
-                Ok((hotkeys, how)) => {
-                    println!("[人声热键] 绑定成功（{how}）");
-                    voice_hotkeys = Some(hotkeys);
+                    Some(hotkeys)
                 }
                 Err(error) => {
-                    println!("[人声热键] ❌ 绑定失败: {error:#}");
-                    self.record_error(format!("人声效果热键绑定失败: {error:#}"));
+                    println!("[热键] ❌ 绑定失败: {error:#}");
+                    None
                 }
             }
+        } else {
+            None
+        };
+        self.install_slot_hotkeys(slot_hotkeys)?;
+        #[cfg(feature = "voice")]
+        if has_voice_keys && !voice_bound && disjoint_ok {
+            // 启动时通常已常驻绑定；这里只覆盖首次失败后的重试，不重复注册。
+            if let Err(error) = self.ensure_voice_hotkeys(app) {
+                self.record_voice_notice(format!("人声效果热键绑定失败：{error:#}"));
+            }
         }
-        let hotkeys = Arc::new(Mutex::new(HotkeyGroups::new(slot_hotkeys, voice_hotkeys)));
-        // Always keep a poll worker, even when the initial key registration fails.
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
-        let play = self.play_handler(playback.clone(), generation);
-        let voice_action = self.voice_hotkey_handler(generation);
-        let sd = shutdown.clone();
-        let groups = hotkeys.clone();
-        let hotkey_thread = Some(std::thread::Builder::new().name("hotkeys".into()).spawn(
-            move || {
-                while !sd.load(Ordering::Acquire) {
-                    let actions = groups
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .poll_actions();
-                    for (group, index) in actions {
-                        match group {
-                            HotkeyGroup::Slots => {
-                                play(index);
-                            }
-                            HotkeyGroup::Voice => voice_action(index),
-                        }
-                    }
-                    std::thread::sleep(Duration::from_millis(12));
-                }
-            },
-        )?);
+        *self.slot_action.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(self.play_handler(playback.clone(), generation));
+        self.ensure_hotkey_thread();
 
         // 手机遥控：作为热键失效时的兜底通路，随引擎一起待命
         match cfg.remote_port {
@@ -1081,8 +1099,6 @@ impl AudioHost {
             session,
             playback,
             stats,
-            shutdown,
-            hotkey_thread,
             slots_meta,
             out_device: out_name,
             in_device: in_name,
@@ -1091,7 +1107,6 @@ impl AudioHost {
             monitor_error: Mutex::new(None),
             started_at: std::time::Instant::now(),
             skipped_notes,
-            hotkeys,
             cfg_key: cfg_fingerprint(&cfg),
             cfg,
         };
@@ -1137,6 +1152,8 @@ impl AudioHost {
         self.audio_requests
             .generation
             .store(generation, Ordering::Release);
+        // 会话已发布，旧的“音频未启动”提示不再成立。
+        self.dismiss_voice_notice();
         None
     }
 
@@ -1175,7 +1192,8 @@ impl AudioHost {
     /// 一旦连转发也断了，虚拟声卡里就是一片死寂（实测精确为 0），**对方会突然听不到他说话**。
     /// 所以「停止」的语义是「关掉音效」，不是「把我变成哑巴」。
     ///
-    /// 进入待机时会**注销热键** —— 否则 F1/F2 仍被我们截走，游戏里按这两个键毫无反应。
+    /// 进入待机时只注销**槽位热键** —— 否则 F1/F2 仍被我们截走，游戏里按这两个键毫无反应。
+    /// 人声效果热键继续保留，待机时仍可切换预设。
     pub fn stop(&self) {
         self.stop_requested(self.reserve_audio_request());
     }
@@ -1194,7 +1212,7 @@ impl AudioHost {
             return;
         }
         self.stop_preview_inner();
-        let handles = {
+        let groups = {
             let _admission = self
                 .preview_control
                 .lock()
@@ -1207,10 +1225,11 @@ impl AudioHost {
                 return;
             };
             r.playback.standby();
-            r.hotkeys.clone()
+            self.hotkeys.clone()
         };
+        *self.slot_action.lock().unwrap_or_else(|e| e.into_inner()) = None;
         // 待机只归还音效槽位按键；变声热键继续可用。
-        if let Err(error) = self.with_hotkey_groups(handles, |groups| groups.standby()) {
+        if let Err(error) = self.with_hotkey_groups(groups, |groups| groups.standby()) {
             self.record_error(format!("注销热键失败: {error:#}"));
         }
         if let Some(sh) = self
@@ -1272,23 +1291,28 @@ impl AudioHost {
         if let Some(r) = running {
             r.playback.standby();
             // A hotkey worker may be waiting for preview admission. Its captured
-            // playback is inactive before we release the lock and join it.
+            // playback is inactive before we release the lock.
             drop(admission);
+            self.end_session_hotkeys();
             self.close_running(r);
+        } else {
+            drop(admission);
+            self.end_session_hotkeys();
         }
     }
 
-    fn close_running(&self, mut running: Running) {
-        running.playback.standby();
-        running.shutdown.store(true, Ordering::Release);
-        if let Some(thread) = running.hotkey_thread.take() {
-            let _ = thread.join();
-        }
+    /// 会话释放只注销槽位热键；人声效果热键保留到进程退出。
+    fn end_session_hotkeys(&self) {
+        *self.slot_action.lock().unwrap_or_else(|e| e.into_inner()) = None;
         if let Err(error) =
-            self.with_hotkey_groups(running.hotkeys.clone(), |groups| groups.release())
+            self.with_hotkey_groups(self.hotkeys.clone(), |groups| groups.end_session())
         {
-            self.record_error(format!("释放热键失败: {error:#}"));
+            self.record_error(format!("释放槽位热键失败: {error:#}"));
         }
+    }
+
+    fn close_running(&self, running: Running) {
+        running.playback.standby();
         drop(running); // Session closes all streams on their owner thread.
     }
 
@@ -1303,12 +1327,11 @@ impl AudioHost {
         if !cfg!(target_os = "macos") || hotkeys::is_main_thread() {
             return action(&mut handle.lock().unwrap_or_else(|e| e.into_inner()));
         }
-        let app = self
-            .app
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .context("热键操作需要主线程上下文")?;
+        let app = self.app.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let Some(app) = app else {
+            // 无 GUI 上下文（测试或 --smoke）：没有可调度的主线程，直接执行。
+            return action(&mut handle.lock().unwrap_or_else(|e| e.into_inner()));
+        };
         let (tx, rx) = mpsc::sync_channel(1);
         app.run_on_main_thread(move || {
             let result = action(&mut handle.lock().unwrap_or_else(|e| e.into_inner()));
@@ -1329,7 +1352,7 @@ impl AudioHost {
             let guard = self.running.lock().unwrap_or_else(|e| e.into_inner());
             let r = guard.as_ref().context("音频还没启动")?;
             (
-                r.hotkeys.clone(),
+                self.hotkeys.clone(),
                 r.playback.clone(),
                 r.slots_meta
                     .iter()
@@ -1364,6 +1387,11 @@ impl AudioHost {
                 self.record_error(format!("恢复热键失败: {error:#}"));
             }
         }
+        *self.slot_action.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(self.play_handler(playback.clone(), generation));
+        self.ensure_hotkey_thread();
+        // 音频恢复后不再保留“音频未启动”等旧提示。
+        self.dismiss_voice_notice();
         if remote_port.is_some() {
             if let Some(sh) = self
                 .remote
@@ -2311,7 +2339,136 @@ impl AudioHost {
         }
     }
 
-    /// 保存三个人声效果热键并在有会话时重绑。
+    /// 程序启动后绑定配置里的人声效果热键，并启动唯一的轮询线程。
+    ///
+    /// 绑定失败不阻止程序启动；提示通过独立的人声提示字段交给界面。
+    pub fn initialize_hotkeys(&self, app: Option<&tauri::AppHandle>) -> Result<()> {
+        if let Some(app) = app {
+            *self.app.lock().unwrap_or_else(|e| e.into_inner()) = Some(app.clone());
+        }
+        self.ensure_hotkey_thread();
+        #[cfg(feature = "voice")]
+        {
+            if let Err(error) = self.ensure_voice_hotkeys(app) {
+                self.record_voice_notice(format!("人声效果热键绑定失败：{error:#}"));
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// 确保变声热键已绑定；已绑定时不重复注册。
+    #[cfg(feature = "voice")]
+    fn ensure_voice_hotkeys(&self, app: Option<&tauri::AppHandle>) -> Result<()> {
+        let specs = self.voice.hotkey_specs();
+        if !specs.iter().any(|spec| !spec.trim().is_empty()) {
+            return Ok(());
+        }
+        if self
+            .hotkeys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .voice_hotkeys()
+            .is_some()
+        {
+            return Ok(());
+        }
+        let (bound, how) = self.bind_hotkeys_on_main_thread(app, &specs)?;
+        println!("[人声热键] 绑定成功（{how}）");
+        self.install_voice_hotkeys(bound)?;
+        self.ensure_hotkey_thread();
+        Ok(())
+    }
+
+    /// 启动唯一的轮询线程；槽位与变声事件由同一个消费者排水。
+    fn ensure_hotkey_thread(&self) {
+        let mut handle = self.hotkey_thread.lock().unwrap_or_else(|e| e.into_inner());
+        if handle.is_some() {
+            return;
+        }
+        let shutdown = self.hotkey_shutdown.clone();
+        let groups = self.hotkeys.clone();
+        let slot_action = self.slot_action.clone();
+        let voice_action = self.voice_hotkey_handler();
+        match std::thread::Builder::new()
+            .name("hotkeys".into())
+            .spawn(move || {
+                while !shutdown.load(Ordering::Acquire) {
+                    let actions = groups
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .poll_actions();
+                    for (group, index) in actions {
+                        match group {
+                            HotkeyGroup::Slots => {
+                                let action = slot_action
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .clone();
+                                if let Some(action) = action {
+                                    action(index);
+                                }
+                            }
+                            HotkeyGroup::Voice => voice_action(index),
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(12));
+                }
+            }) {
+            Ok(thread) => *handle = Some(thread),
+            Err(error) => {
+                drop(handle);
+                self.record_voice_notice(format!("启动热键轮询线程失败：{error}"));
+            }
+        }
+    }
+
+    /// 进程退出前注销全部热键并 join 轮询线程；可重复调用。
+    pub fn shutdown_hotkeys(&self) {
+        self.hotkey_shutdown.store(true, Ordering::Release);
+        if let Some(thread) = self
+            .hotkey_thread
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = thread.join();
+        }
+        *self.slot_action.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let groups = self.hotkeys.clone();
+        if let Err(error) = self.with_hotkey_groups(groups.clone(), |groups| groups.shutdown()) {
+            // 应用退出时主线程调度可能已不可用；直接注销比留下系统热键更安全。
+            log::warn!("主线程注销热键失败，改为直接注销: {error:#}");
+            if let Err(error) = groups.lock().unwrap_or_else(|e| e.into_inner()).shutdown() {
+                self.record_error(format!("释放热键失败: {error:#}"));
+            }
+        }
+    }
+
+    fn install_slot_hotkeys(&self, hotkeys: Option<Hotkeys>) -> Result<()> {
+        self.with_hotkey_groups(self.hotkeys.clone(), move |groups| {
+            groups.set_slot_hotkeys(hotkeys);
+            Ok(())
+        })
+    }
+
+    #[cfg(feature = "voice")]
+    fn install_voice_hotkeys(&self, hotkeys: Hotkeys) -> Result<()> {
+        self.with_hotkey_groups(self.hotkeys.clone(), move |groups| {
+            groups.set_voice_hotkeys(Some(hotkeys));
+            Ok(())
+        })
+    }
+
+    fn record_voice_notice(&self, message: impl Into<String>) {
+        set_voice_notice(&self.voice_notice, message);
+    }
+
+    fn dismiss_voice_notice(&self) {
+        clear_voice_notice(&self.voice_notice);
+    }
+
+    /// 保存三个人声效果热键并立即重绑；与音频会话无关。
     ///
     /// 先校验跨组冲突再落盘；重绑失败保留旧绑定并把错误返回界面。
     pub fn voice_set_hotkeys(
@@ -2333,33 +2490,32 @@ impl AudioHost {
             // 先保存用户选择；系统级冲突导致重绑失败时，旧绑定仍然有效。
             self.voice
                 .save_hotkeys(&voice_specs[0], &voice_specs[1], &voice_specs[2])?;
-            let handle = self
-                .running
+            let has_voice_set = self
+                .hotkeys
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .map(|running| running.hotkeys.clone());
-            if let Some(handle) = handle {
-                let has_voice_set = handle
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .voice_hotkeys()
-                    .is_some();
+                .voice_hotkeys()
+                .is_some();
+            if !voice_specs.iter().any(|spec| !spec.trim().is_empty()) {
                 if has_voice_set {
-                    self.with_hotkey_groups(handle, move |groups| {
-                        groups.rebind_voice(&voice_specs)
-                    })
-                    .context("人声效果热键重绑失败，原热键仍然有效")?;
-                } else {
-                    let app = self.app.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                    let (bound, _) =
-                        self.bind_hotkeys_on_main_thread(app.as_ref(), &voice_specs)?;
-                    handle
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .set_voice_hotkeys(Some(bound));
+                    self.with_hotkey_groups(self.hotkeys.clone(), |groups| groups.clear_voice())
+                        .context("注销人声效果热键失败")?;
                 }
+                self.dismiss_voice_notice();
+                return Ok(self.voice.status());
             }
+            if has_voice_set {
+                self.with_hotkey_groups(self.hotkeys.clone(), move |groups| {
+                    groups.rebind_voice(&voice_specs)
+                })
+                .context("人声效果热键重绑失败，原热键仍然有效")?;
+            } else {
+                let app = self.app.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let (bound, _) = self.bind_hotkeys_on_main_thread(app.as_ref(), &voice_specs)?;
+                self.install_voice_hotkeys(bound)?;
+            }
+            self.ensure_hotkey_thread();
+            self.dismiss_voice_notice();
             Ok(self.voice.status())
         }
         #[cfg(not(feature = "voice"))]
@@ -2411,16 +2567,19 @@ impl AudioHost {
 
     /// 未编译变声后端时没有人声效果热键；保留空处理器让轮询线程结构一致。
     #[cfg(not(feature = "voice"))]
-    fn voice_hotkey_handler(&self, _generation: u64) -> Arc<dyn Fn(usize) + Send + Sync> {
+    fn voice_hotkey_handler(&self) -> Arc<dyn Fn(usize) + Send + Sync> {
         Arc::new(|_| {})
     }
 
     /// 热键线程的事件入口：只调用宿主控制路径，不接触音频回调。
+    ///
+    /// 事件每次读取当前会话代次；0 表示无会话。变声热键跨会话常驻，
+    /// 因此不需要捕获旧代次。
     #[cfg(feature = "voice")]
-    fn voice_hotkey_handler(&self, generation: u64) -> Arc<dyn Fn(usize) + Send + Sync> {
+    fn voice_hotkey_handler(&self) -> Arc<dyn Fn(usize) + Send + Sync> {
         let voice = self.voice.clone();
         let requests = self.audio_requests.clone();
-        let last_error = self.last_error.clone();
+        let notice_state = self.voice_notice.clone();
         Arc::new(move |index| {
             let action = match index {
                 0 => VoiceHotkeyAction::ToggleBypass,
@@ -2428,16 +2587,18 @@ impl AudioHost {
                 2 => VoiceHotkeyAction::PrevPreset,
                 _ => return,
             };
-            let registered = requests.generation.load(Ordering::Acquire);
-            match route_voice_hotkey(&voice, registered, generation, action) {
+            let generation = requests.generation.load(Ordering::Acquire);
+            match route_voice_hotkey(&voice, generation, action) {
                 Ok(outcome) => {
-                    if let Some(notice) = outcome.notice {
-                        *last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(notice);
+                    if let Some(message) = outcome.notice {
+                        set_voice_notice(&notice_state, message);
+                    } else if outcome.acted {
+                        // 动作已生效，之前“音频未启动/变声未开启”的提示不再成立。
+                        clear_voice_notice(&notice_state);
                     }
                 }
                 Err(error) => {
-                    *last_error.lock().unwrap_or_else(|e| e.into_inner()) =
-                        Some(format!("人声效果热键执行失败: {error:#}"));
+                    set_voice_notice(&notice_state, format!("人声效果热键执行失败：{error:#}"));
                 }
             }
         })
@@ -2463,28 +2624,21 @@ impl AudioHost {
 
 /// 把一次热键事件路由到当前的变声状态。
 ///
-/// 捕获代次与当前会话代次不一致时丢弃事件：旧会话的按键不能影响新会话。
-/// 代次为 0 表示没有音频会话，此时预设热键仍更新待用参数，旁路热键只提示。
+/// 代次为 0 表示没有音频会话：预设热键仍更新待用参数，旁路热键只提示，
+/// 不会建立旁路或启动音频。
 #[cfg(feature = "voice")]
 pub(crate) fn route_voice_hotkey(
     voice: &VoiceService,
-    registered_generation: u64,
-    handler_generation: u64,
+    session_generation: u64,
     action: VoiceHotkeyAction,
 ) -> Result<VoiceHotkeyOutcome> {
-    if handler_generation != 0 && registered_generation != handler_generation {
-        return Ok(VoiceHotkeyOutcome {
-            status: voice.status(),
-            acted: false,
-            notice: None,
-        });
-    }
-    voice.handle_hotkey(action, registered_generation != 0)
+    voice.handle_hotkey(action, session_generation != 0)
 }
 
 impl Drop for AudioHost {
     fn drop(&mut self) {
         self.release_inner();
+        self.shutdown_hotkeys();
     }
 }
 

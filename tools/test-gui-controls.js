@@ -1862,6 +1862,54 @@ test('人声效果热键输入只发送变声热键命令', async () => {
     '人声热键不能重启音频会话');
 });
 
+test('人声热键提示在运行与待机时都使用普通提示', async () => {
+  let status = playbackStatus({
+    voice_notice: '变声未开启，旁路热键不生效', voice_notice_generation: 1,
+  });
+  const app = await boot({ onInvoke(command) {
+    if (command === 'status') return status;
+    return voiceFixture(command);
+  } });
+  const toast = app.document.getElementById('toast');
+  const notice = app.document.getElementById('notice');
+
+  await app.pollStatus();
+  assert.equal(toast.textContent, '变声未开启，旁路热键不生效', '运行中提示用普通 toast');
+  assert.equal(notice.textContent, '', '不能写入启动错误提示区');
+
+  status = playbackStatus({
+    running: false, passthrough: true,
+    voice_notice: '音频未启动，旁路热键不生效', voice_notice_generation: 2,
+  });
+  await app.pollStatus();
+  assert.equal(toast.textContent, '音频未启动，旁路热键不生效', '待机提示同样用普通 toast');
+  assert.equal(notice.textContent, '', '待机也不能显示红色启动错误');
+});
+
+test('同一代次人声提示只提示一次且恢复后清除', async () => {
+  let status = playbackStatus({ voice_notice: '音频未启动', voice_notice_generation: 1 });
+  const app = await boot({ onInvoke(command) {
+    if (command === 'status') return status;
+    return voiceFixture(command);
+  } });
+  const toast = app.document.getElementById('toast');
+
+  await app.pollStatus();
+  assert.equal(toast.textContent, '音频未启动');
+  await app.advanceTimers(3000);
+  assert.equal(toast.textContent, '');
+  await app.pollStatus();
+  assert.equal(toast.textContent, '', '同一代次不能重复提示');
+
+  status = playbackStatus({ voice_notice: null, voice_notice_generation: 2 });
+  await app.pollStatus();
+  assert.equal(toast.textContent, '', '恢复后清除提示');
+
+  status = playbackStatus({ voice_notice: '新的提示', voice_notice_generation: 3 });
+  await app.pollStatus();
+  assert.equal(toast.textContent, '新的提示', '新一代次仍可提示');
+});
+
 test('预设选择不自动启用', async () => {
   const app = await boot({ onInvoke(command) {
     const voice = voiceFixture(command);

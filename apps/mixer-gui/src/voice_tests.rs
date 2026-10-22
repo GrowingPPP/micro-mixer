@@ -1074,7 +1074,7 @@ fn 旁路热键只切换临时旁路() {
     let before = service.status();
     let params = control.params();
 
-    let outcome = route_voice_hotkey(&service, 7, 7, VoiceHotkeyAction::ToggleBypass).unwrap();
+    let outcome = route_voice_hotkey(&service, 7, VoiceHotkeyAction::ToggleBypass).unwrap();
 
     assert!(outcome.acted);
     assert!(outcome.status.bypassed, "热键应打开临时旁路");
@@ -1088,7 +1088,7 @@ fn 旁路热键只切换临时旁路() {
     assert_eq!(saved.voice.active_preset, before.preset_id);
     assert_eq!(saved.voice.bypass_hotkey, "F9", "旁路不能改写保存的热键");
 
-    let outcome = route_voice_hotkey(&service, 7, 7, VoiceHotkeyAction::ToggleBypass).unwrap();
+    let outcome = route_voice_hotkey(&service, 7, VoiceHotkeyAction::ToggleBypass).unwrap();
     assert!(!outcome.status.bypassed, "再次按旁路应恢复原状态");
     assert!(outcome.status.enabled);
 }
@@ -1101,7 +1101,7 @@ fn 变声关闭时旁路热键只提示状态() {
     service.attach(control.clone());
     let before = service.status();
 
-    let outcome = route_voice_hotkey(&service, 3, 3, VoiceHotkeyAction::ToggleBypass).unwrap();
+    let outcome = route_voice_hotkey(&service, 3, VoiceHotkeyAction::ToggleBypass).unwrap();
 
     assert!(!outcome.acted, "关闭状态不能建立旁路");
     assert!(!outcome.status.bypassed);
@@ -1135,7 +1135,7 @@ fn 无音频会话时切预设更新待用参数() {
     };
     let service = VoiceService::new_with_path(&config, config_path(&dir));
 
-    let outcome = route_voice_hotkey(&service, 0, 0, VoiceHotkeyAction::NextPreset).unwrap();
+    let outcome = route_voice_hotkey(&service, 0, VoiceHotkeyAction::NextPreset).unwrap();
 
     assert!(outcome.acted);
     assert_eq!(outcome.status.preset_id, "builtin:child");
@@ -1160,7 +1160,7 @@ fn 无音频会话时旁路热键只提示音频未启动() {
     let service = VoiceService::new_with_path(&config, config_path(&dir));
     let before = service.status();
 
-    let outcome = route_voice_hotkey(&service, 0, 0, VoiceHotkeyAction::ToggleBypass).unwrap();
+    let outcome = route_voice_hotkey(&service, 0, VoiceHotkeyAction::ToggleBypass).unwrap();
 
     assert!(!outcome.acted, "无会话时不能建立旁路");
     assert!(!outcome.status.bypassed);
@@ -1195,7 +1195,7 @@ fn 预设循环顺序稳定() {
 
     let mut seen = vec![service.status().preset_id];
     for _ in 0..8 {
-        route_voice_hotkey(&service, 0, 0, VoiceHotkeyAction::NextPreset).unwrap();
+        route_voice_hotkey(&service, 0, VoiceHotkeyAction::NextPreset).unwrap();
         seen.push(service.status().preset_id);
     }
     assert_eq!(
@@ -1215,13 +1215,13 @@ fn 预设循环顺序稳定() {
     );
     assert!(service.status().enabled, "循环预设不能改变启用状态");
 
-    route_voice_hotkey(&service, 0, 0, VoiceHotkeyAction::NextPreset).unwrap();
+    route_voice_hotkey(&service, 0, VoiceHotkeyAction::NextPreset).unwrap();
     assert_eq!(
         service.status().preset_id,
         "builtin:female",
         "末尾应回到第一个"
     );
-    route_voice_hotkey(&service, 0, 0, VoiceHotkeyAction::PrevPreset).unwrap();
+    route_voice_hotkey(&service, 0, VoiceHotkeyAction::PrevPreset).unwrap();
     assert_eq!(
         service.status().preset_id,
         "user:zulu-000003",
@@ -1230,17 +1230,28 @@ fn 预设循环顺序稳定() {
 }
 
 #[test]
-fn 旧会话热键事件不影响新会话() {
+fn 热键按当前会话代次选择运行或待用路径() {
     let dir = TemporaryDir::new();
     let service = VoiceService::new_with_path(&user_config(), config_path(&dir));
-    let before = service.status();
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control);
+    service.set_enabled(true).unwrap();
 
-    let outcome = route_voice_hotkey(&service, 2, 1, VoiceHotkeyAction::NextPreset).unwrap();
+    let active = route_voice_hotkey(&service, 4, VoiceHotkeyAction::ToggleBypass).unwrap();
+    assert!(active.acted, "有会话时代次非 0，旁路应生效");
+    assert!(active.status.bypassed);
 
-    assert!(!outcome.acted, "旧代次事件必须丢弃");
-    assert_eq!(outcome.status.preset_id, before.preset_id);
-    assert_eq!(outcome.status.generation, before.generation);
-    assert_eq!(service.status().preset_id, before.preset_id);
+    let released = route_voice_hotkey(&service, 0, VoiceHotkeyAction::ToggleBypass).unwrap();
+    assert!(!released.acted, "无会话时代次 0，旁路只提示");
+    assert!(released.status.bypassed, "无会话不能改写运行状态");
+    assert!(
+        released
+            .notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("音频未启动")),
+        "必须提示音频未启动：{:?}",
+        released.notice
+    );
 }
 
 #[test]
@@ -1253,7 +1264,7 @@ fn 热键事件不进入音频回调只改控制路径() {
     let params = control.params();
     let generation = control.generation();
 
-    route_voice_hotkey(&service, 5, 5, VoiceHotkeyAction::ToggleBypass).unwrap();
+    route_voice_hotkey(&service, 5, VoiceHotkeyAction::ToggleBypass).unwrap();
 
     // 事件只能通过 VoiceControl 的原子快照改变运行阶段；没有样本处理入口。
     assert_eq!(control.phase(), VoicePhase::Off);

@@ -163,8 +163,6 @@ fn fixture() -> (AudioHost, FakeBackend) {
         stats: session.stats.clone(),
         playback,
         session,
-        shutdown: Arc::new(AtomicBool::new(false)),
-        hotkey_thread: None,
         slots_meta: vec![SlotDto {
             index: 0,
             source_index: 1,
@@ -183,7 +181,6 @@ fn fixture() -> (AudioHost, FakeBackend) {
         monitor_error: Mutex::new(None),
         started_at: std::time::Instant::now(),
         skipped_notes: vec!["Invalid".into()],
-        hotkeys: Arc::new(Mutex::new(hotkeys::HotkeyGroups::default())),
         cfg_key: cfg_fingerprint(&cfg),
         cfg,
     });
@@ -271,8 +268,6 @@ fn voice_fixture(enabled: bool) -> (AudioHost, FakeBackend, TemporaryDir) {
         stats: session.stats.clone(),
         playback,
         session,
-        shutdown: Arc::new(AtomicBool::new(false)),
-        hotkey_thread: None,
         slots_meta: vec![SlotDto {
             index: 0,
             source_index: 0,
@@ -291,7 +286,6 @@ fn voice_fixture(enabled: bool) -> (AudioHost, FakeBackend, TemporaryDir) {
         monitor_error: Mutex::new(None),
         started_at: std::time::Instant::now(),
         skipped_notes: Vec::new(),
-        hotkeys: Arc::new(Mutex::new(hotkeys::HotkeyGroups::default())),
         cfg_key: cfg_fingerprint(&cfg),
         cfg,
     });
@@ -2477,17 +2471,109 @@ fn 超范围的有限音量被所有入口拒绝且不会污染试听或正式�
 }
 
 #[cfg(feature = "voice")]
+fn install_fake_hotkeys(host: &AudioHost) -> Arc<AtomicUsize> {
+    let (manager, registrations) = hotkeys::test_support::manager().unwrap();
+    *host.hotkey_manager.lock().unwrap() = Some(manager);
+    registrations
+}
+
+#[cfg(feature = "voice")]
+fn voice_config_with_hotkeys(enabled: bool) -> app_config::Config {
+    app_config::Config {
+        voice: app_config::VoiceConfig {
+            enabled,
+            active_preset: "builtin:female".into(),
+            bypass_hotkey: "F9".into(),
+            next_preset_hotkey: "F10".into(),
+            prev_preset_hotkey: "F8".into(),
+            ..app_config::VoiceConfig::default()
+        },
+        ..app_config::Config::default()
+    }
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 启动前绑定人声热键且重复初始化不重复注册() {
+    let dir = TemporaryDir::new();
+    let mut host = preview_test_host();
+    host.voice =
+        VoiceService::new_with_path(&voice_config_with_hotkeys(false), dir.0.join("config.toml"));
+    let registrations = install_fake_hotkeys(&host);
+
+    host.initialize_hotkeys(None).unwrap();
+
+    assert!(
+        host.hotkeys.lock().unwrap().voice_bound(),
+        "程序启动后必须先绑定人声热键"
+    );
+    assert!(
+        host.hotkey_thread.lock().unwrap().is_some(),
+        "轮询线程应已启动"
+    );
+    let first = registrations.load(Ordering::Relaxed);
+    assert_eq!(first, 3, "三个人声热键各注册一次");
+
+    host.initialize_hotkeys(None).unwrap();
+    host.ensure_voice_hotkeys(None).unwrap();
+    assert_eq!(
+        registrations.load(Ordering::Relaxed),
+        first,
+        "设备重建或重复初始化不得重复注册"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 释放音频设备保留人声热键并注销槽位() {
+    let (mut host, _backend, _dir) = voice_fixture(true);
+    let dir = TemporaryDir::new();
+    let path = dir.0.join("config.toml");
+    host.voice = VoiceService::new_with_path(&voice_config_with_hotkeys(true), path);
+    host.attach_voice_control(Some(VoiceControl::new(VoiceParams::neutral())));
+    install_fake_hotkeys(&host);
+    host.initialize_hotkeys(None).unwrap();
+    let manager = host.hotkey_manager.lock().unwrap().clone().unwrap();
+    let slot = Hotkeys::bind_with(manager, &["F1".into()]).unwrap();
+    host.install_slot_hotkeys(Some(slot)).unwrap();
+    assert!(host.hotkeys.lock().unwrap().slots_bound());
+
+    host.stop_inner();
+    assert!(
+        !host.hotkeys.lock().unwrap().slots_bound(),
+        "待机必须让出槽位热键"
+    );
+    assert!(
+        host.hotkeys.lock().unwrap().voice_bound(),
+        "待机必须保留人声热键"
+    );
+
+    host.release_inner();
+    assert!(
+        host.hotkeys.lock().unwrap().voice_bound(),
+        "释放设备不能注销人声热键"
+    );
+    assert!(
+        host.hotkey_thread.lock().unwrap().is_some(),
+        "线程跨会话存活"
+    );
+    let before = host.voice.status().preset_id;
+    host.voice_hotkey_handler()(1);
+    assert_ne!(host.voice.status().preset_id, before, "无会话时仍可切预设");
+    assert!(!host.status().running, "切预设不能启动音频");
+}
+
+#[cfg(feature = "voice")]
 #[test]
 fn 无音频会话时变声热键不启动音频() {
     let dir = TemporaryDir::new();
     let path = dir.0.join("config.toml");
-    let mut config = app_config::Config::default();
-    config.voice.active_preset = "builtin:female".into();
     let mut host = preview_test_host();
-    host.voice = VoiceService::new_with_path(&config, path.clone());
+    host.voice = VoiceService::new_with_path(&voice_config_with_hotkeys(false), path.clone());
+    install_fake_hotkeys(&host);
+    host.initialize_hotkeys(None).unwrap();
 
-    let handler = host.voice_hotkey_handler(0);
-    handler(1); // 下一个预设
+    host.voice_hotkey_handler()(1); // 下一个预设
 
     assert!(
         host.running.lock().unwrap().is_none(),
@@ -2500,22 +2586,77 @@ fn 无音频会话时变声热键不启动音频() {
         app_config::Config::load_from(&path).voice.active_preset,
         "builtin:male"
     );
+
+    host.voice_hotkey_handler()(0); // 旁路
+    let status = host.status();
+    assert!(
+        status
+            .voice_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("音频未启动")),
+        "无会话旁路必须提示音频未启动：{:?}",
+        status.voice_notice
+    );
+    assert!(status.last_error.is_none(), "不能复用启动错误通道");
+    assert!(!status.voice.as_ref().unwrap().bypassed);
 }
 
 #[cfg(feature = "voice")]
 #[test]
-fn 旧会话热键事件不影响新会话() {
+fn 运行中与待机旁路提示走独立字段() {
+    let (host, _backend, _dir) = voice_fixture(false);
+    let handler = host.voice_hotkey_handler();
+
+    handler(0);
+    let running = host.status();
+    assert!(running.running);
+    assert!(
+        running
+            .voice_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("变声未开启")),
+        "运行中关闭变声时旁路必须提示：{:?}",
+        running.voice_notice
+    );
+    assert!(running.last_error.is_none(), "人声提示不能写入启动错误");
+
+    host.stop_inner();
+    let standby = host.status();
+    assert!(!standby.running && standby.passthrough, "应处于待机");
+    handler(0);
+    let standby = host.status();
+    assert!(
+        standby
+            .voice_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("变声未开启")),
+        "待机旁路也必须提示：{:?}",
+        standby.voice_notice
+    );
+    assert!(standby.last_error.is_none());
+    assert!(standby.voice_notice_generation > running.voice_notice_generation);
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 音频恢复后清除人声提示() {
     let (host, _backend, _dir) = voice_fixture(true);
-    let before = host.voice.status();
-    // 新会话已发布代次 2；旧会话捕获的事件仍带代次 1。
-    host.audio_requests.register_session(2);
-    let handler = host.voice_hotkey_handler(1);
+    host.record_voice_notice("音频未启动，旁路热键不生效");
+    let before = host.status();
+    assert!(before.voice_notice.is_some());
 
-    handler(1);
+    host.activate(None).unwrap();
 
-    let after = host.voice.status();
-    assert_eq!(after.preset_id, before.preset_id);
-    assert_eq!(after.generation, before.generation);
+    let after = host.status();
+    assert!(after.voice_notice.is_none(), "音频恢复后旧提示必须清除");
+    assert!(after.voice_notice_generation > before.voice_notice_generation);
+
+    host.record_voice_notice("旧提示");
+    host.voice_hotkey_handler()(0);
+    assert!(
+        host.status().voice_notice.is_none(),
+        "生效的热键动作也要清除旧提示"
+    );
 }
 
 #[cfg(feature = "voice")]
@@ -2531,6 +2672,7 @@ fn 变声热键命令校验跨组冲突并持久化() {
     config.save_to(&path).unwrap();
     let mut host = preview_test_host();
     host.voice = VoiceService::new_with_path(&config, path.clone());
+    install_fake_hotkeys(&host);
 
     let error = host.voice_set_hotkeys("F9", "F10", "F8").unwrap_err();
     assert!(
@@ -2547,4 +2689,5 @@ fn 变声热键命令校验跨组冲突并持久化() {
     assert_eq!(saved.voice.next_preset_hotkey, "F6");
     assert_eq!(saved.voice.prev_preset_hotkey, "F7");
     assert_eq!(saved.hotkeys, vec!["F9".to_owned()], "音效热键保持不变");
+    assert!(host.hotkeys.lock().unwrap().voice_bound(), "无会话也要绑定");
 }

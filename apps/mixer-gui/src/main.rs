@@ -950,6 +950,7 @@ fn request_exit(app: &tauri::AppHandle) {
             println!("[退出] 恢复真实麦克风失败: {e:#}");
         }
         host.release();
+        host.shutdown_hotkeys();
         host.finish_shutdown();
         app.exit(0);
     });
@@ -1014,6 +1015,11 @@ fn main() {
         .setup(|app| {
             build_tray(app.handle())?;
             println!("[菜单栏] 图标已创建");
+
+            // 人声效果热键独立于音频会话：程序启动即绑定，释放设备后仍可用。
+            if let Err(error) = app.state::<AudioHost>().initialize_hotkeys(Some(app.handle())) {
+                println!("[人声热键] ❌ 启动绑定失败: {error:#}");
+            }
 
             // 记下用户原本的默认麦克风 —— 「切回真实麦克风」要还原成它。
             // 必须在这里（用户还没点过「启动」）记录，否则记录到的可能是我们自己改过的值。

@@ -560,25 +560,57 @@ mod tests {
     }
 
     #[test]
-    fn 释放会话注销全部变声热键() {
+    fn 释放音频会话保留变声热键并注销槽位() {
         let (manager, _, _, events) = fake_with_events(0);
         let slots = Hotkeys::bind_with(manager.clone(), &["F1".into()]).unwrap();
         let voice = Hotkeys::bind_with(manager, &["F9".into()]).unwrap();
-        let voice_id = crate::parse_hotkey("F9").unwrap().id();
         let mut groups = HotkeyGroups::new(Some(slots), Some(voice));
 
-        groups.release().unwrap();
+        groups.end_session().unwrap();
+
+        assert!(!groups.slots_bound(), "会话释放必须让出槽位按键");
+        assert!(
+            groups.voice_hotkeys().is_some_and(Hotkeys::is_bound),
+            "会话释放后变声热键必须继续注册"
+        );
+        events
+            .lock()
+            .unwrap()
+            .push_back(pressed(crate::parse_hotkey("F9").unwrap().id()));
+        assert_eq!(
+            groups.poll_actions(),
+            vec![(HotkeyGroup::Voice, 0)],
+            "无会话时变声按键仍必须被消费"
+        );
+        events
+            .lock()
+            .unwrap()
+            .push_back(pressed(crate::parse_hotkey("F1").unwrap().id()));
+        assert!(
+            groups.poll_actions().is_empty(),
+            "释放后旧槽位按键不能再被消费"
+        );
+    }
+
+    #[test]
+    fn 进程退出注销全部变声热键() {
+        let (manager, _, _, events) = fake_with_events(0);
+        let slots = Hotkeys::bind_with(manager.clone(), &["F1".into()]).unwrap();
+        let voice = Hotkeys::bind_with(manager, &["F9".into()]).unwrap();
+        let mut groups = HotkeyGroups::new(Some(slots), Some(voice));
+
+        groups.shutdown().unwrap();
 
         assert!(!groups.slots_bound());
         assert!(
             groups.voice_hotkeys().is_none(),
-            "释放后变声热键必须全部注销"
+            "进程退出必须注销并丢弃变声热键"
         );
-        events.lock().unwrap().push_back(pressed(voice_id));
-        assert!(
-            groups.poll_actions().is_empty(),
-            "释放后旧键事件不能再被消费"
-        );
+        events
+            .lock()
+            .unwrap()
+            .push_back(pressed(crate::parse_hotkey("F9").unwrap().id()));
+        assert!(groups.poll_actions().is_empty(), "退出后不再消费事件");
     }
 
     #[test]
