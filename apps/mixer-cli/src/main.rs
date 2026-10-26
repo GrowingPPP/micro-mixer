@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
-use audio_core::device::{AudioBackend, Direction, StreamFormat, StreamHealth};
+use audio_core::device::{AudioBackend, DeviceInfo, Direction, StreamFormat, StreamHealth};
 use audio_session::{
     resolve_device, DumpOptions, Library, MonitorOptions, Playback, Session, SessionOptions,
     SoundSpec, VoiceOptions,
@@ -438,6 +438,16 @@ fn hotkey_test(keys: Option<String>) -> Result<()> {
 /// doctor 检查**该有的东西在不在**（秒出、不动音频设备）。
 /// 用户说"没声音"时先跑这个 —— 大多数问题（虚拟声卡没装、配置里的设备没了、
 /// 音效文件不存在）在这一步就能看出来，不用进游戏试。
+/// 配置里的设备既可能是后端标识，也可能是旧配置里的显示名。
+/// 复用与开流相同的一套解析规则，避免体检把在线设备误报为丢失。
+fn configured_device_online(
+    devices: &[DeviceInfo],
+    selector: &str,
+    direction: Direction,
+) -> Result<bool> {
+    Ok(resolve_device(devices, selector, direction)?.is_some())
+}
+
 fn cmd_doctor(backend: &CpalBackend) -> Result<()> {
     use audio_core::device::is_virtual_name;
 
@@ -502,26 +512,41 @@ fn cmd_doctor(backend: &CpalBackend) -> Result<()> {
     //
     // 这是最常见的"上次还好好的、这次没声音"：耳机拔了、虚拟声卡重装后换了名字。
     if let Some(want) = &cfg.output_device {
-        let ok = outputs.iter().any(|d| &d.name == want);
-        if ok {
-            println!("  ✅ 配置的输出设备「{want}」在线");
-        } else {
-            println!("  ❌ 配置的输出设备「{want}」**不在了**");
-            problems.push(format!(
-                "配置里写的输出设备「{want}」已经不存在（拔了？重装了？）。\
-                 打开界面重新选一个，或跑 `mixer config set output_device <名字>`。"
-            ));
+        match configured_device_online(&devs, want, Direction::Output) {
+            Ok(true) => println!("  ✅ 配置的输出设备「{want}」在线"),
+            Ok(false) => {
+                println!("  ❌ 配置的输出设备「{want}」**不在了**");
+                problems.push(format!(
+                    "配置里写的输出设备「{want}」已经不存在（拔了？重装了？）。\
+                     打开界面重新选一个，或跑 `mixer config set output_device <名字>`。"
+                ));
+            }
+            Err(error) => {
+                println!("  ❌ 配置的输出设备「{want}」无法解析：{error:#}");
+                problems.push(format!(
+                    "配置里的输出设备「{want}」无法解析：{error:#}。\
+                     请用设备标识或唯一的设备名重新设置。"
+                ));
+            }
         }
     }
     if let Some(want) = &cfg.input_device {
-        if inputs.iter().any(|d| &d.name == want) {
-            println!("  ✅ 配置的麦克风「{want}」在线");
-        } else {
-            println!("  ⚠ 配置的麦克风「{want}」不在了 —— 会自动回退到系统默认");
-            problems.push(format!(
-                "配置里的麦克风「{want}」不在了。程序会自动回退到系统默认麦克风，\
-                 但建议重新选一次（`mixer config set input_device <名字>`）。"
-            ));
+        match configured_device_online(&devs, want, Direction::Input) {
+            Ok(true) => println!("  ✅ 配置的麦克风「{want}」在线"),
+            Ok(false) => {
+                println!("  ⚠ 配置的麦克风「{want}」不在了 —— 会自动回退到系统默认");
+                problems.push(format!(
+                    "配置里的麦克风「{want}」不在了。程序会自动回退到系统默认麦克风，\
+                     但建议重新选一次（`mixer config set input_device <名字>`）。"
+                ));
+            }
+            Err(error) => {
+                println!("  ⚠ 配置的麦克风「{want}」无法解析：{error:#}");
+                problems.push(format!(
+                    "配置里的麦克风「{want}」无法解析：{error:#}。\
+                     请用设备标识或唯一的设备名重新设置。"
+                ));
+            }
         }
     }
 
@@ -1821,5 +1846,61 @@ mod tests {
                 "未知项必须报错且不能输出空值：{error:#}"
             );
         }
+    }
+
+    fn device(id: &str, name: &str, direction: Direction) -> DeviceInfo {
+        DeviceInfo {
+            id: audio_core::device::DeviceId::new(id),
+            name: name.into(),
+            direction,
+            is_default: false,
+            max_channels: 2,
+            default_sample_rate: 48_000,
+        }
+    }
+
+    #[test]
+    fn 体检按设备标识识别在线设备() {
+        let devices = vec![device(
+            "coreaudio:blackhole",
+            "BlackHole 2ch",
+            Direction::Output,
+        )];
+        assert!(
+            configured_device_online(&devices, "coreaudio:blackhole", Direction::Output).unwrap()
+        );
+    }
+
+    #[test]
+    fn 体检按唯一名称识别旧配置() {
+        let devices = vec![device(
+            "coreaudio:blackhole",
+            "BlackHole 2ch",
+            Direction::Output,
+        )];
+        assert!(configured_device_online(&devices, "BlackHole 2ch", Direction::Output).unwrap());
+    }
+
+    #[test]
+    fn 体检拒绝方向不匹配的设备() {
+        let devices = vec![device(
+            "coreaudio:blackhole",
+            "BlackHole 2ch",
+            Direction::Input,
+        )];
+        assert!(
+            !configured_device_online(&devices, "coreaudio:blackhole", Direction::Output).unwrap()
+        );
+    }
+
+    #[test]
+    fn 体检对同名设备要求使用标识() {
+        let devices = vec![
+            device("coreaudio:a", "同名设备", Direction::Output),
+            device("coreaudio:b", "同名设备", Direction::Output),
+        ];
+        let error = configured_device_online(&devices, "同名设备", Direction::Output).unwrap_err();
+        assert!(format!("{error:#}").contains("多个设备"));
+        assert!(configured_device_online(&devices, "coreaudio:b", Direction::Output).unwrap());
     }
 }
