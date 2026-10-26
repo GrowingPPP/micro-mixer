@@ -925,7 +925,8 @@ impl VoiceService {
                     });
                 }
                 Ok(VoiceHotkeyOutcome {
-                    status: self.set_bypass(!status.bypassed)?,
+                    // 按住对比期间只翻转用户旁路；有效旁路仍由对比层保持。
+                    status: self.toggle_bypass()?,
                     acted: true,
                     notice: None,
                 })
@@ -1037,6 +1038,8 @@ impl VoiceService {
         if let Some(params) = start.params {
             state.params = VoiceParams::from(params).sanitized();
         }
+        // 启动配置属于显式启停；启动前的对比不能跨会话保留。
+        state.clear_ab_bypass();
         Self::apply_control(&state);
         Ok(block_ms)
     }
@@ -1059,16 +1062,37 @@ impl VoiceService {
         Self::apply_control(state);
     }
 
+    /// 设置用户临时旁路；只改这一层，不清除按住对比。
+    ///
+    /// 显式启用/关闭、切换预设、开始试听与会话重建才清除按住对比；用户旁路
+    /// 与热键保持独立，避免按住对比期间的一次热键把听感切回湿声。
     pub(crate) fn set_bypass(&self, bypass: bool) -> Result<VoiceStatusDto> {
         {
             let mut state = self.lock();
-            Self::cancel_preview(&self.shared.preview_epoch, &mut state);
-            state.bypassed = bypass;
-            state.clear_ab_bypass();
-            state.operation = state.operation.wrapping_add(1);
-            Self::apply_control(&state);
+            Self::apply_user_bypass(&self.shared.preview_epoch, &mut state, bypass);
         }
         Ok(self.status())
+    }
+
+    /// 翻转用户临时旁路；热键使用它而不是有效旁路值。
+    ///
+    /// 按住对比期间热键只翻转用户层，对比层保持不变；释放对比时再由用户旁路
+    /// 状态决定是否恢复湿声。
+    pub(crate) fn toggle_bypass(&self) -> Result<VoiceStatusDto> {
+        {
+            let mut state = self.lock();
+            let bypass = !state.bypassed;
+            Self::apply_user_bypass(&self.shared.preview_epoch, &mut state, bypass);
+        }
+        Ok(self.status())
+    }
+
+    /// 只改用户临时旁路标志；不触碰 `ab_bypassed`，也不写配置。
+    fn apply_user_bypass(epoch: &AtomicU64, state: &mut VoiceState, bypass: bool) {
+        Self::cancel_preview(epoch, state);
+        state.bypassed = bypass;
+        state.operation = state.operation.wrapping_add(1);
+        Self::apply_control(state);
     }
 
     /// 按住对比原声：只叠加一层运行旁路，释放后回到原有启用状态。
@@ -1104,6 +1128,12 @@ impl VoiceService {
     #[cfg(test)]
     pub(crate) fn set_ab_phase_for_test(&self, phase: VoicePhase) {
         self.lock().ab_phase_override = Some(phase);
+    }
+
+    /// 测试辅助：读取用户临时旁路层，与按住对比叠加的有效旁路区分开。
+    #[cfg(test)]
+    pub(crate) fn user_bypassed_for_test(&self) -> bool {
+        self.lock().bypassed
     }
 
     pub(crate) fn set_params(&self, params: VoiceParamsDto) -> Result<VoiceStatusDto> {

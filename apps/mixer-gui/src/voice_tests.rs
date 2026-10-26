@@ -2069,6 +2069,102 @@ fn 按住对比不覆盖用户临时旁路() {
 }
 
 #[test]
+fn 按住对比期间热键只翻转用户旁路() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    service.set_enabled(true).unwrap();
+    service.set_ab_phase_for_test(VoicePhase::Wet);
+    let started = service.set_ab_bypass(true).unwrap();
+    assert!(started.ab_bypassed);
+    assert_eq!(control.phase(), VoicePhase::Off);
+
+    let outcome = route_voice_hotkey(&service, 9, VoiceHotkeyAction::ToggleBypass).unwrap();
+
+    assert!(outcome.acted);
+    assert!(outcome.status.ab_bypassed, "热键不得清除按住对比");
+    assert!(outcome.status.bypassed, "用户旁路叠加后仍是有效旁路");
+    assert!(
+        service.user_bypassed_for_test(),
+        "热键应打开用户临时旁路，而不是翻转有效旁路"
+    );
+    assert_eq!(control.phase(), VoicePhase::Off, "按住期间保持原声");
+}
+
+#[test]
+fn 用户旁路期间释放按住对比保持干声() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    service.set_enabled(true).unwrap();
+    service.set_ab_phase_for_test(VoicePhase::Wet);
+    service.set_ab_bypass(true).unwrap();
+    route_voice_hotkey(&service, 9, VoiceHotkeyAction::ToggleBypass).unwrap();
+    assert!(service.user_bypassed_for_test());
+
+    let released = service.set_ab_bypass(false).unwrap();
+
+    assert!(!released.ab_bypassed);
+    assert!(released.bypassed, "释放对比不能清除用户热键旁路");
+    assert!(released.enabled);
+    assert_eq!(released.phase, "off");
+    assert_eq!(control.phase(), VoicePhase::Off, "用户旁路仍应保持干声");
+}
+
+#[test]
+fn 按住对比期间再次热键恢复用户层后释放恢复湿声() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    service.set_enabled(true).unwrap();
+    service.set_ab_phase_for_test(VoicePhase::Wet);
+    service.set_ab_bypass(true).unwrap();
+    route_voice_hotkey(&service, 9, VoiceHotkeyAction::ToggleBypass).unwrap();
+    assert!(service.user_bypassed_for_test());
+
+    let outcome = route_voice_hotkey(&service, 9, VoiceHotkeyAction::ToggleBypass).unwrap();
+
+    assert!(outcome.status.ab_bypassed, "第二次热键仍不得清除按住对比");
+    assert!(
+        !service.user_bypassed_for_test(),
+        "第二次热键应清除用户旁路"
+    );
+    assert!(outcome.status.bypassed, "按住对比仍使有效状态保持旁路");
+    assert_eq!(control.phase(), VoicePhase::Off, "对比未释放前不得恢复湿声");
+
+    let released = service.set_ab_bypass(false).unwrap();
+    assert!(!released.ab_bypassed);
+    assert!(!released.bypassed);
+    assert_eq!(released.phase, "warmup", "用户层已恢复，释放对比后回到湿声");
+    assert_eq!(control.phase(), VoicePhase::Warmup);
+}
+
+#[test]
+fn 未按住对比时热键正常切换用户旁路() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    service.set_enabled(true).unwrap();
+
+    let opened = route_voice_hotkey(&service, 9, VoiceHotkeyAction::ToggleBypass).unwrap();
+    assert!(opened.acted);
+    assert!(!opened.status.ab_bypassed);
+    assert!(opened.status.bypassed);
+    assert!(service.user_bypassed_for_test());
+    assert_eq!(control.phase(), VoicePhase::Off);
+
+    let closed = route_voice_hotkey(&service, 9, VoiceHotkeyAction::ToggleBypass).unwrap();
+    assert!(!closed.status.ab_bypassed);
+    assert!(!closed.status.bypassed);
+    assert!(!service.user_bypassed_for_test());
+    assert_eq!(control.phase(), VoicePhase::Warmup);
+}
+
+#[test]
 fn 按住对比释放后恢复有效启用() {
     let dir = TemporaryDir::new();
     let service = service(&dir);
@@ -2199,12 +2295,6 @@ fn 切换预设与启停清除按住对比() {
     let status = service.set_enabled(false).unwrap();
     assert!(!status.ab_bypassed);
     assert!(!status.enabled);
-
-    service.set_enabled(true).unwrap();
-    service.set_ab_bypass(true).unwrap();
-    let status = service.set_bypass(true).unwrap();
-    assert!(!status.ab_bypassed);
-    assert!(status.bypassed, "启停与旁路入口不能把按住对比留在运行态");
 }
 
 #[test]
