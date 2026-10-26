@@ -7,6 +7,7 @@
 use std::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use super::metrics::{VoiceMetrics, VoiceMetricsSnapshot};
 use super::{VoiceParams, VoicePhase, VoiceRuntime};
 
 /// 快照的原子字段。
@@ -177,6 +178,8 @@ impl VoiceParamBuffer {
 pub struct VoiceControl {
     runtime: Arc<VoiceRuntime>,
     param_buffer: Arc<VoiceParamBuffer>,
+    /// 与链共享的指标槽；控制句柄克隆之间共享同一份计数。
+    metrics: Arc<VoiceMetrics>,
 }
 
 impl VoiceControl {
@@ -190,6 +193,7 @@ impl VoiceControl {
         Self {
             runtime,
             param_buffer: VoiceParamBuffer::new(params),
+            metrics: Arc::new(VoiceMetrics::new()),
         }
     }
 
@@ -204,6 +208,11 @@ impl VoiceControl {
     /// 最近一次完整参数快照。
     pub fn params(&self) -> VoiceParams {
         self.param_buffer.current()
+    }
+
+    /// 当前人声链指标；克隆共享同一份计数。
+    pub fn metrics_snapshot(&self) -> VoiceMetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     /// 请求启用变声。
@@ -242,6 +251,10 @@ impl VoiceControl {
 
     pub(crate) fn param_buffer(&self) -> &Arc<VoiceParamBuffer> {
         &self.param_buffer
+    }
+
+    pub(crate) fn metrics(&self) -> &Arc<VoiceMetrics> {
+        &self.metrics
     }
 }
 

@@ -6,6 +6,7 @@ pub mod backend;
 pub mod chain;
 pub mod control;
 pub mod effects;
+mod metrics;
 pub mod params;
 pub mod preview;
 pub mod runtime;
@@ -17,6 +18,7 @@ pub use backend::VoiceBackend;
 pub use chain::VoiceChain;
 pub use control::{VoiceControl, VoiceParamBuffer};
 pub use effects::EffectChain;
+pub use metrics::VoiceMetricsSnapshot;
 pub use params::VoiceParams;
 pub use preview::{
     PreviewError, VoicePreviewBuffer, VoicePreviewClip, VoicePreviewControl, VoicePreviewSource,

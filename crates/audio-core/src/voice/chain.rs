@@ -1,5 +1,7 @@
 //! 固定块变声链：输入块累积、湿声 FIFO 与旁路。
 
+use std::time::Instant;
+
 use super::{EffectChain, VoiceBackend, VoiceControl, VoiceParams};
 
 /// 有界湿声 FIFO。
@@ -84,7 +86,8 @@ impl VoiceChain {
     pub fn new(backend: Box<dyn VoiceBackend>, block_frames: usize) -> Self {
         let control = VoiceControl::new(VoiceParams::neutral());
         let applied_params = control.params();
-        Self::new_inner(backend, block_frames, None, control, applied_params)
+        // 兼容入口没有采样率信息，指标里保留 0 以区别于真实配置。
+        Self::new_inner(backend, block_frames, 0, None, control, applied_params)
     }
 
     /// 创建带共享参数快照与控制句柄的固定块链。
@@ -104,6 +107,7 @@ impl VoiceChain {
         Self::new_inner(
             backend,
             block_frames,
+            sample_rate,
             Some(effects),
             control,
             applied_params,
@@ -113,6 +117,7 @@ impl VoiceChain {
     fn new_inner(
         backend: Box<dyn VoiceBackend>,
         block_frames: usize,
+        sample_rate: u32,
         effects: Option<EffectChain>,
         control: VoiceControl,
         applied_params: VoiceParams,
@@ -120,6 +125,11 @@ impl VoiceChain {
         assert!(block_frames > 0, "块长必须大于 0");
         let mut backend = backend;
         backend.set_params(applied_params);
+
+        let latency_frames = backend.latency_frames().saturating_add(block_frames);
+        control
+            .metrics()
+            .configure(sample_rate, block_frames, latency_frames);
 
         Self {
             backend,
@@ -138,7 +148,21 @@ impl VoiceChain {
     /// 喂入输入并写出湿声，返回写入 `output` 的帧数。
     ///
     /// 输入始终被完整消费；输出不足时湿声留在有界 FIFO 中，满则丢弃最旧样本。
+    /// 整次调用（包括旁路拷贝）用单调时钟计时；计时与计数只做原子操作。
     pub fn process(&mut self, input: &[f32], output: &mut [f32]) -> usize {
+        let started = Instant::now();
+        let dropped_before = self.fifo.dropped();
+        let written = self.process_audio(input, output);
+        let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+
+        let metrics = self.control.metrics();
+        metrics.record_process(elapsed);
+        // 只累加本次处理新增的丢弃量，避免把累计值重复计入。
+        metrics.record_overflow(self.fifo.dropped().saturating_sub(dropped_before));
+        written
+    }
+
+    fn process_audio(&mut self, input: &[f32], output: &mut [f32]) -> usize {
         if self.bypass {
             let frames = input.len().min(output.len());
             output[..frames].copy_from_slice(&input[..frames]);
@@ -226,6 +250,15 @@ impl VoiceChain {
     /// FIFO 满时累计丢弃的帧数。
     pub fn overflowed_frames(&self) -> u64 {
         self.fifo.dropped()
+    }
+
+    /// 采集侧报告湿声暂时排空、用最近样本补齐的帧数。
+    ///
+    /// 只累加共享指标，不改变 FIFO 内容或音频输出。
+    pub fn record_gap(&self, frames: usize) {
+        self.control
+            .metrics()
+            .record_gap(u64::try_from(frames).unwrap_or(u64::MAX));
     }
 }
 
@@ -363,6 +396,138 @@ mod tests {
         let (chain, _calls) = 创建链(11);
 
         assert_eq!(chain.latency_frames(), 11 + BLOCK);
+    }
+
+    fn 创建指标链(delay_frames: usize) -> (VoiceChain, VoiceControl) {
+        let control = VoiceControl::new(VoiceParams::neutral());
+        let chain = VoiceChain::new_with_control(
+            Box::new(DelayBackend::new(delay_frames)),
+            BLOCK,
+            SAMPLE_RATE,
+            control.clone(),
+        );
+        (chain, control)
+    }
+
+    #[test]
+    fn 人声指标包含延迟块长与采样率() {
+        const TEN_MS: usize = SAMPLE_RATE as usize / 100;
+        let control = VoiceControl::new(VoiceParams::neutral());
+        let chain = VoiceChain::new_with_control(
+            Box::new(DelayBackend::new(37)),
+            TEN_MS,
+            SAMPLE_RATE,
+            control.clone(),
+        );
+
+        let metrics = control.metrics_snapshot();
+        assert_eq!(metrics.latency_frames, 37 + TEN_MS);
+        assert_eq!(metrics.latency_frames, chain.latency_frames());
+        assert_eq!(metrics.block_frames, TEN_MS);
+        assert_eq!(metrics.sample_rate, SAMPLE_RATE);
+    }
+
+    #[test]
+    fn 兼容入口只记录延迟与块长() {
+        let chain = VoiceChain::new(Box::new(DelayBackend::new(11)), BLOCK);
+        let metrics = chain.control.metrics_snapshot();
+
+        assert_eq!(metrics.latency_frames, 11 + BLOCK);
+        assert_eq!(metrics.block_frames, BLOCK);
+        assert_eq!(metrics.sample_rate, 0);
+    }
+
+    #[test]
+    fn 人声处理耗时被记录且最大值单调() {
+        let (mut chain, control) = 创建指标链(3);
+        // 每次调用覆盖多个算法块，确保耗时高于时钟分辨率。
+        let input = vec![0.1f32; BLOCK * 8];
+        let mut output = vec![0.0f32; BLOCK * 8];
+        let mut observed_max = 0;
+
+        for round in 0..16 {
+            chain.process(&input, &mut output);
+            let metrics = control.metrics_snapshot();
+            assert!(metrics.process_ns_last > 0, "第 {round} 次处理应记录耗时");
+            assert!(
+                metrics.process_ns_max >= metrics.process_ns_last,
+                "最大值不得小于最近一次耗时"
+            );
+            assert!(metrics.process_ns_max >= observed_max, "最大值不得回退");
+            observed_max = metrics.process_ns_max;
+        }
+    }
+
+    #[test]
+    fn 湿声队列溢出计数进入指标() {
+        let (mut chain, control) = 创建指标链(0);
+        let input = vec![0.25f32; BLOCK];
+        let mut output = vec![0.0f32; 1];
+
+        for _ in 0..20 {
+            chain.process(&input, &mut output);
+            assert_eq!(
+                control.metrics_snapshot().overflow_frames,
+                chain.overflowed_frames(),
+                "每次处理后的累计溢出必须一致"
+            );
+        }
+
+        let metrics = control.metrics_snapshot();
+        assert!(metrics.overflow_frames > 0, "长期输出不足必须产生溢出");
+        assert_eq!(metrics.overflow_frames, chain.overflowed_frames());
+    }
+
+    #[test]
+    fn 指标读取不分配且不改变音频输出() {
+        let (mut chain, control) = 创建指标链(5);
+        let mut reference = VoiceChain::new_with_control(
+            Box::new(DelayBackend::new(5)),
+            BLOCK,
+            SAMPLE_RATE,
+            VoiceControl::new(VoiceParams::neutral()),
+        );
+        let input: Vec<f32> = (0..BLOCK)
+            .map(|index| (index as f32 * 0.03).sin() * 0.4)
+            .collect();
+        let mut output = vec![0.0f32; BLOCK];
+        let mut expected = vec![0.0f32; BLOCK];
+
+        assert_eq!(
+            count_allocations(|| {
+                chain.process(&input, &mut output);
+                let metrics = control.metrics_snapshot();
+                assert_eq!(metrics.sample_rate, SAMPLE_RATE);
+            }),
+            0,
+            "处理与指标读取都不得分配"
+        );
+        assert_eq!(reference.process(&input, &mut expected), BLOCK);
+        assert_eq!(output, expected, "读取指标不得改变 PCM 输出");
+    }
+
+    #[test]
+    fn 旁路不改变延迟与块长指标() {
+        let (mut chain, control) = 创建指标链(9);
+        let input = vec![0.3f32; BLOCK];
+        let mut output = vec![0.0f32; BLOCK];
+        chain.process(&input, &mut output);
+        let before = control.metrics_snapshot();
+
+        chain.set_bypass(true);
+        // 旁路拷贝足够多的帧，确保计时高于时钟分辨率。
+        let bypass_input = vec![0.3f32; SAMPLE_RATE as usize];
+        let mut bypass_output = vec![0.0f32; SAMPLE_RATE as usize];
+        assert_eq!(
+            chain.process(&bypass_input, &mut bypass_output),
+            SAMPLE_RATE as usize
+        );
+        let after = control.metrics_snapshot();
+
+        assert_eq!(after.latency_frames, before.latency_frames);
+        assert_eq!(after.block_frames, before.block_frames);
+        assert_eq!(after.sample_rate, before.sample_rate);
+        assert!(after.process_ns_last > 0, "旁路拷贝也要计时");
     }
 
     struct ProbeBackend {
