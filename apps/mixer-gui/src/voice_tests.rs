@@ -2142,6 +2142,35 @@ fn 预热阶段按住对比被拒绝() {
 }
 
 #[test]
+fn 暂停期间按住对比被拒绝() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    service.set_enabled(true).unwrap();
+    service.set_ab_phase_for_test(VoicePhase::Wet);
+    service.suspend();
+
+    let error = service.set_ab_bypass(true).unwrap_err();
+    assert!(
+        error.to_string().contains("音频暂停中"),
+        "暂停期间按住对比必须拒绝，实际 {error:#}"
+    );
+    let status = service.status();
+    assert!(!status.ab_bypassed);
+    assert!(status.bypassed, "暂停层仍应报告有效旁路");
+
+    service.restore();
+    let started = service.set_ab_bypass(true).unwrap();
+    assert!(started.ab_bypassed, "暂停解除后应允许开始对比");
+    assert_eq!(control.phase(), VoicePhase::Off);
+
+    let released = service.set_ab_bypass(false).unwrap();
+    assert!(!released.ab_bypassed);
+    assert_eq!(control.phase(), VoicePhase::Warmup);
+}
+
+#[test]
 fn 切换预设与启停清除按住对比() {
     let dir = TemporaryDir::new();
     let service = service(&dir);
