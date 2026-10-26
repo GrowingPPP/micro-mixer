@@ -222,6 +222,38 @@ voice_set_ab_bypass(active: bool) -> VoiceStatusDto
 - 不改变现有产品文案中的 30 ms 目标；指标用于验证该目标，不替代真机验收。
 - 若 `Instant` 测量在真机/低配机器上影响实时预算，回退方案是每 N 个回调采样一次，保留 last/max 近似值；不改变音频输出。
 
+### 10.1 实测与边界（2026-10-26）
+
+实现范围与上文一致：audio-core 指标快照与原子槽、宿主 `VoiceStatusDto.metrics` /
+`ab_bypassed` 与 `voice_set_ab_bypass`、GUI 性能行与按住按钮。未引入 AI、模型、网络、
+持续监听、配置持久化、CLI 或遥控入口。
+
+release 单线程进程内实时预算（DelayBackend 每种回调 10 秒，Signalsmith 每种 5 秒）：
+
+| 后端 | 回调帧 | 周期 | P99 | 最大 |
+|---|---:|---:|---:|---:|
+| DelayBackend（不含 DSP） | 128 | 2.667 ms | 16.1 µs | 46.8 µs |
+| DelayBackend（不含 DSP） | 256 | 5.333 ms | 23.6 µs | 113.0 µs |
+| DelayBackend（不含 DSP） | 480 | 10.000 ms | 36.6 µs | 57.0 µs |
+| Signalsmith +4 半音 / 共振峰 +3 + 完整效果链 | 128 | 2.667 ms | 52.6 µs | 116.2 µs |
+| Signalsmith +4 半音 / 共振峰 +3 + 完整效果链 | 480 | 10.000 ms | 90.5 µs | 103.6 µs |
+
+P99 均低于周期 15%，最大值均小于周期；Signalsmith 用例断言 Rust 侧分配为 0，
+两个用例的欠载均为 0。与未加指标的
+2026-10-22 基线（DelayBackend P99 18～27 / 28 / 41 µs，Signalsmith P99 54 / 84 µs）
+相比处于同一数量级；差异包含开发配置与运行噪声。指标记录在 release 下约
+46～51 ns/回调，远低于最小回调周期，未触发每 N 个回调采样一次的降级。
+
+回归结果：workspace all-targets 566 项通过、2 项预算测试忽略；
+`audio-core --features voice` 164 项、`audio-session --features voice` 42 项、
+`mixer-gui --features voice` 200 项、Node 四个套件 185 项通过；格式、两种特性组合的
+Clippy、release 构建、Windows MSVC 交叉类型检查与 `git diff --check` 通过。
+
+边界：上述均为进程内 B 级数据，GUI 为交付 DOM 与模拟 IPC，布局为 Chromium 静态渲染。
+延迟指标按链构造值换算，真实设备端到端延迟未测量。真实设备听感、真实热键序列、
+持续监听、44.1 kHz 真机、Windows 真机 / WASAPI / WebView2 未验证；
+V-18 / V-19 仍未关闭，不能用本记录替代真机验收。
+
 ## 11. 实施顺序
 
 1. audio-core：指标结构、`VoiceChain`/`VoiceTee` 记录、单元测试。

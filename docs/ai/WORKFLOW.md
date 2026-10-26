@@ -36,10 +36,15 @@ cargo test --locked -p app-config
 cargo test --locked -p audio-core -p audio-session
 cargo test --locked -p audio-core --features voice
 cargo test --locked -p audio-session --features voice
+cargo test --locked -p audio-core --features voice 指标 -- --test-threads=1
+cargo test --locked -p audio-core --features voice 缺帧 -- --test-threads=1
+cargo test --locked -p mixer-gui --features voice 按住对比 -- --test-threads=1
+cargo test --locked -p mixer-gui --features voice 性能指标 -- --test-threads=1
 cargo test --locked -p mixer-gui --bin mixer-gui combo_ -- --nocapture
 cargo test --locked -p remote
 node --test tools/test-gui-controls.js tools/test-gui-model.js
 node --test tools/test-remote-controls.js tools/test-app-packaging.js
+node --test --test-name-pattern='按住|指标|性能|占位符|指针取消|失焦|按钮禁用|关闭人声面板|延迟|处理' tools/test-gui-controls.js
 ```
 
 `voice` 特性捆绑 C++ 源码并通过 bindgen 生成绑定，需要 C++ 工具链与 libclang；
