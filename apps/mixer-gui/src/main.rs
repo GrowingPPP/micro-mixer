@@ -609,6 +609,11 @@ fn voice_set_bypass(host: State<'_, AudioHost>, bypass: bool) -> Res<VoiceStatus
 }
 
 #[tauri::command]
+fn voice_set_ab_bypass(host: State<'_, AudioHost>, active: bool) -> Res<VoiceStatusDto> {
+    host.voice_set_ab_bypass(active).map_err(err)
+}
+
+#[tauri::command]
 fn voice_set_params(host: State<'_, AudioHost>, params: VoiceParamsDto) -> Res<VoiceStatusDto> {
     host.voice_set_params(params).map_err(err)
 }
@@ -1316,6 +1321,7 @@ fn main() {
             voice_calibration_end,
             voice_set_enabled,
             voice_set_bypass,
+            voice_set_ab_bypass,
             voice_set_params,
             voice_select_preset,
             voice_save_as_user_preset,

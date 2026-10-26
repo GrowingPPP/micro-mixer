@@ -26,7 +26,7 @@ use anyhow::Result;
 use app_config::{builtin_voice_presets, Config, VoiceParamsConfig, VoicePreset};
 
 #[cfg(feature = "voice")]
-use audio_core::voice::{VoiceControl, VoicePhase, VoicePreviewControl};
+use audio_core::voice::{VoiceControl, VoiceMetricsSnapshot, VoicePhase, VoicePreviewControl};
 
 #[cfg(feature = "voice")]
 use audio_session::{signalsmith_voice_backend_factory, VoiceOptions};
@@ -113,6 +113,53 @@ impl From<VoiceParamsDto> for VoiceParams {
     }
 }
 
+/// 人声链性能指标；前端按毫秒与微秒显示。
+///
+/// 采样率未知（兼容入口为 0）时毫秒字段为 0，界面显示占位符而不是把 0 当成真实延迟。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub(crate) struct VoiceMetricsDto {
+    pub latency_ms: f32,
+    pub block_ms: f32,
+    pub sample_rate: u32,
+    pub process_us_last: u32,
+    pub process_us_max: u32,
+    pub overflow_frames: u64,
+    pub gap_frames: u64,
+}
+
+#[cfg(feature = "voice")]
+impl From<VoiceMetricsSnapshot> for VoiceMetricsDto {
+    fn from(snapshot: VoiceMetricsSnapshot) -> Self {
+        Self {
+            latency_ms: frames_to_ms(snapshot.latency_frames, snapshot.sample_rate),
+            block_ms: frames_to_ms(snapshot.block_frames, snapshot.sample_rate),
+            sample_rate: snapshot.sample_rate,
+            process_us_last: nanos_to_micros(snapshot.process_ns_last),
+            process_us_max: nanos_to_micros(snapshot.process_ns_max),
+            overflow_frames: snapshot.overflow_frames,
+            gap_frames: snapshot.gap_frames,
+        }
+    }
+}
+
+/// 帧数按采样率换算成毫秒；先做整数乘法，常见块长能得到精确的毫秒值。
+#[cfg(feature = "voice")]
+fn frames_to_ms(frames: usize, sample_rate: u32) -> f32 {
+    if sample_rate == 0 {
+        return 0.0;
+    }
+    let scaled = u64::try_from(frames)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(1000);
+    scaled as f32 / sample_rate as f32
+}
+
+/// 纳秒转微秒并饱和到 `u32`；整数除法只向下取整，不产生负值。
+#[cfg(feature = "voice")]
+fn nanos_to_micros(nanos: u64) -> u32 {
+    u32::try_from(nanos / 1_000).unwrap_or(u32::MAX)
+}
+
 /// 预设列表条目；内置预设只读，用户预设由后续命令维护。
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct VoicePresetDto {
@@ -189,7 +236,10 @@ impl From<&VoicePreviewStatus> for VoicePreviewDto {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct VoiceStatusDto {
     pub enabled: bool,
+    /// 有效旁路：用户临时旁路、暂停与按住对比任一成立。
     pub bypassed: bool,
+    /// 按住对比原声叠加的临时旁路；界面据此区分用户旁路。
+    pub ab_bypassed: bool,
     pub phase: String,
     pub preset_id: String,
     pub preset_name: String,
@@ -197,6 +247,8 @@ pub(crate) struct VoiceStatusDto {
     pub draft_available: bool,
     pub params: VoiceParamsDto,
     pub preview: VoicePreviewDto,
+    /// 人声链指标；没有控制句柄时为 `None`。
+    pub metrics: Option<VoiceMetricsDto>,
     pub save_error: Option<String>,
     /// 状态快照的操作代次；异步回复低于当前代次时必须丢弃。
     pub generation: u64,
@@ -217,6 +269,7 @@ impl VoiceStatusDto {
         Self {
             enabled: false,
             bypassed: false,
+            ab_bypassed: false,
             phase: "off".to_owned(),
             preset_id: "builtin:female".to_owned(),
             preset_name: "女声".to_owned(),
@@ -224,6 +277,7 @@ impl VoiceStatusDto {
             draft_available: false,
             params: VoiceParamsDto::default(),
             preview: VoicePreviewDto::idle(),
+            metrics: None,
             save_error: None,
             generation: 0,
         }
@@ -373,6 +427,11 @@ type VoiceSaveFn = dyn Fn(&Path, &VoiceWrite) -> Result<()> + Send + Sync;
 struct VoiceState {
     enabled: bool,
     bypassed: bool,
+    /// 按住对比原声叠加的临时旁路；只改运行态，不写配置。
+    ab_bypassed: bool,
+    /// 测试无法驱动真实音频回调进入湿声，允许覆盖 A/B 的阶段门槛。
+    #[cfg(test)]
+    ab_phase_override: Option<VoicePhase>,
     /// 自检（`AudioHost::with_suspended`）的嵌套暂停层数；只叠加，不覆盖用户状态。
     suspended: u32,
     /// 麦克风校准暂停层的租约截止时间；`None` 表示未在校准。
@@ -417,14 +476,27 @@ impl VoiceState {
         self.suspended > 0 || self.calibration_until.is_some()
     }
 
-    /// 暂停和临时旁路都只会让运行态更保守，不会改写保存的启用值。
+    /// 暂停、临时旁路与按住对比都只会让运行态更保守，不会改写保存的启用值。
     fn effective_enabled(&self) -> bool {
-        self.enabled && !self.bypassed && !self.paused()
+        self.enabled && !self.bypassed && !self.ab_bypassed && !self.paused()
     }
 
     fn effective_bypassed(&self) -> bool {
-        self.bypassed || self.paused()
+        self.bypassed || self.ab_bypassed || self.paused()
     }
+}
+
+/// A/B 开始时的阶段判定；生产路径读取控制句柄，测试可覆盖。
+#[cfg(feature = "voice")]
+fn ab_start_phase(state: &VoiceState) -> VoicePhase {
+    #[cfg(test)]
+    if let Some(phase) = state.ab_phase_override {
+        return phase;
+    }
+    state
+        .control
+        .as_ref()
+        .map_or(VoicePhase::Off, VoiceControl::phase)
 }
 
 #[cfg(feature = "voice")]
@@ -495,6 +567,9 @@ impl VoiceService {
                 state: Mutex::new(VoiceState {
                     enabled,
                     bypassed: false,
+                    ab_bypassed: false,
+                    #[cfg(test)]
+                    ab_phase_override: None,
                     suspended: 0,
                     calibration_until: None,
                     preset_id,
@@ -620,6 +695,7 @@ impl VoiceService {
             // 开关显示保存的启用值；暂停与临时旁路通过 bypassed 单独表达。
             enabled: state.enabled,
             bypassed: state.effective_bypassed(),
+            ab_bypassed: state.ab_bypassed,
             phase: state
                 .control
                 .as_ref()
@@ -631,6 +707,10 @@ impl VoiceService {
             draft_available: state.draft.is_some(),
             params: state.params.into(),
             preview: (&state.preview).into(),
+            metrics: state
+                .control
+                .as_ref()
+                .map(|control| control.metrics_snapshot().into()),
             save_error: state.save_error.clone(),
             generation: state.operation,
         }
@@ -652,6 +732,11 @@ impl VoiceService {
         state.preview = VoicePreviewStatus::Preparing;
         state.preview_started = None;
         state.operation = state.operation.wrapping_add(1);
+        if state.ab_bypassed {
+            // 试听要听到变声后的声音，按住对比不能跨试听保留。
+            state.ab_bypassed = false;
+            Self::apply_control(&state);
+        }
         generation
     }
 
@@ -877,6 +962,7 @@ impl VoiceService {
         if state.suspended == 0 {
             state.bypassed = false;
         }
+        state.ab_bypassed = false;
         state.control = Some(control.clone());
         control.set_params(state.params);
         if state.effective_enabled() {
@@ -897,6 +983,7 @@ impl VoiceService {
         Self::cancel_preview(&self.shared.preview_epoch, &mut state);
         state.preview_control = None;
         state.control = None;
+        state.ab_bypassed = false;
         if state.suspended == 0 {
             state.bypassed = false;
         }
@@ -944,6 +1031,7 @@ impl VoiceService {
     fn apply_enabled(state: &mut VoiceState, enabled: bool) {
         state.enabled = enabled;
         state.bypassed = false;
+        state.ab_bypassed = false;
         state.operation = state.operation.wrapping_add(1);
         Self::apply_control(state);
     }
@@ -953,10 +1041,48 @@ impl VoiceService {
             let mut state = self.lock();
             Self::cancel_preview(&self.shared.preview_epoch, &mut state);
             state.bypassed = bypass;
+            state.ab_bypassed = false;
             state.operation = state.operation.wrapping_add(1);
             Self::apply_control(&state);
         }
         Ok(self.status())
+    }
+
+    /// 按住对比原声：只叠加一层运行旁路，释放后回到原有启用状态。
+    ///
+    /// 开始要求会话已发布、变声启用、用户未旁路/暂停、试听空闲且阶段稳定在湿声；
+    /// 不满足时返回明确原因。释放幂等且不依赖控制句柄，失焦与取消路径总能成功。
+    pub(crate) fn set_ab_bypass(&self, active: bool) -> Result<VoiceStatusDto> {
+        {
+            let mut state = self.lock();
+            if active {
+                anyhow::ensure!(state.control.is_some(), "音频未启动");
+                anyhow::ensure!(state.enabled, "变声未启用");
+                anyhow::ensure!(!state.bypassed, "当前已旁路");
+                anyhow::ensure!(!state.paused(), "音频暂停中");
+                anyhow::ensure!(
+                    matches!(state.preview, VoicePreviewStatus::Idle),
+                    "正在试听"
+                );
+                anyhow::ensure!(ab_start_phase(&state) == VoicePhase::Wet, "正在预热");
+                if !state.ab_bypassed {
+                    state.ab_bypassed = true;
+                    state.operation = state.operation.wrapping_add(1);
+                    Self::apply_control(&state);
+                }
+            } else {
+                state.ab_bypassed = false;
+                state.operation = state.operation.wrapping_add(1);
+                Self::apply_control(&state);
+            }
+        }
+        Ok(self.status())
+    }
+
+    /// 测试辅助：真实音频回调无法在宿主测试里推进到湿声，这里覆盖阶段门槛。
+    #[cfg(test)]
+    pub(crate) fn set_ab_phase_for_test(&self, phase: VoicePhase) {
+        self.lock().ab_phase_override = Some(phase);
     }
 
     pub(crate) fn set_params(&self, params: VoiceParamsDto) -> Result<VoiceStatusDto> {
@@ -1017,6 +1143,9 @@ impl VoiceService {
             if state.preset_id != preset.id {
                 // 录制中的试听属于旧预设，必须立即取消，不能回放半段。
                 Self::cancel_preview(&self.shared.preview_epoch, &mut state);
+                // 按住对比绑定旧预设的运行路径，切换后不能继续保持旁路。
+                let ab_cleared = state.ab_bypassed;
+                state.ab_bypassed = false;
                 if state.params != state.saved_params {
                     state.draft = Some(VoiceDraft {
                         source_preset_id: state.preset_id.clone(),
@@ -1029,7 +1158,9 @@ impl VoiceService {
                 state.params = params;
                 state.pending_save_rollback = None;
                 state.operation = state.operation.wrapping_add(1);
-                if let Some(control) = &state.control {
+                if ab_cleared {
+                    Self::apply_control(&state);
+                } else if let Some(control) = &state.control {
                     control.set_params(params);
                 }
                 self.queue_write(&mut state);
@@ -1143,6 +1274,7 @@ impl VoiceService {
                 state.draft = None;
                 state.pending_save_rollback = None;
                 state.bypassed = false;
+                state.ab_bypassed = false;
                 state.enabled = false;
                 let fallback = builtin_voice_presets()
                     .into_iter()

@@ -2354,6 +2354,19 @@ impl AudioHost {
         }
     }
 
+    /// 按住对比原声；只改运行态，不写配置、不改用户旁路。
+    pub fn voice_set_ab_bypass(&self, active: bool) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.set_ab_bypass(active)
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            let _ = active;
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
     pub fn voice_set_params(&self, params: VoiceParamsDto) -> Result<VoiceStatusDto> {
         #[cfg(feature = "voice")]
         {

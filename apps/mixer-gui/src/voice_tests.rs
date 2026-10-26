@@ -2000,3 +2000,285 @@ fn 录制中修改参数立即取消试听() {
     assert_eq!(status.preview.state, "recording", "参数未变化不应取消录制");
     assert!(service.preview_is_current(generation));
 }
+
+// ── 按住对比原声 ─────────────────────────────────────────────
+
+#[test]
+fn 按住对比只改变运行旁路不写配置() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control);
+    service.set_enabled(true).unwrap();
+    service.flush_saves();
+    let before = Config::load_from(&config_path(&dir));
+    service.set_ab_phase_for_test(VoicePhase::Wet);
+
+    let status = service.set_ab_bypass(true).unwrap();
+    assert!(status.ab_bypassed);
+    assert!(status.bypassed, "按住对比期间状态应报告有效旁路");
+    assert!(status.enabled, "按住对比不改变已保存的启用值");
+    assert_eq!(status.phase, "off");
+    service.flush_saves();
+    let during = Config::load_from(&config_path(&dir));
+    assert_eq!(during.voice.enabled, before.voice.enabled);
+    assert_eq!(during.voice.active_preset, before.voice.active_preset);
+    assert_eq!(during.voice.bypass_hotkey, before.voice.bypass_hotkey);
+    assert_eq!(
+        during.voice.next_preset_hotkey,
+        before.voice.next_preset_hotkey
+    );
+    assert_eq!(
+        during.voice.prev_preset_hotkey,
+        before.voice.prev_preset_hotkey
+    );
+
+    let status = service.set_ab_bypass(false).unwrap();
+    assert!(!status.ab_bypassed);
+    assert!(!status.bypassed);
+    assert!(status.enabled);
+    assert_eq!(status.phase, "warmup");
+    service.flush_saves();
+    let after = Config::load_from(&config_path(&dir));
+    assert_eq!(after.voice.enabled, before.voice.enabled);
+    assert_eq!(after.voice.active_preset, before.voice.active_preset);
+}
+
+#[test]
+fn 按住对比不覆盖用户临时旁路() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    service.set_enabled(true).unwrap();
+    service.set_bypass(true).unwrap();
+    service.set_ab_phase_for_test(VoicePhase::Wet);
+
+    let error = service.set_ab_bypass(true).unwrap_err();
+    assert!(
+        error.to_string().contains("当前已旁路"),
+        "用户旁路时按住对比必须拒绝，实际 {error:#}"
+    );
+    assert!(!service.status().ab_bypassed);
+
+    let status = service.set_ab_bypass(false).unwrap();
+    assert!(!status.ab_bypassed);
+    assert!(status.bypassed, "释放对比不能清除用户临时旁路");
+    assert!(status.enabled);
+    assert_eq!(control.phase(), VoicePhase::Off);
+}
+
+#[test]
+fn 按住对比释放后恢复有效启用() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    service.set_enabled(true).unwrap();
+    service.set_ab_phase_for_test(VoicePhase::Wet);
+
+    let started = service.set_ab_bypass(true).unwrap();
+    assert!(started.ab_bypassed);
+    assert_eq!(started.phase, "off", "按住对比应立即回到原声");
+    assert_eq!(control.phase(), VoicePhase::Off);
+
+    let released = service.set_ab_bypass(false).unwrap();
+    assert!(!released.ab_bypassed);
+    assert!(!released.bypassed);
+    assert_eq!(released.phase, "warmup", "释放后应重新预热");
+    assert_eq!(control.phase(), VoicePhase::Warmup);
+}
+
+#[test]
+fn 按住对比与试听互斥() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    service.set_enabled(true).unwrap();
+    service.set_ab_phase_for_test(VoicePhase::Wet);
+
+    service.preview_begin();
+    let error = service.set_ab_bypass(true).unwrap_err();
+    assert!(
+        error.to_string().contains("正在试听"),
+        "试听中按住对比必须拒绝，实际 {error:#}"
+    );
+    service.preview_cancel();
+
+    let started = service.set_ab_bypass(true).unwrap();
+    assert!(started.ab_bypassed);
+    let generation = service.preview_begin();
+    let status = service.status();
+    assert!(!status.ab_bypassed, "开始试听必须取消按住对比");
+    assert!(!status.bypassed);
+    assert_eq!(
+        control.phase(),
+        VoicePhase::Warmup,
+        "取消对比后试听需要恢复湿声路径"
+    );
+    assert!(service.preview_is_current(generation));
+}
+
+#[test]
+fn 预热阶段按住对比被拒绝() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    service.set_enabled(true).unwrap();
+    assert_eq!(control.phase(), VoicePhase::Warmup);
+
+    let error = service.set_ab_bypass(true).unwrap_err();
+    assert!(
+        error.to_string().contains("正在预热"),
+        "预热未稳定时按住对比必须拒绝，实际 {error:#}"
+    );
+    let status = service.status();
+    assert!(!status.ab_bypassed);
+    assert!(!status.bypassed);
+    assert_eq!(status.phase, "warmup");
+    assert_eq!(control.phase(), VoicePhase::Warmup);
+}
+
+#[test]
+fn 切换预设与启停清除按住对比() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    service.set_enabled(true).unwrap();
+    service.set_ab_phase_for_test(VoicePhase::Wet);
+
+    service.set_ab_bypass(true).unwrap();
+    let status = service.select_preset("builtin:male").unwrap();
+    assert!(!status.ab_bypassed);
+    assert!(!status.bypassed);
+    assert_eq!(status.preset_id, "builtin:male");
+    assert_eq!(
+        control.phase(),
+        VoicePhase::Warmup,
+        "切换预设后应恢复湿声路径"
+    );
+
+    service.set_ab_bypass(true).unwrap();
+    let status = service.set_enabled(true).unwrap();
+    assert!(!status.ab_bypassed);
+    assert_eq!(control.phase(), VoicePhase::Warmup);
+
+    service.set_ab_bypass(true).unwrap();
+    let status = service.set_enabled(false).unwrap();
+    assert!(!status.ab_bypassed);
+    assert!(!status.enabled);
+
+    service.set_enabled(true).unwrap();
+    service.set_ab_bypass(true).unwrap();
+    let status = service.set_bypass(true).unwrap();
+    assert!(!status.ab_bypassed);
+    assert!(status.bypassed, "启停与旁路入口不能把按住对比留在运行态");
+}
+
+#[test]
+fn 无会话或未启用时按住对比返回明确错误() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+
+    let error = service.set_ab_bypass(true).unwrap_err();
+    assert!(
+        error.to_string().contains("音频未启动"),
+        "无会话时错误应说明音频未启动，实际 {error:#}"
+    );
+
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control);
+    let error = service.set_ab_bypass(true).unwrap_err();
+    assert!(
+        error.to_string().contains("变声未启用"),
+        "未启用时错误应说明变声未启用，实际 {error:#}"
+    );
+    assert!(!service.status().ab_bypassed);
+
+    let status = service.set_ab_bypass(false).unwrap();
+    assert!(!status.ab_bypassed, "释放路径不依赖控制句柄且必须幂等成功");
+}
+
+#[test]
+fn 会话重建清除按住对比() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control);
+    service.set_enabled(true).unwrap();
+    service.set_ab_phase_for_test(VoicePhase::Wet);
+    service.set_ab_bypass(true).unwrap();
+
+    let rebuilt = VoiceControl::new(VoiceParams::neutral());
+    service.attach(rebuilt.clone());
+    let status = service.status();
+    assert!(!status.ab_bypassed, "新会话不能继承按住对比");
+    assert!(!status.bypassed);
+    assert_eq!(rebuilt.phase(), VoicePhase::Warmup);
+
+    service.set_ab_bypass(true).unwrap();
+    service.detach();
+    let status = service.status();
+    assert!(!status.ab_bypassed, "会话释放必须清除按住对比");
+    assert!(!status.bypassed);
+    assert_eq!(status.phase, "off");
+    assert!(status.metrics.is_none());
+}
+
+#[test]
+fn 状态dto带性能指标() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    assert!(service.status().metrics.is_none(), "无控制句柄时没有指标");
+
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    let status = service.status();
+    let expected: VoiceMetricsDto = control.metrics_snapshot().into();
+    assert_eq!(status.metrics, Some(expected), "指标必须与快照转换一致");
+
+    service.detach();
+    assert!(service.status().metrics.is_none(), "会话释放后不再报告指标");
+}
+
+#[test]
+fn 指标浮点换算正确() {
+    let snapshot = VoiceMetricsSnapshot {
+        latency_frames: 960,
+        sample_rate: 48_000,
+        block_frames: 480,
+        process_ns_last: 12_345,
+        process_ns_max: 1_999_999,
+        overflow_frames: 7,
+        gap_frames: 9,
+    };
+    let dto: VoiceMetricsDto = snapshot.into();
+    assert_eq!(dto.latency_ms, 20.0);
+    assert_eq!(dto.block_ms, 10.0);
+    assert_eq!(dto.sample_rate, 48_000);
+    assert_eq!(dto.process_us_last, 12, "微秒向下取整");
+    assert_eq!(dto.process_us_max, 1_999);
+    assert_eq!(dto.overflow_frames, 7);
+    assert_eq!(dto.gap_frames, 9);
+
+    let zero_rate: VoiceMetricsDto = VoiceMetricsSnapshot {
+        latency_frames: 960,
+        block_frames: 480,
+        ..VoiceMetricsSnapshot::default()
+    }
+    .into();
+    assert_eq!(zero_rate.latency_ms, 0.0, "采样率未知时不换算毫秒");
+    assert_eq!(zero_rate.block_ms, 0.0);
+
+    let saturated: VoiceMetricsDto = VoiceMetricsSnapshot {
+        process_ns_last: u64::MAX,
+        process_ns_max: u64::MAX,
+        ..VoiceMetricsSnapshot::default()
+    }
+    .into();
+    assert_eq!(saturated.process_us_last, u32::MAX);
+    assert_eq!(saturated.process_us_max, u32::MAX);
+}
