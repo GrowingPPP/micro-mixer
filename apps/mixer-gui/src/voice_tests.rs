@@ -2229,6 +2229,170 @@ fn 会话重建清除按住对比() {
 }
 
 #[test]
+fn 试听开始后防御性释放不取消试听() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control);
+    service.set_enabled(true).unwrap();
+    service.set_ab_phase_for_test(VoicePhase::Wet);
+    service.set_ab_bypass(true).unwrap();
+
+    // preview_begin 已清除对比；随后到达的 keyup/失焦释放不能重放参数。
+    let generation = service.preview_begin();
+    service.preview_mark_recording(generation);
+    let operation = service.generation();
+
+    let status = service.set_ab_bypass(false).unwrap();
+    assert!(!status.ab_bypassed);
+    assert_eq!(status.preview.state, "recording");
+    assert_eq!(status.generation, operation, "无对比时释放不能推进代次");
+    assert!(service.preview_is_current(generation));
+    assert_eq!(service.generation(), operation);
+}
+
+#[test]
+fn 重复释放按住对比无副作用() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    service.set_enabled(true).unwrap();
+    let generation = service.generation();
+    let phase = control.phase();
+
+    for _ in 0..3 {
+        let status = service.set_ab_bypass(false).unwrap();
+        assert!(!status.ab_bypassed);
+        assert!(!status.bypassed);
+    }
+    assert_eq!(
+        service.generation(),
+        generation,
+        "释放已结束的对比不推进代次"
+    );
+    assert_eq!(control.phase(), phase);
+}
+
+#[test]
+fn 重复开始按住对比返回当前状态() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control);
+    service.set_enabled(true).unwrap();
+    service.set_ab_phase_for_test(VoicePhase::Wet);
+    let started = service.set_ab_bypass(true).unwrap();
+    let generation = started.generation;
+
+    // 第一次按住已把阶段切回原声，重复按下必须沿用当前对比状态。
+    service.set_ab_phase_for_test(VoicePhase::Off);
+    let repeated = service.set_ab_bypass(true).unwrap();
+    assert!(
+        repeated.ab_bypassed,
+        "重复按下必须保持对比，不因阶段已关闭而报错"
+    );
+    assert_eq!(repeated.generation, generation);
+}
+
+#[test]
+fn 试听不可用时允许开始按住对比() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control);
+    service.set_enabled(true).unwrap();
+    service.set_ab_phase_for_test(VoicePhase::Wet);
+    let generation = service.preview_begin();
+    service.preview_unavailable(generation, "试听失败");
+
+    let status = service.set_ab_bypass(true).unwrap();
+    assert!(status.ab_bypassed);
+    assert_eq!(status.preview.state, "unavailable");
+    assert_eq!(status.preview.reason.as_deref(), Some("试听失败"));
+}
+
+#[test]
+fn 另存预设清除按住对比() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    service.set_enabled(true).unwrap();
+    service.set_ab_phase_for_test(VoicePhase::Wet);
+    service.set_ab_bypass(true).unwrap();
+
+    let status = service.save_as_user_preset("按住对比另存").unwrap();
+    assert!(!status.ab_bypassed);
+    assert!(!status.bypassed);
+    assert!(status.preset_id.starts_with("user:"));
+    assert_eq!(status.phase, "warmup", "另存后应恢复湿声路径");
+    assert_eq!(control.phase(), VoicePhase::Warmup);
+    service.flush_saves();
+}
+
+#[test]
+fn 恢复草稿切换预设清除按住对比() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control.clone());
+    service.set_enabled(true).unwrap();
+    service
+        .set_params(VoiceParamsDto {
+            pitch_semitones: 7.0,
+            ..VoiceParamsDto::default()
+        })
+        .unwrap();
+    service.select_preset("builtin:male").unwrap();
+    service.set_ab_phase_for_test(VoicePhase::Wet);
+    service.set_ab_bypass(true).unwrap();
+    assert_eq!(service.status().preset_id, "builtin:male");
+
+    let status = service.restore_draft().unwrap();
+    assert!(!status.ab_bypassed);
+    assert!(!status.bypassed);
+    assert_eq!(status.preset_id, "builtin:female");
+    assert_eq!(status.params.pitch_semitones, 7.0);
+    assert_eq!(status.phase, "warmup", "切回源预设后应恢复湿声路径");
+    assert_eq!(control.phase(), VoicePhase::Warmup);
+}
+
+#[test]
+fn 会话重建清除对比时推进操作代次() {
+    let dir = TemporaryDir::new();
+    let service = service(&dir);
+    let control = VoiceControl::new(VoiceParams::neutral());
+    service.attach(control);
+    service.set_enabled(true).unwrap();
+    service.set_ab_phase_for_test(VoicePhase::Wet);
+    service.set_ab_bypass(true).unwrap();
+
+    let generation = service.generation();
+    service.attach(VoiceControl::new(VoiceParams::neutral()));
+    assert_eq!(service.generation(), generation + 1, "清除对比必须推进代次");
+    assert!(!service.status().ab_bypassed);
+
+    let generation = service.generation();
+    service.attach(VoiceControl::new(VoiceParams::neutral()));
+    assert_eq!(
+        service.generation(),
+        generation,
+        "未处于对比的重建不额外推进"
+    );
+
+    service.set_ab_phase_for_test(VoicePhase::Wet);
+    service.set_ab_bypass(true).unwrap();
+    let generation = service.generation();
+    service.detach();
+    assert_eq!(
+        service.generation(),
+        generation + 2,
+        "取消试听与清除对比各推进一次"
+    );
+}
+
+#[test]
 fn 状态dto带性能指标() {
     let dir = TemporaryDir::new();
     let service = service(&dir);

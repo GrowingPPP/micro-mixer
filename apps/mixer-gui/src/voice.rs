@@ -484,6 +484,24 @@ impl VoiceState {
     fn effective_bypassed(&self) -> bool {
         self.bypassed || self.ab_bypassed || self.paused()
     }
+
+    /// 清除按住对比并报告是否发生变化；运行态由调用方按需重放。
+    fn clear_ab_bypass(&mut self) -> bool {
+        let cleared = self.ab_bypassed;
+        self.ab_bypassed = false;
+        cleared
+    }
+}
+
+/// 试听占用运行路径的阶段；`Unavailable` 只是提示，不阻塞新的对比。
+#[cfg(feature = "voice")]
+fn preview_busy(preview: &VoicePreviewStatus) -> bool {
+    matches!(
+        preview,
+        VoicePreviewStatus::Preparing
+            | VoicePreviewStatus::Recording { .. }
+            | VoicePreviewStatus::Playing
+    )
 }
 
 /// A/B 开始时的阶段判定；生产路径读取控制句柄，测试可覆盖。
@@ -732,9 +750,8 @@ impl VoiceService {
         state.preview = VoicePreviewStatus::Preparing;
         state.preview_started = None;
         state.operation = state.operation.wrapping_add(1);
-        if state.ab_bypassed {
+        if state.clear_ab_bypass() {
             // 试听要听到变声后的声音，按住对比不能跨试听保留。
-            state.ab_bypassed = false;
             Self::apply_control(&state);
         }
         generation
@@ -962,7 +979,10 @@ impl VoiceService {
         if state.suspended == 0 {
             state.bypassed = false;
         }
-        state.ab_bypassed = false;
+        // 清除对比属于运行态变化；推进代次，旧轮询不能按同代次回显旁路。
+        if state.clear_ab_bypass() {
+            state.operation = state.operation.wrapping_add(1);
+        }
         state.control = Some(control.clone());
         control.set_params(state.params);
         if state.effective_enabled() {
@@ -983,7 +1003,10 @@ impl VoiceService {
         Self::cancel_preview(&self.shared.preview_epoch, &mut state);
         state.preview_control = None;
         state.control = None;
-        state.ab_bypassed = false;
+        // 释放会话也要让旧轮询看到新的代次，不能继续显示对比旁路。
+        if state.clear_ab_bypass() {
+            state.operation = state.operation.wrapping_add(1);
+        }
         if state.suspended == 0 {
             state.bypassed = false;
         }
@@ -1031,7 +1054,7 @@ impl VoiceService {
     fn apply_enabled(state: &mut VoiceState, enabled: bool) {
         state.enabled = enabled;
         state.bypassed = false;
-        state.ab_bypassed = false;
+        state.clear_ab_bypass();
         state.operation = state.operation.wrapping_add(1);
         Self::apply_control(state);
     }
@@ -1041,7 +1064,7 @@ impl VoiceService {
             let mut state = self.lock();
             Self::cancel_preview(&self.shared.preview_epoch, &mut state);
             state.bypassed = bypass;
-            state.ab_bypassed = false;
+            state.clear_ab_bypass();
             state.operation = state.operation.wrapping_add(1);
             Self::apply_control(&state);
         }
@@ -1050,28 +1073,26 @@ impl VoiceService {
 
     /// 按住对比原声：只叠加一层运行旁路，释放后回到原有启用状态。
     ///
-    /// 开始要求会话已发布、变声启用、用户未旁路/暂停、试听空闲且阶段稳定在湿声；
+    /// 开始要求会话已发布、变声启用、用户未旁路/暂停、试听未占用且阶段稳定在湿声；
     /// 不满足时返回明确原因。释放幂等且不依赖控制句柄，失焦与取消路径总能成功。
+    /// 未处于对比时释放不重放参数：那会取消音频侧已经开始的试听录制。
     pub(crate) fn set_ab_bypass(&self, active: bool) -> Result<VoiceStatusDto> {
         {
             let mut state = self.lock();
             if active {
-                anyhow::ensure!(state.control.is_some(), "音频未启动");
-                anyhow::ensure!(state.enabled, "变声未启用");
-                anyhow::ensure!(!state.bypassed, "当前已旁路");
-                anyhow::ensure!(!state.paused(), "音频暂停中");
-                anyhow::ensure!(
-                    matches!(state.preview, VoicePreviewStatus::Idle),
-                    "正在试听"
-                );
-                anyhow::ensure!(ab_start_phase(&state) == VoicePhase::Wet, "正在预热");
+                // 重复按下保持当前状态；第一次按住已经改变了运行阶段。
                 if !state.ab_bypassed {
+                    anyhow::ensure!(state.control.is_some(), "音频未启动");
+                    anyhow::ensure!(state.enabled, "变声未启用");
+                    anyhow::ensure!(!state.bypassed, "当前已旁路");
+                    anyhow::ensure!(!state.paused(), "音频暂停中");
+                    anyhow::ensure!(!preview_busy(&state.preview), "正在试听");
+                    anyhow::ensure!(ab_start_phase(&state) == VoicePhase::Wet, "正在预热");
                     state.ab_bypassed = true;
                     state.operation = state.operation.wrapping_add(1);
                     Self::apply_control(&state);
                 }
-            } else {
-                state.ab_bypassed = false;
+            } else if state.clear_ab_bypass() {
                 state.operation = state.operation.wrapping_add(1);
                 Self::apply_control(&state);
             }
@@ -1144,8 +1165,7 @@ impl VoiceService {
                 // 录制中的试听属于旧预设，必须立即取消，不能回放半段。
                 Self::cancel_preview(&self.shared.preview_epoch, &mut state);
                 // 按住对比绑定旧预设的运行路径，切换后不能继续保持旁路。
-                let ab_cleared = state.ab_bypassed;
-                state.ab_bypassed = false;
+                let ab_cleared = state.clear_ab_bypass();
                 if state.params != state.saved_params {
                     state.draft = Some(VoiceDraft {
                         source_preset_id: state.preset_id.clone(),
@@ -1193,10 +1213,14 @@ impl VoiceService {
                 preset_id: id.clone(),
                 saved_params: state.saved_params,
             });
+            let ab_cleared = state.clear_ab_bypass();
             state.preset_id = id;
             state.preset_name = name.to_owned();
             state.saved_params = params;
             state.operation = state.operation.wrapping_add(1);
+            if ab_cleared {
+                Self::apply_control(&state);
+            }
             self.queue_write(&mut state);
         }
         Ok(self.status())
@@ -1274,7 +1298,7 @@ impl VoiceService {
                 state.draft = None;
                 state.pending_save_rollback = None;
                 state.bypassed = false;
-                state.ab_bypassed = false;
+                state.clear_ab_bypass();
                 state.enabled = false;
                 let fallback = builtin_voice_presets()
                     .into_iter()
@@ -1320,8 +1344,13 @@ impl VoiceService {
                 });
             state.params = draft.params;
             state.operation = state.operation.wrapping_add(1);
+            let mut ab_cleared = false;
             if let Some(preset) = source {
                 let switched = state.preset_id != preset.id;
+                if switched {
+                    // 对比绑定旧预设的运行路径，切回源预设后不能继续保持旁路。
+                    ab_cleared = state.clear_ab_bypass();
+                }
                 state.preset_id = preset.id;
                 state.preset_name = preset.name;
                 state.saved_params = params_from_config(preset.params);
@@ -1330,7 +1359,9 @@ impl VoiceService {
                     self.queue_write(&mut state);
                 }
             }
-            if let Some(control) = &state.control {
+            if ab_cleared {
+                Self::apply_control(&state);
+            } else if let Some(control) = &state.control {
                 control.set_params(state.params);
             }
         }
