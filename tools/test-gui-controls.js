@@ -160,11 +160,11 @@ const voiceParams = (patch = {}) => ({
   ...patch,
 });
 const voiceSnapshot = (patch = {}) => ({
-  enabled: false, bypassed: false, phase: 'off',
+  enabled: false, bypassed: false, ab_bypassed: false, phase: 'off',
   preset_id: 'builtin:female', preset_name: '女声',
   modified: false, draft_available: false,
   params: voiceParams(), preview: { state: 'idle', elapsed_ms: 0, reason: null },
-  save_error: null, generation: 1,
+  metrics: null, save_error: null, generation: 1,
   ...patch,
 });
 const voicePresetList = [
@@ -199,9 +199,14 @@ async function boot({ running = false, initialLoop, onInvoke, now, dark = false,
   let nextOperation = 1;
   const themeStorage = new Map(storedTheme === undefined ? [] : [['mixer.ui.theme', storedTheme]]);
   const mediaListeners = [];
+  const windowListeners = new Map();
   const themeMedia = { matches: dark, addEventListener(type, listener) { if (type === 'change') mediaListeners.push(listener); } };
   const window = {
-    addEventListener() {}, innerWidth: 920, innerHeight: 660,
+    addEventListener(type, listener) {
+      if (!windowListeners.has(type)) windowListeners.set(type, []);
+      windowListeners.get(type).push(listener);
+    },
+    innerWidth: 920, innerHeight: 660,
     matchMedia() { return themeMedia; },
     localStorage: {
       getItem(key) { if (storageFailure === 'read') throw new Error('storage unavailable'); return themeStorage.get(key) ?? null; },
@@ -265,6 +270,11 @@ async function boot({ running = false, initialLoop, onInvoke, now, dark = false,
         if (timer.delay > milliseconds || !timers.has(id)) continue;
         timers.delete(id); timer.callback();
       }
+      await flush();
+    },
+    async emitWindow(type, details = {}) {
+      const event = { type, target: window, stopPropagation() {}, preventDefault() {}, ...details };
+      await Promise.all((windowListeners.get(type) || []).map(listener => listener(event)));
       await flush();
     },
   };
@@ -2751,4 +2761,347 @@ test('试听启动失败显示具体原因并保留重试入口', async () => {
   assert.equal(button.textContent, '试听 3 秒');
   assert.match(hint.textContent, /试听输出失败/);
   assert.match(button.title, /试听输出失败/);
+});
+
+// ── 人声性能指标与按住对比 ───────────────────────────────────
+
+const voiceMetrics = (patch = {}) => ({
+  latency_ms: 22, block_ms: 10, sample_rate: 48000,
+  process_us_last: 50, process_us_max: 120,
+  overflow_frames: 0, gap_frames: 0,
+  ...patch,
+});
+const abArgs = app => app.calls.filter(call => call.command === 'voice_set_ab_bypass')
+  .map(call => call.args);
+
+async function bootAb(patch = {}) {
+  let generation = 1;
+  const snapshot = (extra = {}) => voiceSnapshot({
+    enabled: true, phase: 'wet', ...patch, ...extra,
+  });
+  return boot({ running: true, onInvoke(command, args) {
+    if (command === 'voice_set_ab_bypass') {
+      const active = args.active === true;
+      return snapshot({ bypassed: active, ab_bypassed: active, generation: ++generation });
+    }
+    if (command === 'voice_status') return snapshot();
+    if (command === 'voice_presets') return voicePresetList;
+    if (command === 'status') return playbackStatus({ voice: snapshot() });
+  } });
+}
+
+test('人声面板显示延迟与处理耗时', async () => {
+  const snapshot = voiceSnapshot({ enabled: true, phase: 'wet', metrics: voiceMetrics() });
+  const app = await boot({ running: true, onInvoke(command) {
+    if (command === 'voice_status') return snapshot;
+    if (command === 'status') return playbackStatus({ voice: snapshot });
+    return voiceFixture(command);
+  } });
+  const line = app.document.getElementById('voiceMetrics');
+  assert.ok(line, '人声面板应有性能行');
+  assert.equal(line.getAttribute('aria-live'), 'off');
+  assert.equal(line.textContent,
+    '延迟 22.0 ms · 块 10.0 ms · 处理 0.05 / 0.12 ms · 溢出 0 · 缺帧 0');
+  const dialog = line.closest('.voice-dialog');
+  const presetSection = app.document.getElementById('voicePresetNote').closest('.settings-section');
+  const footer = app.document.getElementById('voiceDone').closest('.dialog-footer');
+  assert.ok(dialog, '性能行应位于人声面板');
+  assert.ok(dialog.children.indexOf(presetSection) < dialog.children.indexOf(line),
+    '性能行应排在预设区之后');
+  assert.ok(dialog.children.indexOf(line) < dialog.children.indexOf(footer),
+    '性能行应排在底部按钮之前');
+  const ab = app.document.getElementById('voiceAbBypass');
+  assert.equal(ab.textContent, '按住听原声');
+  assert.equal(ab.classList.contains('ghost'), true);
+  assert.equal(ab.parentElement, app.document.getElementById('voicePreview').parentElement,
+    '按住按钮应与试听、编辑并排');
+  const css = fs.readFileSync(path.join(root, 'style.css'), 'utf8');
+  assert.match(css, /\.voice-metrics\s*\{[^}]*overflow-wrap:\s*anywhere/s,
+    '性能行应允许换行，避免窄窗口横向滚动');
+});
+
+test('按住听原声发送开始与释放命令', async () => {
+  const app = await bootAb();
+  const ab = app.document.getElementById('voiceAbBypass');
+  const preview = app.document.getElementById('voicePreview');
+  assert.equal(ab.disabled, false, '会话就绪且为湿声时应可按住');
+  assert.equal(ab.getAttribute('aria-pressed'), 'false');
+  await ab.emit('pointerdown', { pointerId: 7, button: 0 });
+  assert.equal(ab.getAttribute('aria-pressed'), 'true');
+  assert.equal(ab.classList.contains('active'), true);
+  assert.equal(preview.disabled, true, '按住对比期间试听必须禁用');
+  assert.match(app.document.getElementById('voiceState').textContent, /对比原声/);
+  await flush();
+  assert.deepEqual(abArgs(app), [{ active: true }]);
+  await ab.emit('pointerup', { pointerId: 7, button: 0 });
+  assert.equal(ab.getAttribute('aria-pressed'), 'false');
+  assert.equal(ab.classList.contains('active'), false);
+  await flush();
+  assert.deepEqual(abArgs(app), [{ active: true }, { active: false }]);
+  assert.equal(preview.disabled, false, '释放后试听按钮恢复');
+  assert.match(app.document.getElementById('voiceState').textContent, /已启用/);
+  await ab.emit('lostpointercapture', { pointerId: 7 });
+  await flush();
+  assert.equal(abArgs(app).length, 2, '释放后的指针捕获丢失不能重复发送');
+});
+
+test('指针取消会释放对比', async () => {
+  const app = await bootAb();
+  const ab = app.document.getElementById('voiceAbBypass');
+  await ab.emit('pointerdown', { pointerId: 3 });
+  await flush();
+  await ab.emit('pointercancel', { pointerId: 3 });
+  await flush();
+  assert.deepEqual(abArgs(app), [{ active: true }, { active: false }]);
+  assert.equal(ab.getAttribute('aria-pressed'), 'false');
+
+  await ab.emit('pointerdown', { pointerId: 4 });
+  await flush();
+  await ab.emit('lostpointercapture', { pointerId: 4 });
+  await flush();
+  assert.deepEqual(abArgs(app), [
+    { active: true }, { active: false }, { active: true }, { active: false },
+  ], '丢失指针捕获也要释放');
+});
+
+test('窗口失焦与页面隐藏会释放对比', async () => {
+  const app = await bootAb();
+  const ab = app.document.getElementById('voiceAbBypass');
+  await ab.emit('pointerdown', { pointerId: 1 });
+  await flush();
+  await app.emitWindow('blur');
+  assert.deepEqual(abArgs(app), [{ active: true }, { active: false }], '窗口失焦应释放');
+  assert.equal(ab.getAttribute('aria-pressed'), 'false');
+
+  await ab.emit('pointerdown', { pointerId: 2 });
+  await flush();
+  app.document.visibilityState = 'hidden';
+  await app.document.emit('visibilitychange');
+  assert.deepEqual(abArgs(app).at(-1), { active: false }, '页面隐藏应释放');
+  assert.equal(ab.getAttribute('aria-pressed'), 'false');
+  app.document.visibilityState = 'visible';
+});
+
+test('试听中与预热中按钮禁用并显示原因', async () => {
+  const recording = voiceSnapshot({ enabled: true, phase: 'wet',
+    preview: { state: 'recording', elapsed_ms: 1200, reason: null } });
+  const previewApp = await boot({ running: true, onInvoke(command) {
+    if (command === 'voice_status') return recording;
+    if (command === 'status') return playbackStatus({ voice: recording });
+    return voiceFixture(command);
+  } });
+  const previewButton = previewApp.document.getElementById('voiceAbBypass');
+  assert.equal(previewButton.disabled, true);
+  assert.equal(previewButton.title, '正在试听');
+  await previewButton.emit('pointerdown', { pointerId: 1 });
+  await flush();
+  assert.equal(abArgs(previewApp).length, 0, '禁用时不能发送开始命令');
+
+  const warmup = voiceSnapshot({ enabled: true, phase: 'warmup' });
+  const warmupApp = await boot({ running: true, onInvoke(command) {
+    if (command === 'voice_status') return warmup;
+    if (command === 'status') return playbackStatus({ voice: warmup });
+    return voiceFixture(command);
+  } });
+  const warmupButton = warmupApp.document.getElementById('voiceAbBypass');
+  assert.equal(warmupButton.disabled, true);
+  assert.equal(warmupButton.title, '正在预热');
+});
+
+test('用户旁路时按钮禁用', async () => {
+  const snapshot = voiceSnapshot({ enabled: true, bypassed: true, phase: 'wet' });
+  const app = await boot({ running: true, onInvoke(command) {
+    if (command === 'voice_status') return snapshot;
+    if (command === 'status') return playbackStatus({ voice: snapshot });
+    return voiceFixture(command);
+  } });
+  const ab = app.document.getElementById('voiceAbBypass');
+  assert.equal(ab.disabled, true);
+  assert.equal(ab.title, '当前已临时旁路');
+  await ab.emit('pointerdown', { pointerId: 1 });
+  await flush();
+  assert.equal(abArgs(app).length, 0, '用户旁路不能被按住对比覆盖');
+  assert.match(app.document.getElementById('voiceState').textContent, /临时旁路/);
+  assert.equal(ab.getAttribute('aria-pressed'), 'false');
+});
+
+test('按住对比不触发配置保存', async () => {
+  const app = await bootAb();
+  const ab = app.document.getElementById('voiceAbBypass');
+  await ab.emit('pointerdown', { pointerId: 1 });
+  await flush();
+  await ab.emit('pointerup', { pointerId: 1 });
+  await flush();
+  assert.equal(app.calls.filter(call => call.command === 'save_config').length, 0,
+    '按住对比不能写配置');
+  assert.equal(app.calls.some(call => call.command === 'voice_set_enabled'), false,
+    '按住对比不能改动启用开关');
+  assert.deepEqual(abArgs(app), [{ active: true }, { active: false }]);
+});
+
+test('指标文本变化不重建面板', async () => {
+  let snapshot = voiceSnapshot({ enabled: true, phase: 'wet', metrics: voiceMetrics() });
+  const app = await boot({ running: true, onInvoke(command) {
+    if (command === 'voice_status') return snapshot;
+    if (command === 'status') return playbackStatus({ voice: snapshot });
+    return voiceFixture(command);
+  } });
+  await app.document.getElementById('voiceEdit').emit('click');
+  const line = app.document.getElementById('voiceMetrics');
+  const preview = app.document.getElementById('voicePreview');
+  const pitch = app.document.getElementById('pitch');
+  const ab = app.document.getElementById('voiceAbBypass');
+  const before = line.textContent;
+
+  snapshot = voiceSnapshot({ enabled: true, phase: 'wet', generation: 1,
+    metrics: voiceMetrics({ process_us_last: 80, process_us_max: 240,
+      overflow_frames: 3, gap_frames: 5 }) });
+  await app.pollStatus();
+
+  assert.notEqual(line.textContent, before, '同代次指标变化也必须刷新');
+  assert.match(line.textContent, /处理 0\.08 \/ 0\.24 ms/);
+  assert.match(line.textContent, /溢出 3/);
+  assert.match(line.textContent, /缺帧 5/);
+  assert.equal(app.document.getElementById('voiceMetrics'), line, '性能行节点保持');
+  assert.equal(app.document.getElementById('voicePreview'), preview, '按钮节点保持');
+  assert.equal(app.document.getElementById('pitch'), pitch, '滑杆节点保持');
+  assert.equal(app.document.getElementById('voiceAbBypass'), ab, '按住按钮节点保持');
+});
+
+test('无 metrics 时显示占位符', async () => {
+  const app = await boot({ running: true, onInvoke(command) {
+    const snapshot = voiceSnapshot({ enabled: true, phase: 'wet' });
+    if (command === 'voice_status') return snapshot;
+    if (command === 'status') return playbackStatus({ voice: snapshot });
+    return voiceFixture(command);
+  } });
+  const line = app.document.getElementById('voiceMetrics');
+  assert.equal(line.textContent, '—');
+  assert.equal(line.textContent.includes('0 ms'), false, '没有指标时不能伪造 0');
+
+  const zeroRate = voiceSnapshot({ enabled: true, phase: 'wet',
+    metrics: voiceMetrics({ sample_rate: 0, latency_ms: 0, block_ms: 0 }) });
+  const zeroApp = await boot({ running: true, onInvoke(command) {
+    if (command === 'voice_status') return zeroRate;
+    if (command === 'status') return playbackStatus({ voice: zeroRate });
+    return voiceFixture(command);
+  } });
+  assert.equal(zeroApp.document.getElementById('voiceMetrics').textContent, '—',
+    '采样率未知时同样显示占位符');
+});
+
+test('键盘空格与回车也能按住对比', async () => {
+  const app = await bootAb();
+  const ab = app.document.getElementById('voiceAbBypass');
+  await ab.emit('keydown', { key: ' ' });
+  await flush();
+  assert.equal(ab.getAttribute('aria-pressed'), 'true');
+  assert.deepEqual(abArgs(app).at(-1), { active: true });
+  await ab.emit('keyup', { key: ' ' });
+  await flush();
+  assert.deepEqual(abArgs(app).at(-1), { active: false });
+
+  await ab.emit('keydown', { key: 'Enter' });
+  await flush();
+  assert.deepEqual(abArgs(app).at(-1), { active: true });
+  await ab.emit('keyup', { key: 'Enter' });
+  await flush();
+  assert.deepEqual(abArgs(app), [
+    { active: true }, { active: false }, { active: true }, { active: false },
+  ]);
+});
+
+test('关闭人声面板会释放对比', async () => {
+  const app = await bootAb();
+  await app.document.getElementById('voiceEdit').emit('click');
+  const ab = app.document.getElementById('voiceAbBypass');
+  await ab.emit('pointerdown', { pointerId: 5 });
+  await flush();
+  await app.document.getElementById('voiceClose').emit('click');
+  await flush();
+  assert.deepEqual(abArgs(app), [{ active: true }, { active: false }]);
+  assert.equal(ab.getAttribute('aria-pressed'), 'false');
+});
+
+test('按住对比时切换预设与启用使用用户的新值', async () => {
+  const app = await bootAb();
+  const ab = app.document.getElementById('voiceAbBypass');
+  const preset = app.document.getElementById('voicePreset');
+  const enabled = app.document.getElementById('voiceEnabled');
+
+  await ab.emit('pointerdown', { pointerId: 6 });
+  await flush();
+  preset.value = 'builtin:male';
+  await preset.emit('change');
+  await flush();
+  assert.deepEqual(app.calls.filter(call => call.command === 'voice_select_preset')
+    .map(call => call.args), [{ id: 'builtin:male' }],
+  '释放对比不能把用户选择的预设改回旧值');
+  assert.equal(preset.value, 'builtin:male');
+
+  await ab.emit('pointerdown', { pointerId: 7 });
+  await flush();
+  enabled.checked = false;
+  await enabled.emit('change');
+  await flush();
+  assert.deepEqual(app.calls.filter(call => call.command === 'voice_set_enabled')
+    .map(call => call.args), [{ enabled: false }],
+  '释放对比不能把用户的启用开关改回旧值');
+  assert.equal(enabled.checked, false);
+});
+
+const watchTextWrites = element => {
+  let value = element.textContent;
+  let writes = 0;
+  Object.defineProperty(element, 'textContent', {
+    configurable: true,
+    get() { return value; },
+    set(next) { writes++; value = String(next); },
+  });
+  return () => writes;
+};
+
+test('指标刷新不重写面板与读屏文本', async () => {
+  let snapshot = voiceSnapshot({ enabled: true, phase: 'wet', metrics: voiceMetrics() });
+  const app = await boot({ running: true, onInvoke(command) {
+    if (command === 'voice_status') return snapshot;
+    if (command === 'status') return playbackStatus({ voice: snapshot });
+    return voiceFixture(command);
+  } });
+  await app.document.getElementById('voiceEdit').emit('click');
+  const previewHint = app.document.getElementById('previewHint');
+  const saveState = app.document.getElementById('voiceSaveState');
+  const pitchOut = app.document.getElementById('pitchOut');
+  const metrics = app.document.getElementById('voiceMetrics');
+  const previewWrites = watchTextWrites(previewHint);
+  const saveWrites = watchTextWrites(saveState);
+  const pitchWrites = watchTextWrites(pitchOut);
+  const metricWrites = watchTextWrites(metrics);
+
+  snapshot = voiceSnapshot({ enabled: true, phase: 'wet', generation: 1,
+    metrics: voiceMetrics({ process_us_last: 90 }) });
+  await app.pollStatus();
+  assert.match(metrics.textContent, /处理 0\.09/);
+  assert.equal(metricWrites(), 1, '性能行只更新一次文本');
+  assert.equal(previewWrites(), 0, '指标变化不能重写试听提示');
+  assert.equal(saveWrites(), 0, '指标变化不能重写保存提示');
+  assert.equal(pitchWrites(), 0, '指标变化不能重建滑杆数值');
+
+  await app.pollStatus();
+  assert.equal(metricWrites(), 1, '指标未变化时不重复写文本');
+
+  snapshot = voiceSnapshot({ enabled: true, phase: 'wet', generation: 1,
+    preview: { state: 'recording', elapsed_ms: 1000, reason: null },
+    metrics: voiceMetrics({ process_us_last: 90 }) });
+  await app.pollStatus();
+  const hintWritesAtStart = previewWrites();
+  assert.equal(hintWritesAtStart, 1, '试听状态真实变化时才更新提示');
+  assert.equal(saveWrites(), 0, '状态轮询不能重写隐藏的保存提示');
+
+  snapshot = voiceSnapshot({ enabled: true, phase: 'wet', generation: 1,
+    preview: { state: 'recording', elapsed_ms: 2000, reason: null },
+    metrics: voiceMetrics({ process_us_last: 90 }) });
+  await app.pollStatus();
+  assert.equal(previewWrites(), hintWritesAtStart, '进度变化不重写相同的读屏提示');
+  assert.equal(saveWrites(), 0);
 });

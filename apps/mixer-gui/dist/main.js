@@ -64,6 +64,7 @@ const el = {
   calibPanel: $('calibPanel'),
   voiceState: $('voiceState'), voiceEnabled: $('voiceEnabled'),
   voicePreset: $('voicePreset'), bypassBadge: $('bypassBadge'), voicePreview: $('voicePreview'),
+  voiceAbBypass: $('voiceAbBypass'), voiceMetrics: $('voiceMetrics'),
   voiceEdit: $('voiceEdit'), previewHint: $('previewHint'), voiceStatus: $('voiceStatus'),
   voiceOverlay: $('voiceOverlay'), voiceClose: $('voiceClose'), voiceDone: $('voiceDone'),
   voiceCurrentPreset: $('voiceCurrentPreset'), dirtyBadge: $('dirtyBadge'),
@@ -126,6 +127,8 @@ function showModal(overlay, focus) {
 }
 function closeModal() {
   if (!activeModal) return;
+  // 关闭人声面板时收起按住对比，避免面板关闭后仍停在原声路径。
+  if (activeModal === el.voiceOverlay) endVoiceAbBypass();
   activeModal.classList.add('hidden');
   ++modalGeneration;
   activeModal = null;
@@ -194,13 +197,17 @@ function neutralVoiceParams() {
   };
 }
 const voiceState = {
-  loaded: false, enabled: false, bypassed: false,
-  presetId: '', presetName: '', modified: false,
+  loaded: false, enabled: false, bypassed: false, abBypassed: false,
+  phase: 'off', presetId: '', presetName: '', modified: false,
   draftAvailable: false, saveError: null,
   // 试听状态由宿主快照提供；录制进度随 250 ms 轮询更新。
   previewState: 'idle', previewElapsedMs: 0, previewReason: '',
+  // 指标随轮询刷新；没有控制句柄时为 null，界面显示占位符。
+  metrics: null,
   params: neutralVoiceParams(),
 };
+// 本地按住状态；命令串行执行期间即使快照迟到也能正确收尾。
+let voiceAbHeld = false;
 // 参数值直接对应 VoiceParams，开关不用哨兵值表达关闭。
 const VOICE_PARAM_CONTROLS = [
   { input: 'pitch', out: 'pitchOut', key: 'pitch_semitones', format: formatSemitone },
@@ -225,7 +232,7 @@ let voicePresets = [];
 let voicePresetLoadVersion = 0;
 let voiceAppliedGeneration = -1;
 let voiceEditVersion = 0;
-const voicePending = { enabled: 0, preset: 0, params: 0, draft: 0, preview: 0 };
+const voicePending = { enabled: 0, preset: 0, params: 0, draft: 0, preview: 0, ab: 0 };
 let voiceLocalParams = new Set();
 let voiceParamTimer = null;
 let voiceNameMode = '';
@@ -437,6 +444,7 @@ function hotkeyList() {
 // ─────────────────────────────── 启停
 
 async function start() {
+  endVoiceAbBypass();
   const choice = newAudioChoice();
   let opened = false;
   if (!state.items.length) {
@@ -532,6 +540,7 @@ async function start() {
 }
 
 async function stop() {
+  endVoiceAbBypass();
   const choice = newAudioChoice();
   el.btnToggle.disabled = true;
   try {
@@ -778,14 +787,150 @@ function syncVoicePreview() {
   // 只有“音频未启动”和“本机试听占用中”属于不可重试的禁用态；
   // 输出失败、记录为空等原因保留按钮，用户可直接重试。
   const hardUnavailable = reason === '音频未启动' || reason === '本机试听占用中';
-  el.voicePreview.disabled = !active && hardUnavailable;
-  el.voicePreview.title = reason
-    || (active ? '点击取消本次试听' : '录制 3 秒后本机回放，不送给对方');
-  el.previewHint.textContent = reason
+  // 按住对比期间必须先松开，避免同一个声音路径同时占用两个入口。
+  el.voicePreview.disabled = voiceState.abBypassed || (!active && hardUnavailable);
+  el.voicePreview.title = voiceState.abBypassed ? '松开「按住听原声」后可试听'
+    : reason || (active ? '点击取消本次试听' : '录制 3 秒后本机回放，不送给对方');
+  const hintText = reason
     || (preview === 'recording' ? '正在录制 3 秒人声，只在本机回放。'
       : preview === 'playing' ? '回放只在本机，不送给对方。'
       : '试听只在本机回放，不送给对方。');
+  // 轮询也会调用这里；只有提示真的变化时才写读屏区域。
+  if (el.previewHint.textContent !== hintText) el.previewHint.textContent = hintText;
 }
+
+/// 指标文本只在变化时写入，避免 250 ms 轮询造成读屏播报和布局抖动。
+function renderVoiceMetrics() {
+  const text = formatVoiceMetrics(voiceState.metrics);
+  if (el.voiceMetrics.textContent !== text) el.voiceMetrics.textContent = text;
+}
+
+function formatVoiceMetrics(metrics) {
+  // 采样率为 0 表示还没有可用的音频会话，不能把换算失败显示成 0 ms。
+  if (!metrics || !metrics.sampleRate) return '—';
+  const fixed = (value, digits) => (Number.isFinite(value) ? value : 0).toFixed(digits);
+  const count = value => String(Math.max(0, Math.trunc(Number.isFinite(value) ? value : 0)));
+  return `延迟 ${fixed(metrics.latencyMs, 1)} ms · 块 ${fixed(metrics.blockMs, 1)} ms · ` +
+    `处理 ${fixed(metrics.processUsLast / 1000, 2)} / ${fixed(metrics.processUsMax / 1000, 2)} ms · ` +
+    `溢出 ${count(metrics.overflowFrames)} · 缺帧 ${count(metrics.gapFrames)}`;
+}
+
+function voiceMetricsFrom(snapshot) {
+  const raw = snapshot && typeof snapshot.metrics === 'object' ? snapshot.metrics : null;
+  if (!raw) return null;
+  const number = value => Number.isFinite(+value) ? +value : 0;
+  return {
+    latencyMs: number(raw.latency_ms),
+    blockMs: number(raw.block_ms),
+    sampleRate: number(raw.sample_rate),
+    processUsLast: number(raw.process_us_last),
+    processUsMax: number(raw.process_us_max),
+    overflowFrames: number(raw.overflow_frames),
+    gapFrames: number(raw.gap_frames),
+  };
+}
+
+function voiceMetricsEqual(a, b) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  return a.latencyMs === b.latencyMs && a.blockMs === b.blockMs
+    && a.sampleRate === b.sampleRate
+    && a.processUsLast === b.processUsLast && a.processUsMax === b.processUsMax
+    && a.overflowFrames === b.overflowFrames && a.gapFrames === b.gapFrames;
+}
+
+/// 按住对比只在湿声稳态可用；用户旁路与试听占用都必须让出入口。
+function voiceAbBypassReason() {
+  if (!(state.running || state.standby)) return '音频未启动';
+  if (!voiceState.enabled) return '变声未启用';
+  if (voiceState.bypassed && !voiceState.abBypassed) return '当前已临时旁路';
+  if (voiceState.previewState !== 'idle' && voiceState.previewState !== 'unavailable') {
+    return '正在试听';
+  }
+  if (voiceState.phase !== 'wet') return '正在预热';
+  return '';
+}
+
+function syncVoiceAbBypass() {
+  const held = voiceState.abBypassed;
+  // 已经按住时必须保持可释放；此时有效旁路来自对比本身，不是用户旁路。
+  const reason = held ? '' : voiceAbBypassReason();
+  el.voiceAbBypass.disabled = !held && !!reason;
+  el.voiceAbBypass.classList.toggle('active', held);
+  el.voiceAbBypass.setAttribute('aria-pressed', held ? 'true' : 'false');
+  el.voiceAbBypass.title = reason
+    || (held ? '松开恢复变声' : '按住时临时听原声，松开恢复变声');
+}
+
+/// 开始与结束都走同一条变声命令队列，避免快速按住/松开时顺序颠倒。
+function beginVoiceAbBypass() {
+  if (voiceAbHeld || el.voiceAbBypass.disabled) return;
+  voiceAbHeld = true;
+  voiceState.abBypassed = true;
+  renderVoice();
+  runVoiceCommand('ab', markVoicePending('ab'), 'voice_set_ab_bypass',
+    { active: true }, '开始按住对比失败');
+}
+
+function endVoiceAbBypass() {
+  if (!voiceAbHeld && !voiceState.abBypassed) return;
+  voiceAbHeld = false;
+  voiceState.abBypassed = false;
+  renderVoice();
+  runVoiceCommand('ab', markVoicePending('ab'), 'voice_set_ab_bypass',
+    { active: false }, '结束按住对比失败');
+}
+
+// 指针捕获不可用时，按钮自身的 pointerdown/up 仍可完成一次按住对比。
+function captureVoiceAbPointer(event) {
+  const pointerId = event?.pointerId;
+  if (typeof el.voiceAbBypass.setPointerCapture !== 'function' || pointerId == null) return;
+  try {
+    el.voiceAbBypass.setPointerCapture(pointerId);
+  } catch (_) { /* 捕获失败不影响按住与松开 */ }
+}
+
+function releaseVoiceAbPointer(event) {
+  const pointerId = event?.pointerId;
+  if (typeof el.voiceAbBypass.releasePointerCapture !== 'function' || pointerId == null) return;
+  try {
+    el.voiceAbBypass.releasePointerCapture(pointerId);
+  } catch (_) { /* 捕获已丢失时释放会抛错，忽略即可 */ }
+}
+
+el.voiceAbBypass.addEventListener('pointerdown', event => {
+  if (event.button != null && event.button !== 0) return;
+  captureVoiceAbPointer(event);
+  beginVoiceAbBypass();
+});
+for (const type of ['pointerup', 'pointercancel']) {
+  el.voiceAbBypass.addEventListener(type, event => {
+    releaseVoiceAbPointer(event);
+    endVoiceAbBypass();
+  });
+}
+el.voiceAbBypass.addEventListener('lostpointercapture', () => endVoiceAbBypass());
+el.voiceAbBypass.addEventListener('keydown', event => {
+  if (event.key !== ' ' && event.key !== 'Enter') return;
+  if (event.repeat) return;
+  event.preventDefault();
+  beginVoiceAbBypass();
+});
+el.voiceAbBypass.addEventListener('keyup', event => {
+  if (event.key !== ' ' && event.key !== 'Enter') return;
+  event.preventDefault();
+  endVoiceAbBypass();
+});
+// 兜底收尾：指针在按钮外松开、键盘焦点移走或窗口失去焦点都不能停在原声路径。
+document.addEventListener('pointerup', () => endVoiceAbBypass());
+document.addEventListener('pointercancel', () => endVoiceAbBypass());
+document.addEventListener('keyup', event => {
+  if (event.key === ' ' || event.key === 'Enter') endVoiceAbBypass();
+});
+window.addEventListener('blur', () => endVoiceAbBypass());
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden === true || document.visibilityState === 'hidden') endVoiceAbBypass();
+});
 
 function previewSnapshotFrom(snapshot) {
   const preview = snapshot && typeof snapshot.preview === 'object' ? snapshot.preview : {};
@@ -829,6 +974,7 @@ function renderVoicePresets() {
 
 function renderVoicePanel() {
   const params = voiceState.params;
+  el.modalBypassBadge.textContent = voiceState.abBypassed ? '对比原声' : '临时旁路';
   el.modalBypassBadge.classList.toggle('hidden', !voiceState.bypassed);
   el.voiceCurrentPreset.textContent = voiceState.presetName || '未读取';
   for (const control of VOICE_SWITCH_CONTROLS) {
@@ -848,12 +994,17 @@ function renderVoicePanel() {
     ? '用户预设可直接保存修改；未保存的修改只在本次运行有效。'
     : '内置预设只读。修改后可另存为用户预设；当前修改只在本次运行有效。';
   el.voiceSaveState.classList.toggle('hidden', !voiceState.saveError);
-  el.voiceSaveState.textContent = voiceState.saveError ? `未保存：${voiceState.saveError}` : '';
+  const saveStateText = voiceState.saveError ? `未保存：${voiceState.saveError}` : '';
+  // 避免每次轮询都重写隐藏的 role=status 文本。
+  if (el.voiceSaveState.textContent !== saveStateText) el.voiceSaveState.textContent = saveStateText;
 }
 
 function renderVoice() {
   const name = voiceState.presetName || '未读取';
-  const stateText = voiceState.bypassed ? '临时旁路'
+  // 按住对比时宿主也会报告有效旁路，界面优先说明这是用户主动的原声对比。
+  const bypassText = voiceState.abBypassed ? '对比原声' : '临时旁路';
+  const stateText = voiceState.abBypassed ? '对比原声'
+    : voiceState.bypassed ? '临时旁路'
     : voiceState.enabled ? '已启用' : '已关闭';
   el.voiceState.textContent = voiceState.loaded ? `${name} · ${stateText}` : '未读取';
   el.voiceStatus.textContent = voiceState.loaded ? `人声效果：${name} · ${stateText}` : '人声效果';
@@ -863,9 +1014,12 @@ function renderVoice() {
     ensureVoicePresetOption(voiceState.presetId, voiceState.presetName);
     el.voicePreset.value = voiceState.presetId;
   }
+  el.bypassBadge.textContent = bypassText;
   el.bypassBadge.classList.toggle('hidden', !voiceState.bypassed);
+  renderVoiceMetrics();
   if (activeModal === el.voiceOverlay) renderVoicePanel();
   syncVoicePreview();
+  syncVoiceAbBypass();
 }
 
 function voiceSaveErrorFrom(snapshot) {
@@ -885,13 +1039,27 @@ function applyVoiceSnapshot(snapshot, { fromPoll = false, requestVersion = null 
   const saveError = voiceSaveErrorFrom(snapshot);
   const draftAvailable = snapshot.draft_available === true;
   const preview = previewSnapshotFrom(snapshot);
-  // 同一代次下只有保存结果、草稿标记与试听进度可能变化；其余字段相同则跳过重绘。
-  if (fromPoll && !voicePending.enabled && !presetPending && !paramsPending
-      && Number.isFinite(generation) && generation === voiceAppliedGeneration
-      && saveError === voiceState.saveError && draftAvailable === voiceState.draftAvailable
-      && preview.state === voiceState.previewState
-      && preview.elapsedMs === voiceState.previewElapsedMs
-      && preview.reason === voiceState.previewReason) {
+  const metrics = voiceMetricsFrom(snapshot);
+  const phase = typeof snapshot.phase === 'string' ? snapshot.phase : 'off';
+  const abBypassed = snapshot.ab_bypassed === true;
+  // 同一代次下保存结果、草稿标记、试听进度与指标仍可能变化；
+  // 指标逐字段比较，否则性能行会停在旧数值。
+  const metricsEqual = voiceMetricsEqual(metrics, voiceState.metrics);
+  const sameGenerationState = fromPoll
+    && !voicePending.enabled && !presetPending && !paramsPending
+    && Number.isFinite(generation) && generation === voiceAppliedGeneration
+    && saveError === voiceState.saveError && draftAvailable === voiceState.draftAvailable
+    && preview.state === voiceState.previewState
+    && preview.elapsedMs === voiceState.previewElapsedMs
+    && preview.reason === voiceState.previewReason
+    && phase === voiceState.phase
+    && abBypassed === voiceState.abBypassed;
+  if (sameGenerationState && metricsEqual) return;
+  if (sameGenerationState) {
+    // 指标每 250 ms 都可能变化，但其余状态没有变化：
+    // 只刷新性能行，避免重写整面板和 role=status 提示。
+    voiceState.metrics = metrics;
+    renderVoiceMetrics();
     return;
   }
   voiceState.loaded = true;
@@ -912,7 +1080,13 @@ function applyVoiceSnapshot(snapshot, { fromPoll = false, requestVersion = null 
   }
   voiceState.draftAvailable = draftAvailable;
   voiceState.saveError = saveError;
-  voiceState.bypassed = snapshot.bypassed === true;
+  // 按住/松开命令在途时保留本地意图，避免迟到的轮询把按钮闪回禁用态。
+  if (!voicePending.ab) {
+    voiceState.bypassed = snapshot.bypassed === true;
+    voiceState.abBypassed = abBypassed;
+  }
+  voiceState.phase = phase;
+  voiceState.metrics = metrics;
   voiceState.previewState = preview.state;
   voiceState.previewElapsedMs = preview.elapsedMs;
   voiceState.previewReason = preview.reason;
@@ -962,6 +1136,8 @@ el.voiceClose.addEventListener('click', closeModal);
 el.voiceDone.addEventListener('click', closeModal);
 
 el.voicePreview.addEventListener('click', () => {
+  // 开始试听前先收回按住对比；命令队列保证宿主先看到释放。
+  endVoiceAbBypass();
   if (el.voicePreview.disabled) return;
   const active = ['preparing', 'recording', 'playing'].includes(voiceState.previewState);
   const token = markVoicePending('preview');
@@ -978,7 +1154,9 @@ el.voicePreview.addEventListener('click', () => {
 });
 
 el.voiceEnabled.addEventListener('change', () => {
+  // 先取用户的新值：释放对比会按旧状态重绘控件，之后再读会丢失这次操作。
   const enabled = !!el.voiceEnabled.checked;
+  endVoiceAbBypass();
   const token = markVoicePending('enabled');
   voiceState.enabled = enabled;
   renderVoice();
@@ -986,7 +1164,9 @@ el.voiceEnabled.addEventListener('change', () => {
 });
 
 el.voicePreset.addEventListener('change', () => {
+  // 先取用户的新值：释放对比会按旧预设重绘下拉，之后再读会回到旧预设。
   const id = el.voicePreset.value;
+  endVoiceAbBypass();
   if (!id) return;
   // 未合并的本地参数在切换后仍由本窗口持有，随下一次 50 ms 合并发送。
   const token = markVoicePending('preset');
@@ -1539,6 +1719,8 @@ async function poll(choice = audioChoice) {
     state.standby = !st.running && !!st.passthrough;
     // 待机状态变了要刷新按钮文案（轮询是唯一能发现"从别处停了"的途径）
     if (wasStandby !== state.standby) syncToggle();
+    // 没有变声快照时也要让按住对比跟随会话可用性。
+    syncVoiceAbBypass();
     el.dot.className = 'dot ' + (!st.running ? (st.passthrough ? 'standby' : 'off')
       : st.overruns > 0 || st.underruns > 0 ? 'warn' : 'ok');
     el.headline.textContent = !st.running

@@ -64,6 +64,7 @@
           <span id="bypassBadge" class="badge warn hidden">临时旁路</span>
         </div>
         <div class="voice-actions">
+          <button id="voiceAbBypass" class="ghost ab" aria-pressed="false" disabled title="音频未启动">按住听原声</button>
           <button id="voicePreview" class="preview" aria-describedby="previewHint" disabled>试听 3 秒</button>
           <button id="voiceEdit" class="ghost" aria-haspopup="dialog">编辑</button>
         </div>
@@ -221,6 +222,7 @@
       </div>
       <p id="voiceSaveState" class="hint error hidden" role="status"></p>
     </section>
+    <p id="voiceMetrics" class="hint voice-metrics" aria-live="off">—</p>
     <div class="dialog-footer"><button id="voiceDone" class="primary">完成</button></div>
   </section>
 </div>
