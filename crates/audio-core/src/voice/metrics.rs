@@ -53,7 +53,8 @@ impl VoiceMetrics {
 
     /// 记录一次 `process` 的耗时，并推进最大值。
     ///
-    /// 先推进最大值再写最近值，任意时刻读取都满足最大值不小于最近值。
+    /// 先推进最大值再写最近值；快照读取再按最近值兜底，保证读者不会看到
+    /// 最大值小于最近值。
     pub(crate) fn record_process(&self, ns: u64) {
         self.process_ns_max.fetch_max(ns, Ordering::Relaxed);
         self.process_ns_last.store(ns, Ordering::Relaxed);
@@ -89,13 +90,21 @@ impl VoiceMetrics {
     }
 
     /// 读取当前指标；只做原子加载。
+    ///
+    /// 各字段不要求来自同一瞬间；最大值按本次读到的最近值兜底，避免并发写入
+    /// 顺序不可见时读者看到最大值小于最近值。
     pub(crate) fn snapshot(&self) -> VoiceMetricsSnapshot {
+        let process_ns_last = self.process_ns_last.load(Ordering::Relaxed);
+        let process_ns_max = self
+            .process_ns_max
+            .load(Ordering::Relaxed)
+            .max(process_ns_last);
         VoiceMetricsSnapshot {
             latency_frames: self.latency_frames.load(Ordering::Relaxed),
             sample_rate: self.sample_rate.load(Ordering::Relaxed),
             block_frames: self.block_frames.load(Ordering::Relaxed),
-            process_ns_last: self.process_ns_last.load(Ordering::Relaxed),
-            process_ns_max: self.process_ns_max.load(Ordering::Relaxed),
+            process_ns_last,
+            process_ns_max,
             overflow_frames: self.overflow_frames.load(Ordering::Relaxed),
             gap_frames: self.gap_frames.load(Ordering::Relaxed),
         }
@@ -138,6 +147,21 @@ mod tests {
             metrics.snapshot().gap_frames,
             u64::MAX,
             "长时间会话的累计缺帧不得回绕"
+        );
+    }
+
+    #[test]
+    fn 快照最大值不会小于最近值() {
+        let metrics = VoiceMetrics::new();
+        // 模拟读取者先看到新的最近值、后看到旧的标称最大值。
+        metrics.process_ns_last.store(500, Ordering::Relaxed);
+        metrics.process_ns_max.store(100, Ordering::Relaxed);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.process_ns_last, 500);
+        assert_eq!(
+            snapshot.process_ns_max, 500,
+            "读取快照不得返回小于最近值的最大值"
         );
     }
 }
