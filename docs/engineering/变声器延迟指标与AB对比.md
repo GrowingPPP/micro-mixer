@@ -244,9 +244,9 @@ P99 均低于周期 15%，最大值均小于周期；Signalsmith 用例断言 Ru
 相比处于同一数量级；差异包含开发配置与运行噪声。指标记录在 release 下约
 46～51 ns/回调，远低于最小回调周期，未触发每 N 个回调采样一次的降级。
 
-回归结果：workspace all-targets 566 项通过、2 项预算测试忽略；
-`audio-core --features voice` 164 项、`audio-session --features voice` 42 项、
-`mixer-gui --features voice` 200 项、Node 四个套件 185 项通过；格式、两种特性组合的
+回归结果：workspace all-targets 571 项通过、2 项预算测试忽略；
+`audio-core --features voice` 165 项、`audio-session --features voice` 42 项、
+`mixer-gui --features voice` 204 项、Node 四个套件 185 项通过；格式、两种特性组合的
 Clippy、release 构建、Windows MSVC 交叉类型检查与 `git diff --check` 通过。
 
 边界：上述均为进程内 B 级数据，GUI 为交付 DOM 与模拟 IPC，布局为 Chromium 静态渲染。

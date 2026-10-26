@@ -185,7 +185,8 @@ git commit -m "音频核心：统计稳态湿声缺帧"
 A/B 状态规则：
 - `active=true`：要求 control 存在、`enabled=true`、用户 `bypassed=false`、`paused()=false`、试听空闲、阶段为 `wet`；否则返回错误。成功时置 `ab_bypassed=true`、推进 operation、调用 `apply_control`。
 - `active=false`：幂等清除 `ab_bypassed`；若有效启用则 `request_enable`，否则保持关闭。
-- `apply_enabled`、`set_bypass`、切换预设、`preview_begin`、`attach`、`detach` 清除 `ab_bypassed`。
+- `apply_enabled`、切换预设、`preview_begin`、`attach`、`detach` 清除 `ab_bypassed`。
+- 用户热键/`set_bypass` 只改变用户旁路标志，不清除 `ab_bypassed`；热键在 A/B 期间翻转用户旁路，释放后由用户旁路状态决定是否恢复变声。
 - `status().bypassed` 仍返回有效旁路；额外 `ab_bypassed` 让界面区分「用户旁路」与「按住对比」。
 
 - [ ] **步骤 1: 写失败测试**
