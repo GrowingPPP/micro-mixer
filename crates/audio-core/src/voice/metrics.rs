@@ -67,9 +67,24 @@ impl VoiceMetrics {
     }
 
     /// 累加湿声排空时补齐的帧数。
+    ///
+    /// 长会话累计值必须饱和而非回绕，避免异常计数把缺口伪装成零。
     pub(crate) fn record_gap(&self, frames: u64) {
-        if frames != 0 {
-            self.gap_frames.fetch_add(frames, Ordering::Relaxed);
+        if frames == 0 {
+            return;
+        }
+        let mut current = self.gap_frames.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_add(frames);
+            match self.gap_frames.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(observed) => current = observed,
+            }
         }
     }
 
@@ -111,5 +126,18 @@ mod tests {
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.overflow_frames, 7);
         assert_eq!(snapshot.gap_frames, 5);
+    }
+
+    #[test]
+    fn 缺帧计数饱和不回绕() {
+        let metrics = VoiceMetrics::new();
+        metrics.record_gap(u64::MAX);
+        metrics.record_gap(1);
+
+        assert_eq!(
+            metrics.snapshot().gap_frames,
+            u64::MAX,
+            "长时间会话的累计缺帧不得回绕"
+        );
     }
 }

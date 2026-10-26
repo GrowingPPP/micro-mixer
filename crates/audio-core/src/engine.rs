@@ -708,6 +708,11 @@ impl VoiceTee {
                 // 避免小回调时向环形缓冲突发整块数据。
                 let wet_frames = self.chain.0.process(dry, &mut out[..frames]);
                 self.fill_wet_hold(out, wet_frames, frames);
+                // 预热与淡化阶段的保持补齐是过渡行为；只有稳态缺口代表持续
+                // 缺湿声，计入共享指标供宿主判断链路是否跟得上。
+                self.chain
+                    .0
+                    .record_gap(frames.saturating_sub(wet_frames.min(frames)));
                 frames
             }
             VoiceTeeState::FadingOut => {
@@ -3192,6 +3197,83 @@ mod tests {
         (engine, runtime)
     }
 
+    /// 每个算法块只产出一半湿声，用于制造稳态缺口。
+    struct HalfOutputBackend {
+        gain: f32,
+    }
+
+    impl VoiceBackend for HalfOutputBackend {
+        fn process(&mut self, input: &[f32], output: &mut [f32]) -> usize {
+            let frames = input.len().min(output.len()) / 2;
+            for (slot, sample) in output[..frames].iter_mut().zip(&input[..frames]) {
+                *slot = *sample * self.gain;
+            }
+            frames
+        }
+
+        fn latency_frames(&self) -> usize {
+            0
+        }
+
+        fn reset(&mut self) {}
+
+        fn set_params(&mut self, _params: VoiceParams) {}
+    }
+
+    /// 产出与 [`HalfOutputBackend`] 相同的前半段，再用最后湿声样本补满整块。
+    ///
+    /// 作为无缺口对照：其 PCM 应与半产出后端加保持补齐的结果一致。
+    struct HoldFillBackend {
+        gain: f32,
+    }
+
+    impl VoiceBackend for HoldFillBackend {
+        fn process(&mut self, input: &[f32], output: &mut [f32]) -> usize {
+            let frames = input.len().min(output.len());
+            let half = frames / 2;
+            for (slot, sample) in output[..half].iter_mut().zip(&input[..half]) {
+                *slot = *sample * self.gain;
+            }
+            let hold = half.checked_sub(1).map_or(0.0, |index| output[index]);
+            output[half..frames].fill(hold);
+            frames
+        }
+
+        fn latency_frames(&self) -> usize {
+            0
+        }
+
+        fn reset(&mut self) {}
+
+        fn set_params(&mut self, _params: VoiceParams) {}
+    }
+
+    /// 构造处于稳态湿声的采集 tee，隔离预热与淡化对缺帧统计的影响。
+    fn 构造稳态采集tee(backend: Box<dyn VoiceBackend + Send>) -> (VoiceTee, VoiceControl) {
+        let control =
+            VoiceControl::with_runtime(Arc::new(VoiceRuntime::new()), VoiceParams::neutral());
+        let setup = VoiceSetup::with_control(control.clone(), 变声块毫秒, backend);
+        let mut tee = VoiceTee::new(setup, 变声块帧, 48_000);
+        tee.state = VoiceTeeState::SteadyWet;
+        (tee, control)
+    }
+
+    fn 构造带后端变声引擎(
+        backend: Box<dyn VoiceBackend + Send>,
+    ) -> (EngineParts, VoiceControl) {
+        let control =
+            VoiceControl::with_runtime(Arc::new(VoiceRuntime::new()), VoiceParams::neutral());
+        let setup = VoiceSetup::with_control(control.clone(), 变声块毫秒, backend);
+        let engine = EngineParts::build_with_voice(
+            StreamFormat::new(48_000, 1),
+            StreamFormat::stereo(48_000),
+            空槽位(),
+            变声缓冲毫秒,
+            Some(setup),
+        );
+        (engine, control)
+    }
+
     /// 以静音预填并把渲染侧推进到湿声稳态；随后由调用方恢复增益与音效。
     fn 静音进入湿声(e: &mut EngineParts, runtime: &VoiceRuntime) {
         e.control.mic_gain_db.set(-100.0);
@@ -3210,6 +3292,138 @@ mod tests {
             }
         }
         panic!("静音预热后渲染侧应进入湿声");
+    }
+
+    #[test]
+    fn 稳态湿声缺帧被计数() {
+        let (mut tee, control) = 构造稳态采集tee(Box::new(HalfOutputBackend { gain: 1.0 }));
+        let dry = 斜坡块(0, 变声块帧);
+        let mut out = vec![0.0f32; 变声块帧];
+
+        assert_eq!(tee.process(&dry, &mut out), 变声块帧);
+        assert_eq!(
+            control.metrics_snapshot().gap_frames,
+            (变声块帧 / 2) as u64,
+            "稳态每块少产出的湿声应计入缺帧"
+        );
+        assert!(
+            out[变声块帧 / 2..]
+                .iter()
+                .all(|sample| *sample == out[变声块帧 / 2 - 1]),
+            "缺口应由最近湿声补齐"
+        );
+    }
+
+    #[test]
+    fn 预热与淡出补齐不增加缺帧() {
+        let (mut engine, control) =
+            构造带后端变声引擎(Box::new(HalfOutputBackend { gain: 1.0 }));
+        let input = vec![0.1f32; 变声块帧];
+        let mut out = vec![0.0f32; 变声块帧 * 2];
+
+        control.request_enable();
+        let mut reached_steady = false;
+        for _ in 0..200 {
+            engine.capture.process(&input);
+            engine.render.process(&mut out);
+            assert_eq!(
+                control.metrics_snapshot().gap_frames,
+                0,
+                "预热与淡入补齐不得计入缺帧"
+            );
+            if engine
+                .capture
+                .voice
+                .as_ref()
+                .is_some_and(|tee| tee.state == VoiceTeeState::SteadyWet)
+            {
+                reached_steady = true;
+                break;
+            }
+        }
+        assert!(reached_steady, "半产出后端应完成预热与淡入");
+
+        control.request_disable();
+        let mut reached_idle = false;
+        for _ in 0..200 {
+            engine.capture.process(&input);
+            engine.render.process(&mut out);
+            assert_eq!(
+                control.metrics_snapshot().gap_frames,
+                0,
+                "淡出补齐不得计入缺帧"
+            );
+            if engine
+                .capture
+                .voice
+                .as_ref()
+                .is_some_and(|tee| tee.state == VoiceTeeState::Idle)
+            {
+                reached_idle = true;
+                break;
+            }
+        }
+        assert!(reached_idle, "淡出应回到关闭态");
+    }
+
+    #[test]
+    fn 试听采集路径不增加缺帧() {
+        let mut 夹具 = 构造试听夹具与后端(Box::new(HalfOutputBackend { gain: 1.0 }));
+        夹具.engine.control.mic_gain_db.set(0.0);
+        夹具.engine.control.sfx_gain_db.set(-100.0);
+        assert_eq!(夹具.runtime.phase(), VoicePhase::Off);
+
+        驱动试听(&mut 夹具, 20);
+        assert!(夹具.preview.start().is_ok(), "关闭状态应开始采集侧试听");
+        let 输出 = 驱动试听采样(&mut 夹具, 64);
+
+        assert_eq!(输出.len(), 64 * 变声块帧);
+        assert_eq!(
+            夹具.control.metrics_snapshot().gap_frames,
+            0,
+            "试听采集路径不得累计缺帧"
+        );
+        assert_eq!(
+            夹具.runtime.phase(),
+            VoicePhase::Off,
+            "试听不得改变变声阶段"
+        );
+    }
+
+    #[test]
+    fn 缺帧计数不改变正式转发() {
+        let (mut counted, counted_control) =
+            构造稳态采集tee(Box::new(HalfOutputBackend { gain: 0.5 }));
+        let (mut reference, reference_control) =
+            构造稳态采集tee(Box::new(HoldFillBackend { gain: 0.5 }));
+        let mut forwarded = Vec::new();
+
+        for block in 0..8 {
+            let dry = 斜坡块(block * 变声块帧, 变声块帧);
+            let mut counted_out = vec![0.0f32; 变声块帧];
+            let mut reference_out = vec![0.0f32; 变声块帧];
+            assert_eq!(counted.process(&dry, &mut counted_out), 变声块帧);
+            assert_eq!(reference.process(&dry, &mut reference_out), 变声块帧);
+            assert_eq!(
+                counted_out, reference_out,
+                "缺帧补齐不得改变写入环形缓冲的 PCM"
+            );
+            forwarded.extend_from_slice(&counted_out);
+        }
+
+        assert!(
+            counted_control.metrics_snapshot().gap_frames > 0,
+            "缺口场景应累计缺帧"
+        );
+        assert_eq!(
+            reference_control.metrics_snapshot().gap_frames,
+            0,
+            "无缺口对照不应累计缺帧"
+        );
+        assert!(
+            最大相邻步进(&forwarded) < 0.01,
+            "缺帧补齐应保持输出连续，不产生硬跳"
+        );
     }
 
     fn 正弦块(频率: f32, 起始帧: usize, 帧数: usize) -> Vec<f32> {
@@ -4587,13 +4801,16 @@ mod tests {
     }
 
     fn 构造试听夹具(gain: f32) -> 试听夹具 {
+        构造试听夹具与后端(Box::new(GainBackend { gain }))
+    }
+
+    fn 构造试听夹具与后端(backend: Box<dyn VoiceBackend + Send>) -> 试听夹具 {
         let runtime = Arc::new(VoiceRuntime::new());
         let control = VoiceControl::with_runtime(runtime.clone(), VoiceParams::neutral());
         let buffer = VoicePreviewBuffer::new(48_000, 3.0);
         let preview = VoicePreviewControl::new(&control, buffer.clone());
-        let setup =
-            VoiceSetup::with_control(control.clone(), 变声块毫秒, Box::new(GainBackend { gain }))
-                .with_preview(buffer.clone());
+        let setup = VoiceSetup::with_control(control.clone(), 变声块毫秒, backend)
+            .with_preview(buffer.clone());
         let engine = EngineParts::build_with_voice(
             StreamFormat::new(48_000, 1),
             StreamFormat::stereo(48_000),
