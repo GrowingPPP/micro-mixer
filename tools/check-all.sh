@@ -62,10 +62,10 @@ else
   echo "$TEST_OUT" | grep -E "^(failures|error)" -A 4 | head -10 | sed 's/^/       /'
 fi
 
-if JS_OUT=$(node --check apps/mixer-gui/dist/main.js && node --check apps/mixer-gui/dist/theme.js && node --check crates/remote/src/control-page.js && node --test tools/test-gui-model.js tools/test-gui-controls.js tools/test-remote-controls.js tools/test-app-packaging.js 2>&1); then
-  pass "GUI 状态、控件与映射回归"
+if JS_OUT=$(node --check apps/mixer-gui/dist/main.js && node --check apps/mixer-gui/dist/theme.js && node --check crates/remote/src/control-page.js && node --test 'tools/test-*.js' 2>&1); then
+  pass "GUI、打包与发布回归"
 else
-  fail "GUI 状态、控件与映射回归"
+  fail "GUI、打包与发布回归"
   echo "$JS_OUT" | tail -12
 fi
 

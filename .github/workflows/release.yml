@@ -1,0 +1,221 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 已存在的 vX.Y.Z tag；手动触发只构建，不创建 release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Version preflight
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+      ref: ${{ steps.meta.outputs.ref }}
+      product: ${{ steps.meta.outputs.product }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Verify tag and versions
+        id: meta
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="$REF_NAME"
+          fi
+          if [[ ! "$TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "tag 必须是 vMAJOR.MINOR.PATCH：$TAG" >&2
+            exit 1
+          fi
+          VERSION="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}"
+
+          test "$(git rev-parse "refs/tags/${TAG}^{commit}")" = "$(git rev-parse HEAD)" || {
+            echo "tag $TAG 没有指向本次检出的提交" >&2
+            exit 1
+          }
+
+          git fetch --no-tags origin "+master:refs/remotes/origin/master"
+          git merge-base --is-ancestor HEAD origin/master || {
+            echo "发布提交必须位于 master 历史上" >&2
+            exit 1
+          }
+
+          cargo metadata --locked --format-version 1 > metadata.json
+          version_json=$(node -p "require('./apps/mixer-gui/tauri.conf.json').version")
+          product=$(node -p "require('./apps/mixer-gui/tauri.conf.json').productName")
+          version_cargo=$(node -p "require('./metadata.json').packages.find(p => p.name === 'mixer-gui')?.version ?? ''")
+          if [ -z "$product" ] || [ -z "$version_cargo" ]; then
+            echo "无法读取产品名或 Cargo 版本" >&2
+            exit 1
+          fi
+          if [ "$version_json" != "$version_cargo" ] || [ "$version_json" != "$VERSION" ]; then
+            echo "tauri.conf.json 版本 ${version_json}、Cargo 版本 ${version_cargo} 与 tag ${VERSION} 不一致" >&2
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "ref=refs/tags/$TAG" >> "$GITHUB_OUTPUT"
+          echo "product=$product" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Release preflight"
+            echo "- tag: \`$TAG\`"
+            echo "- version: \`$VERSION\`"
+            echo "- commit: \`$(git rev-parse HEAD)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  macos:
+    name: macOS universal DMG
+    needs: preflight
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.ref }}
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: Swatinem/rust-cache@v2
+      - name: Install LLVM
+        run: |
+          LLVM_PREFIX=$(brew --prefix llvm 2>/dev/null || true)
+          if [ -z "$LLVM_PREFIX" ] || [ ! -d "$LLVM_PREFIX/lib" ]; then
+            brew install llvm
+            LLVM_PREFIX=$(brew --prefix llvm)
+          fi
+          echo "LIBCLANG_PATH=$LLVM_PREFIX/lib" >> "$GITHUB_ENV"
+      - name: Verify libclang
+        run: |
+          test -d "$LIBCLANG_PATH" || {
+            echo "缺少 libclang：默认变声特性需要 C++ 工具链与 libclang" >&2
+            exit 1
+          }
+      - run: npm ci
+      - name: Install universal Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Build and verify universal DMG
+        env:
+          MIXER_TARGET: universal-apple-darwin
+        run: ./apps/mixer-gui/build-app.sh
+      - name: Stage release asset
+        env:
+          MIXER_TARGET: universal-apple-darwin
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          DMG=$(./apps/mixer-gui/build-app.sh --print-artifact-paths | tail -n 1)
+          test -f "$DMG"
+          mkdir -p dist
+          ASSET="mixer-gui_${VERSION}_macos.dmg"
+          cp "$DMG" "dist/$ASSET"
+          (cd dist && shasum -a 256 "$ASSET" > SHA256SUMS.txt)
+          cat dist/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: dist/
+          if-no-files-found: error
+
+  windows:
+    name: Windows NSIS
+    needs: preflight
+    uses: ./.github/workflows/windows-build.yml
+    with:
+      ref: ${{ needs.preflight.outputs.ref }}
+
+  release:
+    name: Draft release
+    if: github.event_name == 'push'
+    needs: [preflight, macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.preflight.outputs.ref }}
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-dmg
+          path: release-assets/macos
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-nsis
+          path: release-assets/windows
+      - name: Verify and combine assets
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          MAC="release-assets/macos/mixer-gui_${VERSION}_macos.dmg"
+          WIN="release-assets/windows/mixer-gui_${VERSION}_windows_x64_setup.exe"
+          test -f "$MAC"
+          test -f "$WIN"
+          (cd release-assets/macos && sha256sum -c SHA256SUMS.txt)
+          (cd release-assets/windows && sha256sum -c SHA256SUMS.txt)
+          cat release-assets/macos/SHA256SUMS.txt release-assets/windows/SHA256SUMS.txt > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+          PRODUCT: ${{ needs.preflight.outputs.product }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            "release-assets/macos/mixer-gui_${VERSION}_macos.dmg" \
+            "release-assets/windows/mixer-gui_${VERSION}_windows_x64_setup.exe" \
+            "SHA256SUMS.txt" \
+            --draft \
+            --verify-tag \
+            --title "${PRODUCT} ${TAG}" \
+            --generate-notes
+
+          gh release view "$TAG" --json body --jq '.body // ""' > release-body.md
+          cat >> release-body.md <<'EOF'
+
+          ---
+
+          ## 安装与限制
+
+          - 系统要求：macOS 11+（Apple Silicon 与 Intel 通用）；Windows 10/11（需要 WebView2，Win11 通常自带）。
+          - macOS：DMG 首次打开需按住 Control 点击应用再选「打开」；当前未公证，ad-hoc 签名下重新安装后麦克风权限可能需要再次授权。
+          - Windows：安装包当前未签名，SmartScreen 可能提示；下载后请核对 `SHA256SUMS.txt`。
+          - 需要虚拟声卡：macOS 用 BlackHole 2ch，Windows 用 VB-CABLE，安装后重启。
+          - 本程序输出到虚拟声卡的输入端点；语音、会议、直播或游戏应用的麦克风选择虚拟声卡的输出端点。
+          - 已知限制：macOS 未公证、Windows 未签名；真机听感与延迟验收状态见仓库验证记录。
+          - 两个安装包来自同一 tag、同一提交与同一 `Cargo.lock`；CI 构建通过不等同于真机功能验收。
+          EOF
+          gh release edit "$TAG" --notes-file release-body.md

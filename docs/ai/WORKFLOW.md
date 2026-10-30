@@ -78,7 +78,7 @@ cargo test --locked --workspace --all-targets
 node --check apps/mixer-gui/dist/main.js
 node --check apps/mixer-gui/dist/theme.js
 node --check crates/remote/src/control-page.js
-node --test tools/test-gui-model.js tools/test-gui-controls.js tools/test-remote-controls.js tools/test-app-packaging.js
+node --test 'tools/test-*.js'
 cargo build --locked --release --workspace
 ```
 
@@ -110,7 +110,8 @@ macOS 的快捷巡检：
 | 命令 | 宿主 / 行为 |
 |---|---|
 | `./apps/mixer-gui/build-app.sh` | macOS 构建 App，放许可证，签名，生成 DMG，挂载验签并卸载；不启动 App、不打开音频 |
-| `./apps/mixer-gui/build-app.sh --print-artifact-paths` | 只读产物路径，不构建或签名 |
+| `MIXER_TARGET=universal-apple-darwin ./apps/mixer-gui/build-app.sh` | macOS 通用构建（arm64 + x86_64）；产物在 `target/universal-apple-darwin/release/` |
+| `./apps/mixer-gui/build-app.sh --print-artifact-paths` | 只读产物路径，不构建或签名；设置 `MIXER_TARGET` 时输出对应 target 路径 |
 | `./apps/mixer-gui/build-app.sh --print-first-open-note` | 只渲染交付的首次打开说明 |
 | Windows `build-app-windows.ps1 -TestSmokeHarness` | 只运行名称、WAV、参数与失败结果门禁；不编译、不打开设备 |
 | Windows `build-app-windows.ps1 -SkipSmoke` | 构建 EXE 与 NSIS，跳过真实音频 |
@@ -149,7 +150,19 @@ Windows 原生打包和安装验收需要 Windows 宿主；两端发布包应来
 
 变更权限或启动流程时仍需双击路径验收，但应按当前设备准备受控方案，不能机械执行不自包含的历史脚本。
 
-## 5. 复核、提交与报告
+## 5. 发布 workflow
+
+| 入口 | 行为 |
+|---|---|
+| `.github/workflows/windows-build.yml` 手动触发 | Windows 原生构建 NSIS；跳过真实音频冒烟；产物转 ASCII 名并生成 SHA-256 |
+| `.github/workflows/release.yml` 手动触发 | 输入已存在的 tag，只构建双端产物，不创建 release |
+| `.github/workflows/release.yml` 推送 `vMAJOR.MINOR.PATCH` tag | 校验 tag、配置/Cargo 版本、锁文件与 master 祖先关系，构建通用 DMG/NSIS，创建 draft release |
+| `gh release view <tag>` / `gh release edit <tag> --draft=false` | 人工检查资产与验收后发布或继续保留 draft |
+
+发布 workflow 使用 `npm ci`，构建前执行 `cargo metadata --locked`；macOS 无证书时使用 ad-hoc 签名。
+它不代表真机安装、WASAPI、热键、听感或延迟验收。已有 release 不会被覆盖，失败时保留构建 artifact。
+
+## 6. 复核、提交与报告
 
 提交前查看 `git diff --check`、完整 diff 和新增文件，验证文档链接及交付脚本引用。
 确认没有把 `target/`、依赖目录、录音、临时 fixture、密钥或用户配置加入暂存区。

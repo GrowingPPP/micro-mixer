@@ -28,9 +28,16 @@ REPO_ROOT="$(cd ../.. && pwd)"
 # shellcheck source=../../tools/app-product-name.sh
 . "$REPO_ROOT/tools/app-product-name.sh"
 APP_NAME=$(app_product_name "$REPO_ROOT/apps/mixer-gui/tauri.conf.json")
-APP="$REPO_ROOT/target/release/bundle/macos/${APP_NAME}.app"
+# 通用构建需要显式 target，Tauri 会把产物放在 target/<target>/release。
+TARGET="${MIXER_TARGET:-}"
+if [ -n "$TARGET" ]; then
+  TARGET_DIR="$REPO_ROOT/target/$TARGET/release"
+else
+  TARGET_DIR="$REPO_ROOT/target/release"
+fi
+APP="$TARGET_DIR/bundle/macos/${APP_NAME}.app"
 VERSION=$(node -p 'require("./tauri.conf.json").version')
-DMG_DIR="$REPO_ROOT/target/release/bundle/dmg"
+DMG_DIR="$TARGET_DIR/bundle/dmg"
 DMG="$DMG_DIR/${APP_NAME}_${VERSION}.dmg"
 
 print_first_open_note() {
@@ -85,9 +92,22 @@ command -v cargo >/dev/null 2>&1 || { echo "找不到 cargo，请先安装 Rust"
 
 echo "── 1/4 打包 ──"
 # 显式只要 .app —— DMG 由本脚本在**重新签名之后**自己打（见文件末尾）
-../../node_modules/.bin/tauri build --bundles app "$@"
+if [ -n "$TARGET" ]; then
+  ../../node_modules/.bin/tauri build --bundles app --target "$TARGET" "$@"
+else
+  ../../node_modules/.bin/tauri build --bundles app "$@"
+fi
 
 [ -d "$APP" ] || { echo "没找到 App 产物：$APP"; exit 1; }
+
+if [ "$TARGET" = "universal-apple-darwin" ]; then
+  ARCHS=$(lipo -archs "$APP/Contents/MacOS/mixer-gui" 2>/dev/null || true)
+  if ! printf '%s' "$ARCHS" | grep -qw arm64 || ! printf '%s' "$ARCHS" | grep -qw x86_64; then
+    echo "  ❌ 通用构建缺少架构：${ARCHS:-未知}"
+    exit 1
+  fi
+  echo "  ✅ 通用二进制：$ARCHS"
+fi
 
 # ── 把许可证放进 .app ──
 #
@@ -119,17 +139,20 @@ pick_identity() {
 }
 
 IDENTITY=$(pick_identity)
+ENT="$(pwd)/entitlements.plist"
 if [ "$IDENTITY" = "-" ]; then
   echo "  ⚠ 没找到代码签名证书 → 用 ad-hoc。"
   echo "    后果：**每次重新打包后，麦克风权限都要重新授权一次**（TCC 绑定签名）。"
   echo "    想要稳定：在 Xcode 里登录 Apple ID，或从开发者门户申请 'Developer ID Application' 证书。"
-  codesign --force --deep --sign - "$APP"
+  # 没有证书时也要把 audio-input 签进去：发布校验会检查 DMG 内的 App，
+  # 而 ad-hoc 签名本身是有效的，可以携带 entitlement。强化运行时只对有证书的签名开启。
+  codesign --force --deep --entitlements "$ENT" --sign - "$APP"
+  echo "  已附加 entitlements: audio-input（ad-hoc）"
 else
   echo "  用证书：$IDENTITY"
   # ⚠️ 强化运行时必须带 entitlements —— 否则**麦克风会被静默拒绝**
   #    （不报错、不弹窗，只是录音全是零，peak 精确等于 -100 dBFS）。
   #    光有 Info.plist 的 NSMicrophoneUsageDescription 不够。
-  ENT="$(pwd)/entitlements.plist"
   codesign --force --deep --options runtime \
            --entitlements "$ENT" --sign "$IDENTITY" "$APP"
   echo "  已附加 entitlements: audio-input"
@@ -157,8 +180,7 @@ echo "  ✅ 目录用途说明齐全（强化运行时下读 ~/Downloads 必需�
 if codesign -d --entitlements - "$APP" 2>/dev/null | grep -q "audio-input"; then
   echo "  ✅ entitlements 含 audio-input（强化运行时下麦克风必需）"
 else
-  echo "  ⚠ 当前签名没有 audio-input entitlement"
-  echo "     —— 如果你用的是 ad-hoc 签名，这不影响；用了真证书 + 强化运行时就会录不到声音。"
+  echo "  ⚠ 当前签名没有 audio-input entitlement —— 麦克风可能被静默拒绝"
 fi
 # 变声依赖 Signalsmith（MIT）；声明缺失时产物不满足随包保留版权声明的要求。
 [ -f "$APP/Contents/Resources/THIRD-PARTY-NOTICES.md" ] \

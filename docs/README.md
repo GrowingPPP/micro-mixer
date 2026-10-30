@@ -70,7 +70,7 @@
 | [变声器-生产实现计划-第一阶段.md](planning/变声器-生产实现计划-第一阶段.md) | 配置原子写入、audio-core 人声链、tee、独立限幅 | 已完成并本地合并 |
 | [变声器-生产实现计划-第二阶段.md](planning/变声器-生产实现计划-第二阶段.md) | 效果链、预设、Host/IPC、GUI、热键、遥控、CLI、试听、双端验收 | 已实现，进程内回归通过；真机与听感待验收 |
 | [变声器-延迟指标与AB对比-实现计划.md](planning/变声器-延迟指标与AB对比-实现计划.md) | 人声延迟指标、按住听原声、宿主/GUI 回归 | 已完成并合并 master |
-| [发布自动化与双端产物-计划.md](planning/发布自动化与双端产物-计划.md) | tag 触发的 draft release、DMG/NSIS、checksum 与版本门禁 | 待执行 |
+| [发布自动化与双端产物-计划.md](planning/发布自动化与双端产物-计划.md) | tag 触发的 draft release、DMG/NSIS、checksum 与版本门禁 | 已实现 workflow，待 CI 实跑 |
 | [开发计划-任务拆解与排期.md](planning/开发计划-任务拆解与排期.md) | 人日估算、关键路径、阶段划分 | 路线图，不重复状态 |
 | [M0验证方案.md](planning/M0验证方案.md) | Go / No-Go 实验设计 | **已结项**（H1 成立，决策 GO） |
 | [M0-执行手册.md](planning/M0-执行手册.md) | M0 的操作步骤（配合 `m0/tools/`） | **已结项** |

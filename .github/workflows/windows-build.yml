@@ -1,0 +1,108 @@
+name: Windows package
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 要构建的 Git ref；留空则使用当前分支
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      ref:
+        description: 要构建的 Git ref
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows NSIS
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: Swatinem/rust-cache@v2
+      - name: Install LLVM
+        shell: pwsh
+        run: |
+          $llvm = 'C:\Program Files\LLVM\bin'
+          if (-not (Test-Path (Join-Path $llvm 'libclang.dll'))) {
+            choco install llvm -y --no-progress
+          }
+          "LIBCLANG_PATH=$llvm" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Verify libclang
+        shell: pwsh
+        run: |
+          if (-not (Test-Path $env:LIBCLANG_PATH)) {
+            throw "缺少 libclang：默认变声特性需要 C++ 工具链与 libclang"
+          }
+      - run: npm ci
+      - name: Verify locked dependency graph
+        shell: pwsh
+        run: cargo metadata --locked --format-version 1 | Out-Null
+      - name: PowerShell packaging harness
+        shell: powershell
+        run: .\apps\mixer-gui\build-app-windows.ps1 -TestSmokeHarness
+      - name: Build NSIS installer
+        shell: powershell
+        run: .\apps\mixer-gui\build-app-windows.ps1 -SkipSmoke
+      - name: Verify installer contents
+        shell: pwsh
+        run: |
+          $nsisScript = Get-ChildItem -LiteralPath 'target/release/nsis' -Filter 'installer.nsi' -File -Recurse -ErrorAction SilentlyContinue |
+                        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if ($null -eq $nsisScript) {
+            throw '没有找到 Tauri 生成的 installer.nsi，无法核对安装内容'
+          }
+          $scriptText = Get-Content -Raw -Encoding UTF8 -LiteralPath $nsisScript.FullName
+          if ($scriptText -notmatch '[\\/=]LICENSE(?![\w.-])' -or
+              $scriptText -notmatch 'THIRD-PARTY-NOTICES\.md') {
+            throw 'installer.nsi 没有收录 LICENSE 与 THIRD-PARTY-NOTICES.md'
+          }
+          foreach ($name in @('LICENSE', 'THIRD-PARTY-NOTICES.md')) {
+            if (-not (Test-Path -LiteralPath (Join-Path 'target/release/bundle/nsis' $name) -PathType Leaf)) {
+              throw "构建目录缺少分发文件：$name"
+            }
+          }
+      - name: Stage release asset
+        shell: pwsh
+        run: |
+          $config = Get-Content -Raw -Encoding UTF8 apps/mixer-gui/tauri.conf.json | ConvertFrom-Json
+          $version = $config.version
+          $product = $config.productName
+          $pattern = "${product}_${version}_*-setup.exe"
+          $installers = @(Get-ChildItem -LiteralPath 'target/release/bundle/nsis' -Filter $pattern -File -ErrorAction Stop)
+          if ($installers.Count -ne 1) {
+            throw "预期恰好一个 ${pattern}，实际 $($installers.Count) 个"
+          }
+          $assetName = "mixer-gui_${version}_windows_x64_setup.exe"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $assetPath = Join-Path dist $assetName
+          Copy-Item -LiteralPath $installers[0].FullName -Destination $assetPath -Force
+          if ((Get-Item -LiteralPath $assetPath).Length -le 0) {
+            throw "安装包为空：$assetPath"
+          }
+          $hash = (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $checksum = "$hash  $assetName`n"
+          [IO.File]::WriteAllText(
+            (Join-Path dist 'SHA256SUMS.txt'),
+            $checksum,
+            [Text.UTF8Encoding]::new($false)
+          )
+          Get-Content -Raw -Encoding UTF8 (Join-Path dist 'SHA256SUMS.txt')
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-nsis
+          path: dist/
+          if-no-files-found: error
