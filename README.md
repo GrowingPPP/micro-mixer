@@ -437,17 +437,17 @@ MIXER_DUMP=/tmp/out.f32 MIXER_DUMP_FRAMES=300000 ./target/release/mixer play --f
 
 ### 交付物的准确说法
 
-**目前没有 Windows 产物。** 存在的是源码 + 配置 + 一个从未运行过的构建脚本：
+**Windows 产物由 CI 构建，尚未发布正式 release。** 真机安装与 WASAPI 仍需验收：
 
 | | 状态 |
 |---|---|
 | Windows 源码改动 | ✅ 除变声外的源码通过交叉类型检查（**类型检查级别**；交叉检查使用 `--no-default-features`） |
-| Windows 变声后端 | ⏳ 默认构建需要 MSVC C++ 工具链与 libclang；Windows 原生构建尚未执行 |
+| Windows 变声后端 | ✅ Windows 原生 CI 默认构建通过 |
 | NSIS 打包配置 | ✅ 通过 Tauri 官方 JSON schema 校验；图标是合法的 6 尺寸 ICO |
-| `build-app-windows.ps1` | ✅ 存在，**从未运行过** |
-| **Windows 可执行文件** | ❌ |
-| **NSIS 安装包** | ❌ |
-| **在 Windows 上运行过任何一次** | ❌ |
+| `build-app-windows.ps1` | ✅ 已在 Windows 原生 CI 运行 |
+| **Windows 可执行文件** | ✅ CI 构建（未发布） |
+| **NSIS 安装包** | ✅ CI 构建并通过 checksum（未真机安装） |
+| **在 Windows 上运行过任何一次** | 用户报告已验（2026-10-30），逐项证据待补，见 [Windows 验收记录](docs/engineering/变声器真机验收-Windows.md) |
 
 「交叉编译通过」的含义要说清楚：`cargo check` **只做类型检查，不生成二进制**。
 `target/x86_64-pc-windows-msvc/debug/` 是空的。它证明的是"代码能编译"，
@@ -517,14 +517,18 @@ mixer selftest    # 链路自检：送信号进虚拟设备，从环回录回来
 
 ### 已知会在首次实测时暴露问题的点
 
+> 下面保留早期风险清单。用户报告已在 Windows 验证（2026-10-30），逐项证据仍待补；
+> 以 [Windows 验收记录](docs/engineering/变声器真机验收-Windows.md) 和
+> [验证台账](docs/engineering/验证台账.md) 为准。
+
 诚实列出来，免得把"编译通过"当成"能用"：
 
 - Windows 热键管理器在专属消息循环线程上注册、注销和析构；真实键盘事件、重绑和退出仍需 Windows 验收
 - 托盘图标、关窗不退的行为在 Windows 上未确认
 - VB-CABLE 到底是 16 位还是 32 位、采样率多少 —— **没见过真机**
-- NSIS 安装包从未构建过
-- 变声 C++ 后端（Signalsmith Stretch）首次在 MSVC 下从零构建；静态库是否完整链入、安装后是否缺
-  `msvcp140.dll` / `vcruntime140.dll`，以及实际延迟与听感，都需 Windows 真机验收
+- NSIS 安装包已在 CI 构建并通过 checksum，真机安装未验收
+- 变声 C++ 后端（Signalsmith Stretch）已在 Windows 原生 CI 完成 MSVC 构建；静态库是否完整链入、
+  安装后是否缺 `msvcp140.dll` / `vcruntime140.dll`，以及实际延迟与听感，都需 Windows 真机验收
 - 变声热键、3 秒试听、遥控变声区和待机行为尚未在 Windows 上实际运行
 - 「切回真实麦克风」在 Windows 上**没有**（有意为之：那个功能是回滚 macOS 流程
   改过的系统默认设备，而 Windows 流程压根不改系统设置）
