@@ -9,9 +9,9 @@ const root = path.resolve(__dirname, '..');
 const config = JSON.parse(fs.readFileSync(path.join(root, 'apps/mixer-gui/tauri.conf.json'), 'utf8'));
 const scripts = ['apps/mixer-gui/build-app.sh', 'm0/tools/app_verify.sh', 'tools/app-product-name.sh'];
 
-function run(script, argument, projectRoot) {
+function run(script, argument, projectRoot, env = process.env) {
   const result = spawnSync('bash', [path.join(projectRoot, script), argument], {
-    cwd: os.tmpdir(), encoding: 'utf8', env: process.env,
+    cwd: os.tmpdir(), encoding: 'utf8', env,
   });
   assert.equal(result.error, undefined);
   return result;
@@ -31,6 +31,16 @@ function expectPaths(projectRoot, productName, version) {
   assert.ok(note.stdout.includes(`把「${productName}」拖进旁边的 Applications 文件夹`));
   assert.ok(note.stdout.includes('本程序把人声与音频混合后写进去'));
   assert.equal(note.stdout.includes('$APP_NAME'), false, '安装说明必须真正展开产品名');
+  const universal = run('apps/mixer-gui/build-app.sh', '--print-artifact-paths', projectRoot, {
+    ...process.env,
+    MIXER_TARGET: 'universal-apple-darwin',
+  });
+  assert.equal(universal.status, 0, universal.stderr);
+  assert.deepEqual(universal.stdout.trim().split(/\r?\n/), [
+    path.join(projectRoot, 'target/universal-apple-darwin/release/bundle/macos', `${productName}.app`),
+    path.join(projectRoot, 'target/universal-apple-darwin/release/bundle/dmg',
+      `${productName}_${version}.dmg`),
+  ]);
   assert.equal(fs.existsSync(path.join(projectRoot, 'target')), false,
     '路径查看不能构建或创建产物');
 }
@@ -136,6 +146,12 @@ test('macOS App 包内的许可证文件名与安装资源声明一致且签名�
     assert.ok(mac.includes(`"$APP/Contents/Resources/${name}"`),
       `macOS 脚本必须把 ${name} 放在 Contents/Resources 根目录，与 bundle.resources 的落点一致`);
   }
+});
+
+test('macOS 两种签名分支都携带麦克风 entitlement', () => {
+  const mac = fs.readFileSync(path.join(root, 'apps/mixer-gui/build-app.sh'), 'utf8');
+  assert.equal((mac.match(/--entitlements "\$ENT"/g) || []).length, 2,
+    'ad-hoc 与证书签名都必须传入 audio-input entitlement');
 });
 
 test('macOS permission prompts identify the same application as the bundle metadata', () => {

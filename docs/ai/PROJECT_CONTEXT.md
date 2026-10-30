@@ -173,7 +173,7 @@ Windows 代码与交叉类型检查不等同于真机验收；真实 WASAPI、�
 | 手机控制页及 HTTP 路由 | `crates/remote/src/control-page.js`、`lib.rs`、`tests.rs` |
 | 自检与无窗口冒烟 | `crates/selftest/src/lib.rs`；`apps/mixer-gui/src/smoke.rs` |
 | 名称、权限与打包 | `tauri.conf.json`、`Info.plist`、两端 `build-app` 脚本；`tools/app-product-name.sh` |
-| 交付脚本回归 / 双端 CI | `tools/test-*.js`；`.github/workflows/quality.yml` |
+| 交付脚本回归 / 双端 CI / 发布 | `tools/test-*.js`；`.github/workflows/quality.yml`、`windows-build.yml`、`release.yml` |
 
 ## 7. 历史资料的适用范围
 

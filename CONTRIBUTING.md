@@ -187,15 +187,17 @@ cargo test --locked --workspace --all-targets
 node --check apps/mixer-gui/dist/main.js
 node --check apps/mixer-gui/dist/theme.js
 node --check crates/remote/src/control-page.js
-node --test tools/test-gui-model.js tools/test-gui-controls.js tools/test-remote-controls.js tools/test-app-packaging.js
+node --test 'tools/test-*.js'
 cargo build --locked --release --workspace
 ```
 
 纯文档变更核对实际实现、相对链接和命令，并执行 `git diff --check`，无需为文档启动音频设备或重新打包。
 
-`.github/workflows/quality.yml` 在 macOS / Windows 宿主运行 Rust/JS 回归及对应平台检查。release 构建和完整 Tauri schema 校验属于本地补充门禁，当前不在该 CI 工作流中执行。
+`.github/workflows/quality.yml` 在 macOS / Windows 宿主运行 Rust/JS 回归及对应平台检查。完整 Tauri schema 校验属于本地补充门禁，当前不在该 CI 工作流中执行。
 Windows 另执行 `build-app-windows.ps1 -TestSmokeHarness`，验证受控 WAV、构建参数与失败退出码门禁；
-该检查无需虚拟声卡。`tools/win-cross-check.sh` 在 macOS 检查 Windows 所有目标（包含测试），
+该检查无需虚拟声卡。`.github/workflows/windows-build.yml` 可手动构建 NSIS，`.github/workflows/release.yml`
+在 `v` tag 上构建双端产物并创建 draft release；两者都跳过真实音频，不替代真机验收。
+`tools/win-cross-check.sh` 在 macOS 检查 Windows 所有目标（包含测试），
 但不链接安装包，不能替代 Windows 上的真实 WASAPI、热键、WebView 与 NSIS 验收。
 
 ### 改到音频链路时，还要跑

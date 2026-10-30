@@ -58,7 +58,7 @@ jobs:
       - run: node --check apps/mixer-gui/dist/main.js
       - run: node --check apps/mixer-gui/dist/theme.js
       - run: node --check crates/remote/src/control-page.js
-      - run: node --test tools/test-gui-model.js tools/test-gui-controls.js tools/test-remote-controls.js tools/test-app-packaging.js
+      - run: node --test 'tools/test-*.js'
       - name: Windows smoke harness regression
         if: runner.os == 'Windows'
         shell: powershell
