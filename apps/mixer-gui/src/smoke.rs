@@ -158,6 +158,7 @@ pub fn run(dir: PathBuf) -> Result<()> {
         monitor: true, // 顺带覆盖监听路径（会短暂从默认输出放声）
         monitor_device: None,
         remote_port: Some(18767), // 冒烟测试用固定端口，顺便验证手机遥控
+        voice: None,
     };
     let base = cfg.clone();
     let t0 = Instant::now();

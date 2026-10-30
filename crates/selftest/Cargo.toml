@@ -8,7 +8,8 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-audio-core = { path = "../audio-core" }
+# 诊断路径不启用 voice：不编译 C++ 后端，保持可在无 libclang 环境单独构建。
+audio-core = { path = "../audio-core", default-features = false }
 backend-cpal = { path = "../backend-cpal" }
 
 [lints]

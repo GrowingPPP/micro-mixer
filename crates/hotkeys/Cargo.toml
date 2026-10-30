@@ -6,6 +6,10 @@ authors.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+# 仅供宿主回归注入不注册系统热键的管理器替身；生产构建不启用。
+test-support = []
+
 [dependencies]
 anyhow.workspace = true
 log.workspace = true

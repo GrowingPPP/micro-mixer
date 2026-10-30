@@ -160,6 +160,10 @@ else
   echo "  ⚠ 当前签名没有 audio-input entitlement"
   echo "     —— 如果你用的是 ad-hoc 签名，这不影响；用了真证书 + 强化运行时就会录不到声音。"
 fi
+# 变声依赖 Signalsmith（MIT）；声明缺失时产物不满足随包保留版权声明的要求。
+[ -f "$APP/Contents/Resources/THIRD-PARTY-NOTICES.md" ] \
+  && echo "  ✅ App 包内含第三方声明" \
+  || { echo "  ❌ App 包里没有第三方声明"; exit 1; }
 # ── 4/4 打 DMG ────────────────────────────────────────────────
 #
 # ⚠️ 顺序很关键：**必须在重新签名之后**做 dmg。
@@ -208,6 +212,9 @@ DMG_APP="$MP/${APP_NAME}.app"
 [ -f "$DMG_APP/Contents/Resources/LICENSE" ] \
   && echo "  ✅ App 包内含 LICENSE" \
   || { echo "  ❌ App 包里没有 LICENSE"; DMG_OK=0; }
+[ -f "$DMG_APP/Contents/Resources/THIRD-PARTY-NOTICES.md" ] \
+  && echo "  ✅ App 包内含第三方声明" \
+  || { echo "  ❌ App 包里没有第三方声明"; DMG_OK=0; }
 [ -L "$MP/Applications" ] && echo "  ✅ 有 Applications 快捷方式（可拖拽安装）" || { echo "  ⚠ 缺 Applications 快捷方式"; DMG_OK=0; }
 [ -f "$MP/首次打开请看这里.txt" ] && echo "  ✅ 有首次打开说明" || echo "  ⚠ 缺说明文件"
 [ -f "$MP/LICENSE" ] && echo "  ✅ 有 LICENSE（MIT）" || { echo "  ❌ 缺 LICENSE"; DMG_OK=0; }

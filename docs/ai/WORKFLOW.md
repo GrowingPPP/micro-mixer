@@ -34,11 +34,31 @@ Node 构建依赖可用 `npm ci` 从 `package-lock.json` 恢复，常规修改�
 ```sh
 cargo test --locked -p app-config
 cargo test --locked -p audio-core -p audio-session
+cargo test --locked -p audio-core --features voice
+cargo test --locked -p audio-session --features voice
+cargo test --locked -p audio-core --features voice 指标 -- --test-threads=1
+cargo test --locked -p audio-core --features voice 缺帧 -- --test-threads=1
+cargo test --locked -p mixer-gui --features voice 按住对比 -- --test-threads=1
+cargo test --locked -p mixer-gui --features voice 性能指标 -- --test-threads=1
 cargo test --locked -p mixer-gui --bin mixer-gui combo_ -- --nocapture
 cargo test --locked -p remote
 node --test tools/test-gui-controls.js tools/test-gui-model.js
 node --test tools/test-remote-controls.js tools/test-app-packaging.js
+node --test --test-name-pattern='按住|指标|性能|占位符|指针取消|失焦|按钮禁用|关闭人声面板|延迟|处理' tools/test-gui-controls.js
 ```
+
+`voice` 特性捆绑 C++ 源码并通过 bindgen 生成绑定，需要 C++ 工具链与 libclang；
+`voice-signalsmith` 是兼容旧命令的别名。`mixer-gui` 与 `mixer-cli` 默认启用 `voice`，
+因此默认 `cargo build/clippy/test --workspace` 会编译 C++，本地与 `quality.yml` 双端 CI
+都需要可用的 C++ 工具链，并设置 `LIBCLANG_PATH`。`quality.yml` 在 macOS/Windows 安装 LLVM，
+并在默认特性门禁之外显式运行 `cargo test -p audio-core --features voice` 与
+`cargo test -p audio-session --features voice`，以及
+`cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings`
+（不含变声后端的构建也必须无告警）。
+
+`tools/win-cross-check.sh` 以 `--no-default-features` 运行，不编译 C++，也不要求上述工具；
+它只证明不依赖变声后端的 Windows 目标源码可编译，替换不了 Windows 原生 CI 与真机构建。
+`tools/voice-spike/` 是独立 workspace，另有自己的验证命令，不计入该门禁。
 
 完整操作组合的测试选择见[播放操作组合回归](../engineering/播放操作组合回归.md)。
 
@@ -53,6 +73,7 @@ GUI 布局变更同时检查默认与最小窗口、明暗主题、长名称和�
 ```sh
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo clippy --locked --workspace --all-targets --no-default-features -- -D warnings
 cargo test --locked --workspace --all-targets
 node --check apps/mixer-gui/dist/main.js
 node --check apps/mixer-gui/dist/theme.js
@@ -60,6 +81,10 @@ node --check crates/remote/src/control-page.js
 node --test tools/test-gui-model.js tools/test-gui-controls.js tools/test-remote-controls.js tools/test-app-packaging.js
 cargo build --locked --release --workspace
 ```
+
+默认命令启用 GUI/CLI 的 `voice` 特性，会编译 C++ 变声后端，需要 C++ 工具链与 libclang。
+缺少这些工具时用 `cargo build --locked --workspace --no-default-features` 验证不依赖变声
+后端的代码；该构建不含变声能力，不能作为交付产物。
 
 macOS 的快捷巡检：
 
@@ -74,9 +99,11 @@ macOS 的快捷巡检：
   沙箱拒绝本机套接字时，记录环境限制，按执行环境规则申请对应能力；不能删掉网络回归或虚报通过。
 - schema 脚本可能下载官方 schema、准备 Python 校验器。下载失败可能跳过，校验器缺失可能退化为顶层字段检查。
   只有输出「完全符合 Tauri 官方 schema」才记录为完整 schema 通过。
-- Windows 交叉脚本用临时 `llvm-rc` 桩执行 `cargo check --locked --all-targets --target x86_64-pc-windows-msvc --workspace`。
-  它不链接、不运行 Windows 程序；桩不能用于发布构建。
-- Windows 原生 CI 执行上列格式检查、Clippy、Rust 测试及 JS 检查；Bash 工具不是 Windows 原生命令的替代品。
+- Windows 交叉脚本用临时 `llvm-rc` 桩执行
+  `cargo check --locked --all-targets --target x86_64-pc-windows-msvc --workspace --no-default-features`。
+  它不编译变声 C++ 后端、不链接、不运行 Windows 程序；输出中的跳过说明不代表变声代码已验证，桩不能用于发布构建。
+- Windows 原生 CI 执行上列格式检查、Clippy、Rust 测试、显式变声测试及 JS 检查；它是变声 C++ 后端编译的权威检查，
+  交叉检查不能替代；Bash 工具也不是 Windows 原生命令的替代品。
 
 ## 4. 打包与设备验收
 

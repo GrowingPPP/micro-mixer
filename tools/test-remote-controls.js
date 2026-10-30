@@ -14,27 +14,54 @@ function shippedScript() {
   return fs.readFileSync(path.join(dir, 'control-page.js'), 'utf8');
 }
 
-function harness() {
+function harness({ standby = false } = {}) {
+  const reloads = { count: 0 };
   const messages = { textContent: '' };
   const requests = [];
   const executed = [];
   const listeners = new Map();
-  const element = () => ({ classList: { add() {}, remove() {} } });
+  const intervals = [];
+  const classList = () => {
+    const classes = new Set();
+    return {
+      add: name => classes.add(name),
+      remove: name => classes.delete(name),
+      contains: name => classes.has(name),
+    };
+  };
+  const element = () => ({ classList: classList() });
   const buttons = [element(), element()];
+  const presetButtons = [
+    { dataset: { id: 'builtin:female' }, classList: classList(), textContent: '女声' },
+    { dataset: { id: 'builtin:male' }, classList: classList(), textContent: '男声' },
+  ];
+  const fields = {
+    m: messages,
+    venable: { checked: false },
+    vpreset: { textContent: '' },
+    vbypass: { hidden: true },
+    // 待机页的状态行带 data-standby 标记；活动页没有。
+    ...(standby ? { s: { dataset: { standby: '1' } } } : {}),
+  };
   const context = vm.createContext({
     document: {
       body: element(),
-      getElementById: () => messages,
-      querySelectorAll: () => buttons,
+      getElementById: id => fields[id] || messages,
+      querySelectorAll: selector => selector === '.vp' ? presetButtons : buttons,
       addEventListener: (name, fn) => listeners.set(name, fn),
     },
+    location: { reload: () => { reloads.count++; } },
     setTimeout: () => 0,
+    setInterval: (fn, ms) => {
+      intervals.push({ fn, ms });
+      return intervals.length;
+    },
     fetch: request => new Promise((resolve, reject) => {
       requests.push({
         path: request,
-        finish(ok = true) {
+        finish(ok = true, state = {}) {
           executed.push(request);
-          resolve({ json: async () => ({ ok, error: ok ? undefined : '拒绝' }) });
+          resolve({ json: async () => ({ ok, error: ok ? undefined : '拒绝', ...state }) });
         },
         reject,
       });
@@ -44,7 +71,10 @@ function harness() {
   buttons.forEach((button, i) => {
     button.click = () => context.hit(`/play/${i + 1}`, button);
   });
-  return { context, buttons, listeners, requests, executed, messages };
+  return {
+    context, buttons, presetButtons, listeners, requests, executed, messages, fields, intervals,
+    reloads,
+  };
 }
 
 async function flush() {
@@ -118,4 +148,165 @@ test('phone number and space keys share the click command ordering', async () =>
   h.requests[1].finish();
   await flush();
   assert.equal(h.messages.textContent, '已停止');
+});
+
+test('变声启用与切预设按点击顺序提交且选预设不启用', async () => {
+  const h = harness();
+  const enable = h.context.voiceEnable(true);
+  await flush();
+  assert.deepEqual(h.requests.map(r => r.path), ['/voice/enable/1']);
+  h.requests[0].finish(true, {
+    enabled: true, bypassed: false, preset_id: 'builtin:female', preset_name: '女声',
+  });
+  await enable;
+  assert.equal(h.fields.venable.checked, true);
+  assert.equal(h.messages.textContent, '已启用变声');
+
+  const pick = h.context.voicePick(h.presetButtons[1]);
+  await flush();
+  assert.deepEqual(h.requests.map(r => r.path),
+    ['/voice/enable/1', '/voice/preset/builtin%3Amale'],
+    '选择预设只提交预设命令，不能顺带启用或关闭');
+  h.requests[1].finish(true, {
+    enabled: true, bypassed: false, preset_id: 'builtin:male', preset_name: '男声',
+  });
+  await pick;
+  assert.equal(h.fields.vpreset.textContent, '男声');
+  assert.ok(h.presetButtons[1].classList.contains('on'));
+  assert.ok(!h.presetButtons[0].classList.contains('on'));
+  assert.equal(h.messages.textContent, '已切换预设');
+});
+
+test('变声快速启用切预设关闭保持点击顺序', async () => {
+  const h = harness();
+  const pending = [
+    h.context.voiceEnable(true),
+    h.context.voicePick(h.presetButtons[1]),
+    h.context.voiceEnable(false),
+  ];
+  const paths = ['/voice/enable/1', '/voice/preset/builtin%3Amale', '/voice/enable/0'];
+  for (let i = 0; i < paths.length; i++) {
+    await flush();
+    assert.deepEqual(h.requests.map(r => r.path), paths.slice(0, i + 1));
+    h.requests[i].finish(true, {
+      enabled: i < 2,
+      bypassed: false,
+      preset_id: i === 1 ? 'builtin:male' : 'builtin:female',
+      preset_name: i === 1 ? '男声' : '女声',
+    });
+  }
+  await Promise.all(pending);
+  assert.deepEqual(h.executed, paths);
+  assert.equal(h.messages.textContent, '已关闭变声');
+  assert.equal(h.fields.venable.checked, false);
+});
+
+test('变声状态轮询更新开关旁路与当前预设', async () => {
+  const h = harness();
+  assert.equal(h.intervals.length, 1);
+  assert.equal(h.intervals[0].ms, 1000);
+  const poll = h.context.pollVoice();
+  await flush();
+  assert.deepEqual(h.requests.map(r => r.path), ['/voice/status']);
+  h.requests[0].finish(true, {
+    enabled: true, bypassed: true, preset_id: 'builtin:male', preset_name: '男声',
+  });
+  await poll;
+  assert.equal(h.fields.venable.checked, true);
+  assert.equal(h.fields.vbypass.hidden, false);
+  assert.equal(h.fields.vpreset.textContent, '男声');
+  assert.ok(h.presetButtons[1].classList.contains('on'));
+});
+
+test('点击后启动的轮询不能覆盖先完成的命令结果', async () => {
+  const h = harness();
+  const enable = h.context.voiceEnable(true);
+  await flush();
+  const poll = h.context.pollVoice();
+  await flush();
+  assert.deepEqual(h.requests.map(r => r.path), ['/voice/enable/1', '/voice/status']);
+
+  h.requests[0].finish(true, {
+    enabled: true, bypassed: false, preset_id: 'builtin:male', preset_name: '男声',
+  });
+  await enable;
+  assert.equal(h.fields.venable.checked, true);
+  assert.equal(h.fields.vpreset.textContent, '男声');
+
+  h.requests[1].finish(true, {
+    enabled: false, bypassed: true, preset_id: 'builtin:female', preset_name: '女声',
+  });
+  await poll;
+  assert.equal(h.fields.venable.checked, true, '命令完成后到达的旧轮询必须丢弃');
+  assert.equal(h.fields.vpreset.textContent, '男声');
+  assert.equal(h.fields.vbypass.hidden, true);
+});
+
+test('退休会话的旧轮询回复不覆盖新的变声状态', async () => {
+  const h = harness();
+  const poll = h.context.pollVoice();
+  await flush();
+  const enable = h.context.voiceEnable(true);
+  await flush();
+  assert.deepEqual(h.requests.map(r => r.path), ['/voice/status', '/voice/enable/1']);
+  h.requests[1].finish(true, {
+    enabled: true, bypassed: false, preset_id: 'builtin:male', preset_name: '男声',
+  });
+  await enable;
+  assert.equal(h.fields.venable.checked, true);
+  assert.equal(h.fields.vpreset.textContent, '男声');
+
+  h.requests[0].finish(true, {
+    enabled: false, bypassed: true, preset_id: 'builtin:female', preset_name: '女声',
+  });
+  await poll;
+  assert.equal(h.fields.venable.checked, true, '旧会话回复不能覆盖新状态');
+  assert.equal(h.fields.vpreset.textContent, '男声');
+  assert.equal(h.fields.vbypass.hidden, true);
+});
+
+test('变声命令失败显示原因且不改变开关', async () => {
+  const h = harness();
+  const pick = h.context.voicePick(h.presetButtons[0]);
+  await flush();
+  h.requests[0].finish(false, {
+    enabled: false, bypassed: false, preset_id: 'builtin:female', preset_name: '女声',
+  });
+  await pick;
+  assert.equal(h.messages.textContent, '失败：拒绝');
+  assert.equal(h.fields.venable.checked, false);
+});
+
+test('待机页轮询播放可用性并在恢复后整页刷新', async () => {
+  const h = harness({ standby: true });
+  const playbackPolls = h.intervals.filter(timer => timer.ms === 2000);
+  assert.equal(playbackPolls.length, 1, '待机页必须每两秒检查一次播放是否恢复');
+
+  const first = h.context.pollPlayback();
+  await flush();
+  assert.deepEqual(h.requests.map(r => r.path), ['/playback']);
+  h.requests[0].finish(true, { available: false });
+  await first;
+  assert.equal(h.reloads.count, 0, '仍在待机时不能刷新');
+
+  const second = h.context.pollPlayback();
+  await flush();
+  h.requests[1].finish(true, { available: true });
+  await second;
+  assert.equal(h.reloads.count, 1, '播放恢复后必须整页刷新出现音效按钮');
+});
+
+test('待机页轮询失败时保持页面等待下一轮', async () => {
+  const h = harness({ standby: true });
+  const poll = h.context.pollPlayback();
+  await flush();
+  h.requests[0].reject(new Error('offline'));
+  await poll;
+  assert.equal(h.reloads.count, 0);
+});
+
+test('活动页不轮询播放可用性', async () => {
+  const h = harness();
+  assert.equal(h.intervals.filter(timer => timer.ms === 2000).length, 0);
+  assert.deepEqual(h.intervals.map(timer => timer.ms), [1000], '活动页只轮询变声状态');
 });

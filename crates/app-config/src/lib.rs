@@ -4,9 +4,16 @@
 //!
 //! 使用 TOML 解析器处理字符串转义、空数组和多行配置；旧版扁平配置仍可读取。
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+
+mod voice;
+use voice::VoiceLoadNotes;
+pub use voice::{builtin_voice_presets, VoiceConfig, VoiceParamsConfig, VoicePreset};
 
 /// 音效库里的一个条目。
 ///
@@ -63,6 +70,18 @@ pub struct Config {
     /// 热键列表（与音效槽位一一对应）
     pub hotkeys: Vec<String>,
 
+    /// `[voice]` 节；旧配置没有该节时使用默认值（关闭变声）。
+    pub voice: VoiceConfig,
+    /// 用户变声预设；内置预设由代码提供，不存放在这里。
+    pub voice_presets: Vec<VoicePreset>,
+    /// 加载变声配置时产生的非阻断警告（越界钳制、条目丢弃、预设回退）。
+    pub voice_warnings: Vec<String>,
+    /// `voice_warnings` 中会在重写配置时被永久删除的内容（被拒绝的预设条目、
+    /// 类型错误的字段、被整体忽略的配置节）。
+    ///
+    /// 非空时 [`Config::load_for_write_from`] 拒绝写入：保存一次就会把这些手写内容带走。
+    pub voice_rejected: Vec<String>,
+
     /// 解析时不认识的行，原样留着。
     ///
     /// 为什么要留：这是个**用户可以直接编辑**的文本文件。早先保存时只写自己认识的键，
@@ -94,9 +113,24 @@ impl Default for Config {
             looping: false,
             monitor_device: None,
             hotkeys: Vec::new(),
+            voice: VoiceConfig::default(),
+            voice_presets: Vec::new(),
+            voice_warnings: Vec::new(),
+            voice_rejected: Vec::new(),
             unknown_lines: Vec::new(),
         }
     }
+}
+
+/// 一次宽松读取的结果：配置本身，加上需要告知用户的问题。
+#[derive(Debug, Clone)]
+pub struct LoadReport {
+    pub config: Config,
+    /// 面向用户的中文说明；调用方应写入日志并在界面或终端显示。
+    pub notices: Vec<String>,
+    /// 为 true 时 [`Config::load_for_write_from`] 会拒绝同一文件：保存将失败，
+    /// 直到用户修复文件。
+    pub write_blocked: bool,
 }
 
 /// 目标平台。
@@ -202,7 +236,11 @@ impl Config {
         base_dir().join("mixer").join("config.toml")
     }
 
-    /// 读取配置。文件不存在时返回默认值（不是错误）。
+    /// 宽松读取配置，只用于展示与启动参数。文件不存在或无法读取时返回默认值。
+    ///
+    /// 读出的配置**不能**直接改完再写回：无效 TOML 与读取失败会退化成部分内容或默认值，
+    /// 保存后原文件里的音效库与用户预设随之丢失。会写回的流程使用
+    /// [`Config::load_for_write`]。需要告知用户读取问题时使用 [`Config::load_report`]。
     pub fn load() -> Self {
         Self::load_from(&Self::path())
     }
@@ -214,15 +252,121 @@ impl Config {
         }
     }
 
+    /// 读取配置并返回需要告知用户的问题。读取本身与 [`Config::load`] 一样宽松。
+    pub fn load_report() -> LoadReport {
+        Self::load_report_from(&Self::path())
+    }
+
+    pub fn load_report_from(path: &Path) -> LoadReport {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return LoadReport {
+                    config: Self::default(),
+                    notices: Vec::new(),
+                    write_blocked: false,
+                };
+            }
+            Err(error) => {
+                return LoadReport {
+                    config: Self::default(),
+                    notices: vec![format!(
+                        "读取配置文件失败（{}）：{error}。本次按默认设置运行；\
+                         修复前保存配置会被拒绝，原文件不会被覆盖",
+                        path.display()
+                    )],
+                    write_blocked: true,
+                };
+            }
+        };
+        match text.parse::<toml::Table>() {
+            Ok(table) => {
+                let config = Self::from_table(table);
+                let mut notices = config.voice_warnings.clone();
+                let write_blocked = !config.voice_rejected.is_empty();
+                if write_blocked {
+                    notices.push(format!(
+                        "配置文件 {} 中被丢弃的变声条目仍保留在文件里；\
+                         手动修复它们之前，保存配置会被拒绝，避免把它们永久删除",
+                        path.display()
+                    ));
+                }
+                LoadReport {
+                    config,
+                    notices,
+                    write_blocked,
+                }
+            }
+            Err(error) => LoadReport {
+                config: Self::parse(&text),
+                notices: vec![format!(
+                    "配置文件 {} 不是有效 TOML（{}）。只读取了能识别的设置；\
+                     修复前保存配置会被拒绝，原文件不会被覆盖",
+                    path.display(),
+                    describe_toml_error(&text, &error)
+                )],
+                write_blocked: true,
+            },
+        }
+    }
+
+    /// 写入前的严格读取：读出的配置可以改完直接 [`Config::save_to`]。
+    ///
+    /// 只有文件不存在才使用默认值。以下情况返回错误，调用方应原样报告并放弃写入，
+    /// 磁盘上的文件保持不动：
+    /// - 读取失败（权限、编码等）；
+    /// - 不是有效 TOML：宽松回退只认旧版扁平键，重写会把 `[[sounds]]`、`[voice]`、
+    ///   `[[voice_presets]]` 降级成注释；
+    /// - 含有加载时被拒绝的变声条目（见 [`Config::voice_rejected`]）：它们不进内存，
+    ///   写回就等于永久删除。
+    ///
+    /// 钳制与激活预设回退只是规范化数值，条目仍在，不阻止写入。
+    pub fn load_for_write() -> Result<Self> {
+        Self::load_for_write_from(&Self::path())
+    }
+
+    pub fn load_for_write_from(path: &Path) -> Result<Self> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("读取配置文件失败: {}", path.display()));
+            }
+        };
+        let table = text.parse::<toml::Table>().map_err(|error| {
+            anyhow::anyhow!(
+                "配置文件 {} 不是有效 TOML（{}），已拒绝写入以免覆盖原内容；请先修复该文件",
+                path.display(),
+                describe_toml_error(&text, &error)
+            )
+        })?;
+        let config = Self::from_table(table);
+        if !config.voice_rejected.is_empty() {
+            anyhow::bail!(
+                "配置文件 {} 含有无法保留的变声条目，保存会把它们永久删除，已拒绝写入：{}。\
+                 请先在文件中修复这些条目",
+                path.display(),
+                config.voice_rejected.join("；")
+            );
+        }
+        Ok(config)
+    }
+
     pub fn save(&self) -> Result<PathBuf> {
         let path = Self::path();
-        if let Some(dir) = path.parent() {
+        self.save_to(&path)?;
+        Ok(path)
+    }
+
+    /// 保存到指定路径，写入过程原子替换目标文件。
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("创建配置目录失败: {}", dir.display()))?;
         }
-        std::fs::write(&path, self.to_text())
-            .with_context(|| format!("写入配置失败: {}", path.display()))?;
-        Ok(path)
+        write_atomic(path, &self.to_text())
     }
 
     // ── 解析
@@ -282,7 +426,14 @@ impl Config {
     }
 
     fn from_table(mut t: toml::Table) -> Self {
+        let mut notes = VoiceLoadNotes::default();
+        let voice = voice::parse_voice(t.remove("voice"), &mut notes);
+        let voice_presets = voice::parse_voice_presets(t.remove("voice_presets"), &mut notes);
         let mut c = Self {
+            voice,
+            voice_presets,
+            voice_warnings: notes.warnings,
+            voice_rejected: notes.rejected,
             input_device: take_string(&mut t, "input_device"),
             output_device: take_string(&mut t, "output_device"),
             monitor_device: take_string(&mut t, "monitor_device"),
@@ -341,6 +492,15 @@ impl Config {
                 })
                 .collect();
             c.set_sound_entries(&entries);
+        }
+        let (active_preset, enabled) = c.voice.effective_active_preset(&c.voice_presets);
+        if active_preset != c.voice.active_preset {
+            c.voice_warnings.push(format!(
+                "变声激活预设「{}」不存在，已回退到「{active_preset}」并关闭变声",
+                c.voice.active_preset
+            ));
+            c.voice.active_preset = active_preset;
+            c.voice.enabled = enabled;
         }
         c.unknown_lines = toml::to_string(&t)
             .unwrap_or_default()
@@ -426,6 +586,7 @@ impl Config {
                 .collect();
             t.insert("sounds".into(), toml::Value::Array(rows));
         }
+        voice::write_voice(&mut t, &self.voice, &self.voice_presets);
         // Unknown entries must join the document before serialization. Appending
         // them after [[sounds]] would attach them to the final sound record.
         let mut notes = Vec::new();
@@ -471,28 +632,68 @@ impl Config {
         text
     }
 
+    /// 读取一项配置的文本表示。与 `set` 共用点路径解析，未知项返回错误。
+    ///
+    /// 未设置的设备与数值输出空行，便于调用方判断"未配置"；列表按逗号分隔，
+    /// 与 `set` 的输入格式一致。布尔值输出 `true` / `false`。
+    pub fn get(&self, key: &str) -> Result<String> {
+        let value = match ConfigKey::parse(key)? {
+            ConfigKey::InputDevice => self.input_device.clone().unwrap_or_default(),
+            ConfigKey::OutputDevice => self.output_device.clone().unwrap_or_default(),
+            ConfigKey::MonitorDevice => self.monitor_device.clone().unwrap_or_default(),
+            ConfigKey::BufferMs => self.buffer_ms.map(|v| v.to_string()).unwrap_or_default(),
+            ConfigKey::MicGainDb => self.mic_gain_db.map(|v| v.to_string()).unwrap_or_default(),
+            ConfigKey::SfxGainDb => self.sfx_gain_db.map(|v| v.to_string()).unwrap_or_default(),
+            ConfigKey::Monitor => self.monitor.to_string(),
+            ConfigKey::Looping => self.looping.to_string(),
+            ConfigKey::SoundDirs => join_paths(&self.sound_dirs),
+            ConfigKey::SoundFiles => join_paths(&self.sound_files),
+            ConfigKey::SoundNames => self.sound_names.join("\n"),
+            ConfigKey::SoundTags => self.sound_tags.join("\n"),
+            ConfigKey::SoundGains => self
+                .sound_gains
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            ConfigKey::Hotkeys => self.hotkeys.join(","),
+            ConfigKey::VoiceEnabled => self.voice.enabled.to_string(),
+            ConfigKey::VoiceActivePreset => self.voice.active_preset.clone(),
+            ConfigKey::VoiceBypassHotkey => self.voice.bypass_hotkey.clone(),
+            ConfigKey::VoiceNextPresetHotkey => self.voice.next_preset_hotkey.clone(),
+            ConfigKey::VoicePrevPresetHotkey => self.voice.prev_preset_hotkey.clone(),
+        };
+        Ok(value)
+    }
+
     /// 用 `key value` 设置一项。返回是否成功。
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
         let v = value.trim();
-        match key {
-            "input_device" => {
+        match ConfigKey::parse(key)? {
+            ConfigKey::InputDevice => {
                 self.input_device = if v.is_empty() || v == "none" {
                     None
                 } else {
                     Some(v.to_string())
                 }
             }
-            "output_device" => {
+            ConfigKey::OutputDevice => {
                 self.output_device = if v.is_empty() || v == "none" {
                     None
                 } else {
                     Some(v.to_string())
                 }
             }
-            "buffer_ms" => self.buffer_ms = Some(v.parse().context("buffer_ms 需要是整数")?),
-            "mic_gain_db" => self.mic_gain_db = Some(v.parse().context("mic_gain_db 需要是数字")?),
-            "sfx_gain_db" => self.sfx_gain_db = Some(v.parse().context("sfx_gain_db 需要是数字")?),
-            "sound_dirs" => {
+            ConfigKey::BufferMs => {
+                self.buffer_ms = Some(v.parse().context("buffer_ms 需要是整数")?)
+            }
+            ConfigKey::MicGainDb => {
+                self.mic_gain_db = Some(v.parse().context("mic_gain_db 需要是数字")?)
+            }
+            ConfigKey::SfxGainDb => {
+                self.sfx_gain_db = Some(v.parse().context("sfx_gain_db 需要是数字")?)
+            }
+            ConfigKey::SoundDirs => {
                 self.sound_dirs = v
                     .split(',')
                     .map(|x| x.trim())
@@ -500,7 +701,7 @@ impl Config {
                     .map(|x| expand(x.to_string()))
                     .collect()
             }
-            "sound_files" => {
+            ConfigKey::SoundFiles => {
                 self.sound_files = v
                     .split(',')
                     .map(|x| x.trim())
@@ -508,14 +709,18 @@ impl Config {
                     .map(|x| expand(x.to_string()))
                     .collect()
             }
-            "monitor" => self.monitor = parse_bool(v),
-            "looping" => self.looping = v.parse().context("looping 需要是 true 或 false")?,
-            "monitor_device" => self.monitor_device = parse_str(v),
-            "sound_names" => {
+            ConfigKey::Monitor => self.monitor = parse_bool(v),
+            ConfigKey::Looping => {
+                self.looping = v.parse().context("looping 需要是 true 或 false")?
+            }
+            ConfigKey::MonitorDevice => self.monitor_device = parse_str(v),
+            ConfigKey::SoundNames => {
                 self.sound_names = v.split('\n').map(|x| x.trim().to_string()).collect()
             }
-            "sound_tags" => self.sound_tags = v.split('\n').map(|x| x.trim().to_string()).collect(),
-            "sound_gains" => {
+            ConfigKey::SoundTags => {
+                self.sound_tags = v.split('\n').map(|x| x.trim().to_string()).collect()
+            }
+            ConfigKey::SoundGains => {
                 self.sound_gains = v
                     .split(',')
                     .map(|x| x.trim())
@@ -523,7 +728,7 @@ impl Config {
                     .filter_map(|x| x.parse::<f32>().ok())
                     .collect()
             }
-            "hotkeys" => {
+            ConfigKey::Hotkeys => {
                 self.hotkeys = if v.is_empty() {
                     Vec::new()
                 } else {
@@ -533,11 +738,18 @@ impl Config {
                         .collect()
                 }
             }
-            other => anyhow::bail!(
-                "未知配置项「{other}」。可用：input_device / output_device / buffer_ms / \
-                 mic_gain_db / sfx_gain_db / sound_dirs / sound_files / sound_gains / \
-             monitor / looping / hotkeys"
-            ),
+            ConfigKey::VoiceEnabled => {
+                self.voice.enabled = v.parse().context("voice.enabled 需要是 true 或 false")?
+            }
+            ConfigKey::VoiceActivePreset => {
+                if self.find_voice_preset(v).is_none() {
+                    anyhow::bail!("未知的变声预设「{v}」");
+                }
+                self.voice.active_preset = v.to_owned();
+            }
+            ConfigKey::VoiceBypassHotkey => self.voice.bypass_hotkey = v.to_owned(),
+            ConfigKey::VoiceNextPresetHotkey => self.voice.next_preset_hotkey = v.to_owned(),
+            ConfigKey::VoicePrevPresetHotkey => self.voice.prev_preset_hotkey = v.to_owned(),
         }
         Ok(())
     }
@@ -673,6 +885,130 @@ impl Config {
         g.resize(count, 0.0);
         g
     }
+}
+
+/// `config get/set` 支持的点路径。
+///
+/// 键名解析与错误文案只在这里维护一份，避免 `get` 与 `set` 对同一项给出不同判断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigKey {
+    InputDevice,
+    OutputDevice,
+    MonitorDevice,
+    BufferMs,
+    MicGainDb,
+    SfxGainDb,
+    Monitor,
+    Looping,
+    SoundDirs,
+    SoundFiles,
+    SoundNames,
+    SoundTags,
+    SoundGains,
+    Hotkeys,
+    VoiceEnabled,
+    VoiceActivePreset,
+    VoiceBypassHotkey,
+    VoiceNextPresetHotkey,
+    VoicePrevPresetHotkey,
+}
+
+const CONFIG_KEY_LIST: &str = "input_device / output_device / monitor_device / buffer_ms / \
+     mic_gain_db / sfx_gain_db / sound_dirs / sound_files / sound_names / sound_tags / \
+     sound_gains / monitor / looping / hotkeys / voice.enabled / voice.active_preset / \
+     voice.bypass_hotkey / voice.next_preset_hotkey / voice.prev_preset_hotkey";
+
+impl ConfigKey {
+    fn parse(key: &str) -> Result<Self> {
+        Ok(match key {
+            "input_device" => Self::InputDevice,
+            "output_device" => Self::OutputDevice,
+            "monitor_device" => Self::MonitorDevice,
+            "buffer_ms" => Self::BufferMs,
+            "mic_gain_db" => Self::MicGainDb,
+            "sfx_gain_db" => Self::SfxGainDb,
+            "monitor" => Self::Monitor,
+            "looping" => Self::Looping,
+            "sound_dirs" => Self::SoundDirs,
+            "sound_files" => Self::SoundFiles,
+            "sound_names" => Self::SoundNames,
+            "sound_tags" => Self::SoundTags,
+            "sound_gains" => Self::SoundGains,
+            "hotkeys" => Self::Hotkeys,
+            "voice.enabled" => Self::VoiceEnabled,
+            "voice.active_preset" => Self::VoiceActivePreset,
+            "voice.bypass_hotkey" => Self::VoiceBypassHotkey,
+            "voice.next_preset_hotkey" => Self::VoiceNextPresetHotkey,
+            "voice.prev_preset_hotkey" => Self::VoicePrevPresetHotkey,
+            other => anyhow::bail!("未知配置项「{other}」。可用：{CONFIG_KEY_LIST}"),
+        })
+    }
+}
+
+/// 把 TOML 解析错误整理成「第 N 行：原因」，避免带出多行源码片段。
+fn describe_toml_error(text: &str, error: &toml::de::Error) -> String {
+    match error.span() {
+        Some(span) => {
+            let upto = span.start.min(text.len());
+            let line = text.as_bytes()[..upto]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count()
+                + 1;
+            format!("第 {line} 行：{}", error.message())
+        }
+        None => error.message().to_owned(),
+    }
+}
+
+fn join_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|path| path.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// 原子写入配置文本：同目录临时文件写完并同步后，重命名覆盖目标。
+///
+/// 临时文件必须与目标同目录，重命名才不会跨文件系统。任一步失败都删除临时文件，
+/// 目标路径上的旧配置保持原样。
+fn write_atomic(path: &Path, text: &str) -> Result<()> {
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("配置路径缺少文件名: {}", path.display()))?;
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let temp_path = dir.join(format!(
+        ".{}.{}.{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        nanos,
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::File::create(&temp_path)
+            .with_context(|| format!("创建临时配置文件失败: {}", temp_path.display()))?;
+        file.write_all(text.as_bytes())
+            .with_context(|| format!("写入临时配置文件失败: {}", temp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("同步临时配置文件失败: {}", temp_path.display()))?;
+        drop(file);
+        std::fs::rename(&temp_path, path)
+            .with_context(|| format!("替换配置文件失败: {}", path.display()))
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
 }
 
 fn parse_str(v: &str) -> Option<String> {
@@ -988,6 +1324,9 @@ mod path_tests {
 
 #[cfg(test)]
 mod tests {
+    // 测试名保留 ID 等缩写，行为描述比机械转成 snake_case 更重要。
+    #![allow(non_snake_case)]
+
     use super::*;
 
     #[test]
@@ -1171,6 +1510,10 @@ sfx_gain_db = -9
             looping: false,
             monitor_device: None,
             hotkeys: vec!["F1".into(), "F2".into()],
+            voice: VoiceConfig::default(),
+            voice_presets: Vec::new(),
+            voice_warnings: Vec::new(),
+            voice_rejected: Vec::new(),
             unknown_lines: Vec::new(),
         };
         let round = Config::parse(&c.to_text());
@@ -1400,6 +1743,812 @@ value = "second"
         assert_eq!(c.sound_dirs[0], expected);
         let c = Config::parse(r#"sound_files = ["~/Sounds"]"#);
         assert_eq!(c.sound_files[0], expected);
+    }
+
+    struct TemporaryDirectory(PathBuf);
+
+    impl TemporaryDirectory {
+        fn new(label: &str) -> Self {
+            static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("系统时钟早于 UNIX_EPOCH")
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "mixer-config-{label}-{}-{nanos}-{}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TemporaryDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn 保存后旧文件被完整替换() {
+        let dir = TemporaryDirectory::new("replace");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "output_device = \"旧设备\"\nbuffer_ms = 10\n").unwrap();
+        let config = Config {
+            output_device: Some("新设备".into()),
+            buffer_ms: Some(40),
+            monitor: false,
+            ..Default::default()
+        };
+        config.save_to(&path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("旧设备"), "旧值仍然存在：\n{saved}");
+        let restored = Config::load_from(&path);
+        assert_eq!(restored.output_device.as_deref(), Some("新设备"));
+        assert_eq!(restored.buffer_ms, Some(40));
+        assert!(!restored.monitor, "显式关闭的监听必须保存并恢复");
+    }
+
+    #[test]
+    fn 保存失败保留旧文件() {
+        let dir = TemporaryDirectory::new("failure");
+        let target = dir.path().join("目标目录");
+        std::fs::create_dir(&target).unwrap();
+        let old_path = target.join("config.toml");
+        const OLD: &str = "output_device = \"旧设备\"\n";
+        std::fs::write(&old_path, OLD).unwrap();
+
+        let config = Config {
+            output_device: Some("新设备".into()),
+            ..Default::default()
+        };
+        assert!(
+            config.save_to(&target).is_err(),
+            "目标路径是目录时保存必须失败"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&old_path).unwrap(),
+            OLD,
+            "保存失败不能改动旧文件"
+        );
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            [std::ffi::OsString::from("目标目录")],
+            "失败后残留临时文件"
+        );
+    }
+
+    #[test]
+    fn 未知键与音效条目在原子保存后仍保留() {
+        let dir = TemporaryDirectory::new("unknown");
+        let path = dir.path().join("config.toml");
+        let text = r#"
+future_scalar = "keep,me"
+[[sounds]]
+id = "stable-id"
+path = 'C:\Users\Doe, John\sound.wav'
+name = "Good"
+gain_db = -9.0
+tags = ["literal,tag", "another"]
+hotkey = "F2"
+"#;
+        let original = Config::try_parse(text).unwrap();
+        original.save_to(&path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let document = saved.parse::<toml::Table>().unwrap();
+        assert_eq!(document["future_scalar"].as_str(), Some("keep,me"));
+        let restored = Config::try_parse(&saved).unwrap();
+        assert!(
+            restored
+                .unknown_lines
+                .iter()
+                .any(|line| line.contains("future_scalar")),
+            "未知键丢失：\n{saved}"
+        );
+        assert_eq!(restored.sound_entries(), original.sound_entries());
+        assert_eq!(
+            restored.sound_entries()[0].tags,
+            ["literal,tag", "another"],
+            "音效标签不能按标点拆分"
+        );
+    }
+
+    #[test]
+    fn 保存后不留下临时文件() {
+        let dir = TemporaryDirectory::new("clean");
+        let path = dir.path().join("config.toml");
+        Config::default().save_to(&path).unwrap();
+        let mut names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [std::ffi::OsString::from("config.toml")],
+            "目录里有残留文件"
+        );
+    }
+
+    #[test]
+    fn 旧配置没有变声节时视为关闭() {
+        let config = Config::try_parse("buffer_ms = 20\nmonitor = false\n").unwrap();
+        assert!(!config.voice.enabled, "旧配置不能自动启用变声");
+        assert_eq!(config.voice.active_preset, "builtin:female");
+        assert!(config.voice.bypass_hotkey.is_empty());
+        assert!(config.voice.next_preset_hotkey.is_empty());
+        assert!(config.voice.prev_preset_hotkey.is_empty());
+        assert!(config.voice_presets.is_empty());
+        assert!(config.voice_warnings.is_empty());
+    }
+
+    #[test]
+    fn 变声配置与用户预设完整往返() {
+        let params = VoiceParamsConfig {
+            pitch_semitones: 3.5,
+            formant_semitones: -2.5,
+            gate_enabled: true,
+            gate_db: -48.0,
+            eq_low_enabled: true,
+            eq_low_db: -3.5,
+            eq_mid_enabled: true,
+            eq_mid_db: 1.5,
+            eq_high_enabled: true,
+            eq_high_db: 4.0,
+            drive_enabled: true,
+            drive: 0.4,
+            robot_enabled: true,
+            robot_hz: 123.0,
+            robot_mix: 0.6,
+        };
+        let mut config = Config::default();
+        config.voice.enabled = true;
+        config.voice.active_preset = "user:mine-abc123".into();
+        config.voice.bypass_hotkey = "Cmd+Shift+B".into();
+        config.voice.next_preset_hotkey = "Cmd+Shift+Right".into();
+        config.voice.prev_preset_hotkey = "Cmd+Shift+Left".into();
+        config.voice_presets.push(VoicePreset {
+            id: "user:mine-abc123".into(),
+            name: "我的声音".into(),
+            params,
+            unknown_lines: Vec::new(),
+        });
+
+        let text = config.to_text();
+        let round = Config::try_parse(&text).unwrap();
+        assert_eq!(round, config, "变声配置与用户预设应无损往返");
+        assert_eq!(
+            round.find_voice_preset("user:mine-abc123"),
+            Some(VoicePreset {
+                id: "user:mine-abc123".into(),
+                name: "我的声音".into(),
+                params,
+                unknown_lines: Vec::new(),
+            })
+        );
+
+        let builtins = builtin_voice_presets();
+        assert_eq!(
+            builtins.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            [
+                "builtin:female",
+                "builtin:male",
+                "builtin:child",
+                "builtin:deep",
+                "builtin:robot",
+                "builtin:radio",
+            ]
+        );
+        assert_eq!(
+            builtins.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            ["女声", "男声", "小孩", "低沉", "机器人", "对讲机"]
+        );
+        let by_id = |id: &str| {
+            builtins
+                .iter()
+                .find(|preset| preset.id == id)
+                .unwrap()
+                .params
+        };
+        let female = by_id("builtin:female");
+        assert_eq!(
+            (female.pitch_semitones, female.formant_semitones),
+            (4.0, 3.0)
+        );
+        assert!(female.gate_enabled);
+        assert_eq!(female.gate_db, -45.0);
+        assert!(female.eq_high_enabled);
+        assert_eq!(female.eq_high_db, 2.0);
+        assert!(!female.eq_low_enabled && !female.eq_mid_enabled);
+        assert!(!female.drive_enabled && !female.robot_enabled);
+        let robot = by_id("builtin:robot");
+        assert!(robot.drive_enabled);
+        assert_eq!(robot.drive, 0.2);
+        assert!(robot.robot_enabled);
+        assert_eq!((robot.robot_hz, robot.robot_mix), (50.0, 0.8));
+        let radio = by_id("builtin:radio");
+        assert!(radio.gate_enabled);
+        assert_eq!(radio.gate_db, -50.0);
+        assert!(radio.eq_low_enabled && radio.eq_mid_enabled && radio.eq_high_enabled);
+        assert_eq!(
+            (radio.eq_low_db, radio.eq_mid_db, radio.eq_high_db),
+            (-9.0, 4.0, -9.0)
+        );
+        assert!(radio.drive_enabled);
+        assert_eq!(radio.drive, 0.35);
+        assert!(!radio.robot_enabled);
+    }
+
+    #[test]
+    fn 未知变声键与预设字段保留往返() {
+        let text = r#"
+[voice]
+enabled = true
+active_preset = "user:mine-abc123"
+future_voice_key = "keep,me"
+
+[[voice_presets]]
+id = "user:mine-abc123"
+name = "我的声音"
+pitch_semitones = 2.0
+future_preset_key = 7
+"#;
+        let config = Config::try_parse(text).unwrap();
+        assert!(
+            config
+                .voice
+                .unknown_lines
+                .iter()
+                .any(|line| line.contains("future_voice_key")),
+            "未知变声键未保留：{:?}",
+            config.voice.unknown_lines
+        );
+        assert!(
+            config.voice_presets[0]
+                .unknown_lines
+                .iter()
+                .any(|line| line.contains("future_preset_key")),
+            "未知预设字段未保留：{:?}",
+            config.voice_presets[0].unknown_lines
+        );
+
+        let serialized = config.to_text();
+        let document = serialized.parse::<toml::Table>().unwrap();
+        assert_eq!(
+            document["voice"]["future_voice_key"].as_str(),
+            Some("keep,me")
+        );
+        assert_eq!(
+            document["voice_presets"][0]["future_preset_key"].as_integer(),
+            Some(7)
+        );
+        let round = Config::try_parse(&serialized).unwrap();
+        assert_eq!(round.voice.unknown_lines, config.voice.unknown_lines);
+        assert_eq!(
+            round.voice_presets[0].unknown_lines,
+            config.voice_presets[0].unknown_lines
+        );
+        assert_eq!(
+            round.to_text().parse::<toml::Table>().unwrap(),
+            document,
+            "未知键在第二次往返后不应漂移"
+        );
+    }
+
+    #[test]
+    fn 激活预设缺失时回退女声并关闭() {
+        let config =
+            Config::try_parse("[voice]\nenabled = true\nactive_preset = \"user:missing\"\n")
+                .unwrap();
+        assert_eq!(config.voice.active_preset, "builtin:female");
+        assert!(!config.voice.enabled, "缺失预设时必须关闭变声");
+        assert!(
+            config
+                .voice_warnings
+                .iter()
+                .any(|warning| warning.contains("user:missing")),
+            "缺失预设应产生警告：{:?}",
+            config.voice_warnings
+        );
+        assert_eq!(
+            config.voice.effective_active_preset(&config.voice_presets),
+            ("builtin:female".into(), false)
+        );
+    }
+
+    #[test]
+    fn 重复预设_ID_与空名称被拒绝() {
+        let text = r#"
+[[voice_presets]]
+id = "user:first"
+name = "第一个"
+pitch_semitones = 1.0
+
+[[voice_presets]]
+id = "user:first"
+name = "重复标识"
+
+[[voice_presets]]
+id = "user:blank"
+name = "   "
+
+[[voice_presets]]
+id = "builtin:female"
+name = "非法前缀"
+
+[[voice_presets]]
+id = "user:last"
+name = "最后一个"
+pitch_semitones = 9.0
+"#;
+        let config = Config::try_parse(text).unwrap();
+        let ids: Vec<_> = config
+            .voice_presets
+            .iter()
+            .map(|preset| preset.id.as_str())
+            .collect();
+        assert_eq!(ids, ["user:first", "user:last"]);
+        assert!(
+            config.voice_warnings.len() >= 3,
+            "被丢弃的条目都应记录警告：{:?}",
+            config.voice_warnings
+        );
+        assert!(config.find_voice_preset("user:first").is_some());
+        assert!(config.find_voice_preset("user:last").is_some());
+        assert!(config.find_voice_preset("user:blank").is_none());
+    }
+
+    #[test]
+    fn 越界参数在加载时钳制并警告() {
+        let text = r#"
+[voice]
+active_preset = "user:hot"
+
+[[voice_presets]]
+id = "user:hot"
+name = "越界参数"
+pitch_semitones = 30.0
+formant_semitones = -20.0
+gate_enabled = true
+gate_db = 10.0
+eq_low_enabled = true
+eq_low_db = 20.0
+eq_mid_enabled = true
+eq_mid_db = -20.0
+eq_high_enabled = true
+eq_high_db = 13.0
+drive_enabled = true
+drive = 2.0
+robot_enabled = true
+robot_hz = 2000.0
+robot_mix = -1.0
+"#;
+        let config = Config::try_parse(text).unwrap();
+        let params = config.voice_presets[0].params;
+        assert_eq!(params.pitch_semitones, 24.0);
+        assert_eq!(params.formant_semitones, -12.0);
+        assert_eq!(params.gate_db, 0.0);
+        assert_eq!(params.eq_low_db, 12.0);
+        assert_eq!(params.eq_mid_db, -12.0);
+        assert_eq!(params.eq_high_db, 12.0);
+        assert_eq!(params.drive, 1.0);
+        assert_eq!(params.robot_hz, 1000.0);
+        assert_eq!(params.robot_mix, 0.0);
+        assert!(
+            config
+                .voice_warnings
+                .iter()
+                .any(|warning| warning.contains("越界参数")),
+            "钳制应产生警告：{:?}",
+            config.voice_warnings
+        );
+
+        let round = Config::try_parse(&config.to_text()).unwrap();
+        assert_eq!(round.voice_presets, config.voice_presets);
+        assert!(
+            round.voice_warnings.is_empty(),
+            "已钳制的值再次加载不应重复警告：{:?}",
+            round.voice_warnings
+        );
+    }
+
+    #[test]
+    fn 用户预设_ID_稳定且不重复() {
+        let config = Config::default();
+        let first = config.new_user_preset_id("My Voice");
+        let second = config.new_user_preset_id("My Voice");
+        assert_ne!(first, second, "同名两次创建必须得到不同 ID");
+        assert!(first.starts_with("user:"), "用户预设 ID 前缀错误：{first}");
+        for id in [&first, &second] {
+            let suffix = id.rsplit_once('-').expect("ID 应包含名称片段与后缀").1;
+            assert_eq!(suffix.len(), 6, "随机后缀应为 6 位十六进制：{id}");
+            assert!(
+                suffix.chars().all(|ch| ch.is_ascii_hexdigit()),
+                "随机后缀应为十六进制：{id}"
+            );
+        }
+        assert!(config.new_user_preset_id("中文名称").starts_with("user:"));
+
+        let mut preset = VoicePreset {
+            id: first.clone(),
+            name: "My Voice".into(),
+            params: VoiceParamsConfig::neutral(),
+            unknown_lines: Vec::new(),
+        };
+        preset.name = "重命名后".into();
+        assert_eq!(preset.id, first, "重命名不能改变已有预设 ID");
+    }
+
+    #[test]
+    fn 内置预设只读且不在配置中重复写入() {
+        let mut config = Config {
+            voice_presets: builtin_voice_presets(),
+            ..Default::default()
+        };
+        config.voice_presets.push(VoicePreset {
+            id: "user:mine-abc123".into(),
+            name: "我的声音".into(),
+            params: VoiceParamsConfig {
+                pitch_semitones: 1.0,
+                ..VoiceParamsConfig::neutral()
+            },
+            unknown_lines: Vec::new(),
+        });
+
+        let document = config.to_text().parse::<toml::Table>().unwrap();
+        let saved = document["voice_presets"].as_array().unwrap();
+        assert_eq!(saved.len(), 1, "只有用户预设应写入配置：{saved:?}");
+        assert_eq!(saved[0]["id"].as_str(), Some("user:mine-abc123"));
+        assert!(
+            saved.iter().all(|row| !row["id"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("builtin:")),
+            "内置预设不能写入配置：{saved:?}"
+        );
+    }
+
+    #[test]
+    fn 变声配置点路径写入与读取() {
+        let mut config = Config::default();
+        config.set("voice.enabled", "true").unwrap();
+        assert!(config.voice.enabled);
+        config.set("voice.enabled", "false").unwrap();
+        assert!(!config.voice.enabled);
+        assert!(config.set("voice.enabled", "yes").is_err());
+
+        config.set("voice.active_preset", "builtin:male").unwrap();
+        assert_eq!(config.voice.active_preset, "builtin:male");
+        assert!(
+            config.set("voice.active_preset", "user:missing").is_err(),
+            "激活预设必须存在"
+        );
+        assert_eq!(config.voice.active_preset, "builtin:male");
+
+        config.set("voice.bypass_hotkey", "Cmd+Shift+B").unwrap();
+        config
+            .set("voice.next_preset_hotkey", "Cmd+Shift+Right")
+            .unwrap();
+        config
+            .set("voice.prev_preset_hotkey", "Cmd+Shift+Left")
+            .unwrap();
+        assert_eq!(config.voice.bypass_hotkey, "Cmd+Shift+B");
+        assert_eq!(config.voice.next_preset_hotkey, "Cmd+Shift+Right");
+        assert_eq!(config.voice.prev_preset_hotkey, "Cmd+Shift+Left");
+
+        assert!(config.set("voice.unknown", "1").is_err());
+        assert!(config.set("voice.presets.name", "1").is_err());
+
+        let round = Config::try_parse(&config.to_text()).unwrap();
+        assert_eq!(round.voice, config.voice);
+    }
+
+    #[test]
+    fn 变声配置原子保存失败保留旧文件() {
+        let dir = TemporaryDirectory::new("voice-failure");
+        let target = dir.path().join("目标目录");
+        std::fs::create_dir(&target).unwrap();
+        let old_path = target.join("config.toml");
+        const OLD: &str = "[voice]\nenabled = false\nactive_preset = \"builtin:female\"\n";
+        std::fs::write(&old_path, OLD).unwrap();
+
+        let mut config = Config::default();
+        config.set("voice.enabled", "true").unwrap();
+        config.set("voice.active_preset", "builtin:male").unwrap();
+        assert!(
+            config.save_to(&target).is_err(),
+            "目标路径是目录时保存必须失败"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&old_path).unwrap(),
+            OLD,
+            "保存失败不能改动旧文件"
+        );
+    }
+
+    // ── 写入前的严格读取
+
+    /// 音效库、变声节与用户预设俱全，只有 Windows 路径里的一处非法反斜杠转义。
+    const INVALID_TOML_WITH_LIBRARY_AND_VOICE: &str = concat!(
+        "[[sounds]]\n",
+        "id = \"s1\"\n",
+        "path = \"C:\\Users\\Doe\\a.wav\"\n",
+        "name = \"笑声\"\n",
+        "\n",
+        "[voice]\n",
+        "enabled = true\n",
+        "active_preset = \"user:mine-abc123\"\n",
+        "\n",
+        "[[voice_presets]]\n",
+        "id = \"user:mine-abc123\"\n",
+        "name = \"我的声音\"\n",
+        "pitch_semitones = 3.0\n",
+    );
+
+    fn write_config(dir: &TemporaryDirectory, text: &str) -> PathBuf {
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    #[test]
+    fn 写入前读取遇到无效_TOML_拒绝且保留原文件() {
+        let dir = TemporaryDirectory::new("strict-invalid");
+        let path = write_config(&dir, INVALID_TOML_WITH_LIBRARY_AND_VOICE);
+
+        let error = Config::load_for_write_from(&path).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("不是有效 TOML"), "{message}");
+        assert!(message.contains("第 3 行"), "应指出出错行：{message}");
+        assert!(message.contains("拒绝写入"), "{message}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            INVALID_TOML_WITH_LIBRARY_AND_VOICE,
+            "拒绝写入时磁盘上的文件必须保持原样"
+        );
+    }
+
+    #[test]
+    fn 写入前读取文件不存在时使用默认配置() {
+        let dir = TemporaryDirectory::new("strict-missing");
+        let path = dir.path().join("尚未创建").join("config.toml");
+
+        let config = Config::load_for_write_from(&path).unwrap();
+        assert_eq!(config, Config::default());
+        assert!(!path.exists(), "读取不应创建文件");
+    }
+
+    #[test]
+    fn 写入前读取无法读取时报错() {
+        let dir = TemporaryDirectory::new("strict-unreadable");
+        // 目录无法按文件读取：这类错误不能被当成「没有配置」。
+        let error = Config::load_for_write_from(dir.path()).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("读取配置文件失败"),
+            "{error:#}"
+        );
+
+        let bytes = vec![0xff, 0xfe, 0x00, b'['];
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, &bytes).unwrap();
+        let error = Config::load_for_write_from(&path).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("读取配置文件失败"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn 写入前读取遇到被拒绝的变声条目拒绝写入() {
+        let cases = [
+            (
+                "缺少 user: 前缀",
+                "[[voice_presets]]\nid = \"mine\"\nname = \"甲\"\n",
+                "缺少 user: 前缀",
+            ),
+            (
+                "名称为空",
+                "[[voice_presets]]\nid = \"user:a\"\nname = \"  \"\n",
+                "名称为空",
+            ),
+            (
+                "重复 ID",
+                "[[voice_presets]]\nid = \"user:a\"\nname = \"甲\"\n\
+                 [[voice_presets]]\nid = \"user:a\"\nname = \"乙\"\n",
+                "重复",
+            ),
+            ("条目不是表格", "voice_presets = [1]\n", "不是表格"),
+            ("预设列表不是数组", "voice_presets = \"x\"\n", "不是数组"),
+            ("voice 节不是表格", "voice = 3\n", "[voice]"),
+            (
+                "启用值类型错误",
+                "[voice]\nenabled = \"yes\"\n",
+                "voice.enabled",
+            ),
+            (
+                "热键类型错误",
+                "[voice]\nbypass_hotkey = 7\n",
+                "voice.bypass_hotkey",
+            ),
+            (
+                "预设数值字段类型错误",
+                "[[voice_presets]]\nid = \"user:a\"\nname = \"甲\"\npitch_semitones = [1]\n",
+                "pitch_semitones",
+            ),
+            (
+                "预设开关字段类型错误",
+                "[[voice_presets]]\nid = \"user:a\"\nname = \"甲\"\ngate_enabled = \"on\"\n",
+                "gate_enabled",
+            ),
+        ];
+        for (label, voice_text, reason) in cases {
+            let dir = TemporaryDirectory::new("strict-rejected");
+            // 顶层键必须出现在任何表头之前，否则会被归入前一个表。
+            let text = format!("buffer_ms = 40\n{voice_text}\n[[sounds]]\npath = \"/a.wav\"\n");
+            let path = write_config(&dir, &text);
+
+            let error = Config::load_for_write_from(&path).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("拒绝写入"), "{label}：{message}");
+            assert!(message.contains(reason), "{label} 应说明原因：{message}");
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                text,
+                "{label}：拒绝写入时不得改动文件"
+            );
+
+            let report = Config::load_report_from(&path);
+            assert!(report.write_blocked, "{label}");
+            assert!(
+                report.notices.iter().any(|notice| notice.contains(reason)),
+                "{label} 的提示应包含原因：{:?}",
+                report.notices
+            );
+            assert_eq!(
+                report.config.sound_entries().len(),
+                1,
+                "{label}：读取仍应保留其余配置"
+            );
+        }
+    }
+
+    #[test]
+    fn 写入前读取接受仅钳制或回退的警告() {
+        let dir = TemporaryDirectory::new("strict-normalized");
+        let path = write_config(
+            &dir,
+            "[voice]\nenabled = true\nactive_preset = \"user:gone\"\n\n\
+             [[voice_presets]]\nid = \"user:hot\"\nname = \"越界\"\npitch_semitones = 99.0\n",
+        );
+
+        let config = Config::load_for_write_from(&path).unwrap();
+        assert!(config.voice_rejected.is_empty());
+        assert!(
+            config.voice_warnings.len() >= 2,
+            "钳制与回退仍应留下警告：{:?}",
+            config.voice_warnings
+        );
+        assert_eq!(config.voice_presets[0].params.pitch_semitones, 24.0);
+        assert_eq!(config.voice.active_preset, "builtin:female");
+        assert!(!config.voice.enabled);
+
+        let report = Config::load_report_from(&path);
+        assert!(!report.write_blocked, "规范化数值不应阻止保存");
+        assert_eq!(report.notices, config.voice_warnings);
+    }
+
+    #[test]
+    fn 写入前读取成功后保存保留音效库用户预设与未知键() {
+        let dir = TemporaryDirectory::new("strict-roundtrip");
+        let path = write_config(
+            &dir,
+            r#"
+future_scalar = "keep,me"
+
+[[sounds]]
+id = "s1"
+path = "C:\\Users\\Doe\\a.wav"
+name = "笑声"
+hotkey = "F1"
+
+[voice]
+enabled = true
+active_preset = "user:mine-abc123"
+
+[[voice_presets]]
+id = "user:mine-abc123"
+name = "我的声音"
+pitch_semitones = 3.0
+"#,
+        );
+
+        let mut config = Config::load_for_write_from(&path).unwrap();
+        config.voice.enabled = false;
+        config.save_to(&path).unwrap();
+
+        let saved = Config::load_for_write_from(&path).unwrap();
+        assert!(!saved.voice.enabled);
+        assert_eq!(saved.sound_entries(), config.sound_entries());
+        assert_eq!(saved.voice_presets, config.voice_presets);
+        assert_eq!(saved.voice_presets[0].params.pitch_semitones, 3.0);
+        assert!(saved
+            .unknown_lines
+            .iter()
+            .any(|line| line.contains("future_scalar")));
+    }
+
+    #[test]
+    fn 加载报告在无效_TOML_时提示并阻止写入() {
+        let dir = TemporaryDirectory::new("report-invalid");
+        let text = format!("buffer_ms = 40\n{INVALID_TOML_WITH_LIBRARY_AND_VOICE}");
+        let path = write_config(&dir, &text);
+
+        let report = Config::load_report_from(&path);
+        assert!(report.write_blocked);
+        assert_eq!(report.notices.len(), 1, "{:?}", report.notices);
+        assert!(report.notices[0].contains("不是有效 TOML"));
+        assert!(report.notices[0].contains(&path.display().to_string()));
+        assert_eq!(
+            report.config.buffer_ms,
+            Some(40),
+            "宽松读取仍应保留能识别的设置"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn 加载报告在读取失败时用默认值并阻止写入() {
+        let dir = TemporaryDirectory::new("report-unreadable");
+        let report = Config::load_report_from(dir.path());
+        assert!(report.write_blocked);
+        assert_eq!(report.config, Config::default());
+        assert!(report.notices[0].contains("读取配置文件失败"));
+    }
+
+    #[test]
+    fn 加载报告在配置正常或缺失时没有提示() {
+        let dir = TemporaryDirectory::new("report-clean");
+        let missing = Config::load_report_from(&dir.path().join("config.toml"));
+        assert!(missing.notices.is_empty() && !missing.write_blocked);
+
+        let path = write_config(&dir, "buffer_ms = 40\n[voice]\nenabled = false\n");
+        let report = Config::load_report_from(&path);
+        assert!(report.notices.is_empty() && !report.write_blocked);
+        assert_eq!(report.config.buffer_ms, Some(40));
+    }
+
+    #[test]
+    fn 被拒绝的变声条目进入警告列表且被拒绝列表是其子集() {
+        let config = Config::try_parse(
+            "[[voice_presets]]\nid = \"user:a\"\nname = \"\"\n\n\
+             [[voice_presets]]\nid = \"user:b\"\nname = \"越界\"\npitch_semitones = 99.0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.voice_rejected.len(),
+            1,
+            "{:?}",
+            config.voice_rejected
+        );
+        assert!(config
+            .voice_rejected
+            .iter()
+            .all(|item| config.voice_warnings.contains(item)));
+        assert_eq!(
+            config.voice_warnings.len(),
+            2,
+            "被拒绝与被钳制的条目都应有提示"
+        );
     }
 }
 

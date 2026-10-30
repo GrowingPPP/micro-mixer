@@ -250,7 +250,9 @@ pub(super) fn pump_windows_messages() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{HotkeyManager, Hotkeys, ManagerOwner};
+    use crate::{HotkeyGroup, HotkeyGroups, HotkeyManager, Hotkeys, ManagerOwner};
+    use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
+    use std::collections::VecDeque;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -299,11 +301,16 @@ mod tests {
         }
     }
 
-    fn fake(rejected: u32) -> (Arc<HotkeyManager>, Calls, Arc<AtomicUsize>) {
+    type TestEvents = Arc<Mutex<VecDeque<GlobalHotKeyEvent>>>;
+
+    fn fake_with_events(
+        rejected: u32,
+    ) -> (Arc<HotkeyManager>, Calls, Arc<AtomicUsize>, TestEvents) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let pumps = Arc::new(AtomicUsize::new(0));
+        let queue: TestEvents = Arc::new(Mutex::new(VecDeque::new()));
         let events = Arc::new(EventInbox {
-            local: Some(Arc::new(Mutex::new(std::collections::VecDeque::new()))),
+            local: Some(queue.clone()),
         });
         let worker_calls = calls.clone();
         let worker_pumps = pumps.clone();
@@ -330,7 +337,20 @@ mod tests {
             }),
             calls,
             pumps,
+            queue,
         )
+    }
+
+    fn fake(rejected: u32) -> (Arc<HotkeyManager>, Calls, Arc<AtomicUsize>) {
+        let (manager, calls, pumps, _) = fake_with_events(rejected);
+        (manager, calls, pumps)
+    }
+
+    fn pressed(id: u32) -> GlobalHotKeyEvent {
+        GlobalHotKeyEvent {
+            id,
+            state: HotKeyState::Pressed,
+        }
     }
 
     #[test]
@@ -521,5 +541,112 @@ mod tests {
         std::thread::spawn(move || drop(keys)).join().unwrap();
         let rebound = Hotkeys::bind_to_slots(&["Ctrl+Alt+Shift+F23".into()]).unwrap();
         assert_eq!(rebound.len(), 1);
+    }
+
+    #[test]
+    fn 变声热键在待机时保持注册() {
+        let (manager, _, _, _) = fake_with_events(0);
+        let slots = Hotkeys::bind_with(manager.clone(), &["F1".into()]).unwrap();
+        let voice = Hotkeys::bind_with(manager, &["F9".into(), "F10".into(), "F8".into()]).unwrap();
+        let mut groups = HotkeyGroups::new(Some(slots), Some(voice));
+
+        groups.standby().unwrap();
+
+        assert!(!groups.slots_bound(), "待机必须让出音效槽位按键");
+        assert!(
+            groups.voice_hotkeys().is_some_and(Hotkeys::is_bound),
+            "待机时人声效果热键必须保持注册"
+        );
+    }
+
+    #[test]
+    fn 释放音频会话保留变声热键并注销槽位() {
+        let (manager, _, _, events) = fake_with_events(0);
+        let slots = Hotkeys::bind_with(manager.clone(), &["F1".into()]).unwrap();
+        let voice = Hotkeys::bind_with(manager, &["F9".into()]).unwrap();
+        let mut groups = HotkeyGroups::new(Some(slots), Some(voice));
+
+        groups.end_session().unwrap();
+
+        assert!(!groups.slots_bound(), "会话释放必须让出槽位按键");
+        assert!(
+            groups.voice_hotkeys().is_some_and(Hotkeys::is_bound),
+            "会话释放后变声热键必须继续注册"
+        );
+        events
+            .lock()
+            .unwrap()
+            .push_back(pressed(crate::parse_hotkey("F9").unwrap().id()));
+        assert_eq!(
+            groups.poll_actions(),
+            vec![(HotkeyGroup::Voice, 0)],
+            "无会话时变声按键仍必须被消费"
+        );
+        events
+            .lock()
+            .unwrap()
+            .push_back(pressed(crate::parse_hotkey("F1").unwrap().id()));
+        assert!(
+            groups.poll_actions().is_empty(),
+            "释放后旧槽位按键不能再被消费"
+        );
+    }
+
+    #[test]
+    fn 进程退出注销全部变声热键() {
+        let (manager, _, _, events) = fake_with_events(0);
+        let slots = Hotkeys::bind_with(manager.clone(), &["F1".into()]).unwrap();
+        let voice = Hotkeys::bind_with(manager, &["F9".into()]).unwrap();
+        let mut groups = HotkeyGroups::new(Some(slots), Some(voice));
+
+        groups.shutdown().unwrap();
+
+        assert!(!groups.slots_bound());
+        assert!(
+            groups.voice_hotkeys().is_none(),
+            "进程退出必须注销并丢弃变声热键"
+        );
+        events
+            .lock()
+            .unwrap()
+            .push_back(pressed(crate::parse_hotkey("F9").unwrap().id()));
+        assert!(groups.poll_actions().is_empty(), "退出后不再消费事件");
+    }
+
+    #[test]
+    fn 两组热键共享事件通道时按组路由() {
+        let (manager, _, _, events) = fake_with_events(0);
+        let slots = Hotkeys::bind_with(manager.clone(), &["F1".into()]).unwrap();
+        let voice = Hotkeys::bind_with(manager, &["F9".into()]).unwrap();
+        let groups = HotkeyGroups::new(Some(slots), Some(voice));
+
+        events
+            .lock()
+            .unwrap()
+            .push_back(pressed(crate::parse_hotkey("F1").unwrap().id()));
+        events
+            .lock()
+            .unwrap()
+            .push_back(pressed(crate::parse_hotkey("F9").unwrap().id()));
+
+        assert_eq!(
+            groups.poll_actions(),
+            vec![(HotkeyGroup::Slots, 0), (HotkeyGroup::Voice, 0)],
+            "同一消费者排水后必须把按键送回各自集合"
+        );
+    }
+
+    #[test]
+    fn 重绑失败保留旧键() {
+        let f1 = crate::parse_hotkey("F1").unwrap().id();
+        let f2 = crate::parse_hotkey("F2").unwrap().id();
+        let (manager, _, _, events) = fake_with_events(f2);
+        let mut keys = Hotkeys::bind_with(manager, &["F1".into()]).unwrap();
+
+        assert!(keys.rebind(&["F2".into()]).is_err());
+        assert_eq!(keys.bindings(), &[("F1".into(), 0)], "失败必须保留旧绑定");
+
+        events.lock().unwrap().push_back(pressed(f1));
+        assert_eq!(keys.poll(), Some(0), "冲突重绑后旧键仍必须可用");
     }
 }

@@ -25,5 +25,14 @@ serde_json = "1"
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 rfd = "0.15"
 
+[features]
+# 默认启用变声；关闭后仍可编译，运行期对变声请求返回明确错误。
+default = ["voice"]
+voice = ["audio-session/voice"]
+
+[dev-dependencies]
+# 宿主生命周期回归注入不注册系统热键的管理器替身。
+hotkeys = { path = "../../crates/hotkeys", features = ["test-support"] }
+
 [lints]
 workspace = true

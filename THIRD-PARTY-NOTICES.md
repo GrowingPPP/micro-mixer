@@ -5,7 +5,7 @@
 > 本文件由 `tools/gen-third-party-notices.py` 自动生成，请勿手工编辑。
 > 重新生成：`python3 tools/gen-third-party-notices.py`
 
-共收录 **303** 个第三方 crate（Rust）。
+共收录 **322** 个第三方 crate（Rust）。
 
 平台：aarch64-apple-darwin + x86_64-apple-darwin（不含其他平台专用的依赖）。
 收录范围：从 workspace 成员出发，沿**普通依赖与构建依赖**可达的全部 crate；
@@ -17,7 +17,7 @@
 ## 依赖清单（按许可证分组）
 
 
-### MIT OR Apache-2.0 —— 141 个
+### MIT OR Apache-2.0 —— 156 个
 
 - anstream 1.0.0
 - anstyle 1.0.14
@@ -50,7 +50,17 @@
 - crossbeam-channel 0.5.17
 - crossbeam-utils 0.8.23
 - crypto-common 0.1.7
+- dasp 0.11.0
+- dasp_envelope 0.11.0
+- dasp_frame 0.11.0
+- dasp_interpolate 0.11.0
+- dasp_peak 0.11.0
+- dasp_ring_buffer 0.11.0
+- dasp_rms 0.11.0
 - dasp_sample 0.11.0
+- dasp_signal 0.11.0
+- dasp_slice 0.11.0
+- dasp_window 0.11.1
 - defmt 1.1.1
 - defmt-macros 1.1.1
 - defmt-parser 1.0.0
@@ -104,6 +114,7 @@
 - png 0.17.16
 - png 0.18.1
 - powerfmt 0.2.1
+- prettyplease 0.2.37
 - proc-macro2 1.0.107
 - qrcode 0.14.1
 - quote 1.0.47
@@ -124,6 +135,7 @@
 - serde_derive_internals 0.29.1
 - serde_json 1.0.151
 - serde_repr 0.1.21
+- serde_spanned 0.6.9
 - serde_spanned 1.1.2
 - serde_with 3.24.0
 - serde_with_macros 3.24.0
@@ -149,8 +161,11 @@
 - time 0.3.55
 - time-core 0.1.9
 - time-macros 0.2.32
+- toml 0.8.2
 - toml 1.1.8+spec-1.1.0
+- toml_datetime 0.6.3
 - toml_datetime 1.1.2+spec-1.1.0
+- toml_edit 0.20.2
 - toml_parser 1.1.5+spec-1.1.0
 - toml_writer 1.1.3+spec-1.1.0
 - tray-icon 0.25.1
@@ -161,7 +176,7 @@
 - web-time 1.1.0
 - web_atoms 0.2.6
 
-### MIT —— 43 个
+### MIT —— 45 个
 
 - block2 0.6.2
 - bytes 1.12.1
@@ -198,12 +213,14 @@
 - schemars 0.9.0
 - schemars 1.2.2
 - schemars_derive 0.8.22
+- signalsmith-stretch 0.1.3
 - simd-adler32 0.3.10
 - strsim 0.11.1
 - synstructure 0.14.0
 - tauri-winres 0.3.6
 - tokio 1.53.2
 - urlpattern 0.6.0
+- winnow 0.5.40
 - winnow 1.0.4
 - zmij 1.0.23
 
@@ -318,17 +335,23 @@
 - jiff-core 0.1.1
 - memchr 2.8.3
 
+### BSD-3-Clause —— 4 个
+
+- alloc-no-stdlib 3.0.0
+- alloc-stdlib 0.3.0
+- bindgen 0.70.1
+- bindgen 0.72.1
+
 ### Apache-2.0 —— 3 个
 
 - clang-sys 1.9.1
 - cpal 0.15.3
 - tao 0.37.1
 
-### BSD-3-Clause —— 3 个
+### Apache-2.0/MIT —— 2 个
 
-- alloc-no-stdlib 3.0.0
-- alloc-stdlib 0.3.0
-- bindgen 0.72.1
+- cexpr 0.6.0
+- rustc-hash 1.1.0
 
 ### BSD-3-Clause OR Apache-2.0 —— 2 个
 
@@ -369,10 +392,6 @@
 ### Apache-2.0 AND MIT —— 1 个
 
 - dpi 0.1.2
-
-### Apache-2.0/MIT —— 1 个
-
-- cexpr 0.6.0
 
 ### BSD-2-Clause OR MIT OR Apache-2.0 —— 1 个
 
@@ -785,7 +804,7 @@ limitations under the License.
 
 ### 8. Apache-2.0
 
-覆盖 185 个 crate：anstream 1.0.0, anstyle 1.0.14, anstyle-parse 1.0.0, anstyle-query 1.1.5, anyhow 1.0.104, arrayvec 0.7.8, autocfg 1.5.1, base64 0.21.7 等 185 个
+覆盖 191 个 crate：anstream 1.0.0, anstyle 1.0.14, anstyle-parse 1.0.0, anstyle-query 1.1.5, anyhow 1.0.104, arrayvec 0.7.8, autocfg 1.5.1, base64 0.21.7 等 191 个
 
 
 ```text
@@ -2319,7 +2338,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 
 ### 15. BSD-3-Clause
 
-覆盖 1 个 crate：bindgen 0.72.1
+覆盖 2 个 crate：bindgen 0.70.1, bindgen 0.72.1
 
 
 ```text
@@ -2774,7 +2793,7 @@ THIS SOFTWARE.
 
 ### 28. MIT
 
-覆盖 48 个 crate：adler2 2.0.1, anyhow 1.0.104, block2 0.6.2, camino 1.2.6, cargo-platform 0.1.9, cargo_metadata 0.19.2, ctor 1.0.13, dasp_sample 0.11.0 等 48 个
+覆盖 61 个 crate：adler2 2.0.1, anyhow 1.0.104, block2 0.6.2, camino 1.2.6, cargo-platform 0.1.9, cargo_metadata 0.19.2, ctor 1.0.13, dasp 0.11.0 等 61 个
 
 
 ```text
@@ -2836,7 +2855,7 @@ THE SOFTWARE.
 
 ### 30. MIT
 
-覆盖 17 个 crate：anstream 1.0.0, anstyle 1.0.14, anstyle-parse 1.0.0, anstyle-query 1.1.5, clap 4.6.7, clap_builder 4.6.7, clap_derive 4.6.7, clap_lex 1.1.1 等 17 个
+覆盖 20 个 crate：anstream 1.0.0, anstyle 1.0.14, anstyle-parse 1.0.0, anstyle-query 1.1.5, clap 4.6.7, clap_builder 4.6.7, clap_derive 4.6.7, clap_lex 1.1.1 等 20 个
 
 
 ```text
@@ -2932,13 +2951,13 @@ DEALINGS IN THE SOFTWARE.
 
 ### 33. MIT
 
-覆盖 1 个 crate：base64 0.23.1
+覆盖 2 个 crate：base64 0.21.7, base64 0.22.1
 
 
 ```text
 The MIT License (MIT)
 
-Copyright (c) 2025 Alice Maz, Marshall Pierce
+Copyright (c) 2015 Alice Maz
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -2962,13 +2981,13 @@ THE SOFTWARE.
 
 ### 34. MIT
 
-覆盖 2 个 crate：base64 0.21.7, base64 0.22.1
+覆盖 1 个 crate：base64 0.23.1
 
 
 ```text
 The MIT License (MIT)
 
-Copyright (c) 2015 Alice Maz
+Copyright (c) 2025 Alice Maz, Marshall Pierce
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -3203,7 +3222,7 @@ DEALINGS IN THE SOFTWARE.
 
 ### 42. MIT
 
-覆盖 5 个 crate：cc 1.6.0, cfg-if 1.0.5, find-msvc-tools 0.1.14, jobserver 0.1.35, socket2 0.6.5
+覆盖 6 个 crate：cc 1.6.0, cfg-if 1.0.5, find-msvc-tools 0.1.14, jobserver 0.1.35, socket2 0.6.5, toml_datetime 0.6.3
 
 
 ```text
@@ -4202,11 +4221,11 @@ SOFTWARE.
 
 ### 72. MIT
 
-覆盖 1 个 crate：getrandom 0.4.3
+覆盖 1 个 crate：getrandom 0.3.4
 
 
 ```text
-Copyright (c) 2018-2026 The rust-random Project Developers
+Copyright (c) 2018-2025 The rust-random Project Developers
 Copyright (c) 2014 The Rust Project Developers
 
 Permission is hereby granted, free of charge, to any
@@ -4237,11 +4256,11 @@ DEALINGS IN THE SOFTWARE.
 
 ### 73. MIT
 
-覆盖 1 个 crate：getrandom 0.3.4
+覆盖 1 个 crate：getrandom 0.4.3
 
 
 ```text
-Copyright (c) 2018-2025 The rust-random Project Developers
+Copyright (c) 2018-2026 The rust-random Project Developers
 Copyright (c) 2014 The Rust Project Developers
 
 Permission is hereby granted, free of charge, to any
@@ -5547,6 +5566,82 @@ THE SOFTWARE.
 
 ### 114. MIT
 
+覆盖 1 个 crate：signalsmith-stretch 0.1.3
+
+
+```text
+Copyright 2024 Colin Marc <hi@colinmarc.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+
+### 115. MIT
+
+覆盖 1 个 crate：signalsmith-stretch 0.1.3
+
+
+```text
+MIT License
+
+Copyright (c) 2025 Signalsmith Audio
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+
+### 116. MIT
+
+覆盖 1 个 crate：signalsmith-stretch 0.1.3
+
+
+```text
+MIT License
+
+Copyright (c) 2022 Geraint Luff / Signalsmith Audio Ltd.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+
+### 117. MIT
+
 覆盖 1 个 crate：simd-adler32 0.3.10
 
 
@@ -5575,7 +5670,7 @@ SOFTWARE.
 ```
 
 
-### 115. MIT
+### 118. MIT
 
 覆盖 1 个 crate：smallvec 1.16.2
 
@@ -5609,7 +5704,7 @@ DEALINGS IN THE SOFTWARE.
 ```
 
 
-### 116. MIT
+### 119. MIT
 
 覆盖 1 个 crate：stable_deref_trait 1.2.1
 
@@ -5643,7 +5738,7 @@ DEALINGS IN THE SOFTWARE.
 ```
 
 
-### 117. MIT
+### 120. MIT
 
 覆盖 1 个 crate：strsim 0.11.1
 
@@ -5675,7 +5770,7 @@ SOFTWARE.
 ```
 
 
-### 118. MIT
+### 121. MIT
 
 覆盖 1 个 crate：swift-rs 1.0.8
 
@@ -5703,7 +5798,7 @@ SOFTWARE.
 ```
 
 
-### 119. MIT
+### 122. MIT
 
 覆盖 1 个 crate：synstructure 0.14.0
 
@@ -5719,7 +5814,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 ```
 
 
-### 120. MIT
+### 123. MIT
 
 覆盖 7 个 crate：tauri 2.12.2, tauri-build 2.7.1, tauri-codegen 2.7.1, tauri-macros 2.7.1, tauri-runtime 2.12.1, tauri-runtime-wry 2.12.1, tauri-utils 2.10.1
 
@@ -5749,7 +5844,7 @@ SOFTWARE.
 ```
 
 
-### 121. MIT
+### 124. MIT
 
 覆盖 1 个 crate：tauri-winres 0.3.6
 
@@ -5786,7 +5881,7 @@ DEALINGS IN THE SOFTWARE.
 ```
 
 
-### 122. MIT
+### 125. MIT
 
 覆盖 1 个 crate：tendril 0.5.1
 
@@ -5820,7 +5915,7 @@ DEALINGS IN THE SOFTWARE.
 ```
 
 
-### 123. MIT
+### 126. MIT
 
 覆盖 3 个 crate：time 0.3.55, time-core 0.1.9, time-macros 0.2.32
 
@@ -5848,7 +5943,7 @@ SOFTWARE.
 ```
 
 
-### 124. MIT
+### 127. MIT
 
 覆盖 1 个 crate：tokio 1.53.2
 
@@ -5878,7 +5973,7 @@ SOFTWARE.
 ```
 
 
-### 125. MIT
+### 128. MIT
 
 覆盖 1 个 crate：typenum 1.20.1
 
@@ -5908,7 +6003,7 @@ SOFTWARE.
 ```
 
 
-### 126. MIT
+### 129. MIT
 
 覆盖 1 个 crate：unicode-ident 1.0.26
 
@@ -5956,7 +6051,7 @@ authorization of the copyright holder.
 ```
 
 
-### 127. MIT
+### 130. MIT
 
 覆盖 1 个 crate：urlpattern 0.6.0
 
@@ -5986,7 +6081,7 @@ SOFTWARE.
 ```
 
 
-### 128. MIT
+### 131. MIT
 
 覆盖 1 个 crate：utf8parse 0.2.2
 
@@ -6020,7 +6115,7 @@ DEALINGS IN THE SOFTWARE.
 ```
 
 
-### 129. MIT
+### 132. MIT
 
 覆盖 1 个 crate：uuid 1.27.0
 
@@ -6055,7 +6150,7 @@ DEALINGS IN THE SOFTWARE.
 ```
 
 
-### 130. MIT
+### 133. MIT
 
 覆盖 1 个 crate：version_check 0.9.5
 
@@ -6083,7 +6178,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
 
-### 131. MIT
+### 134. MIT
 
 覆盖 1 个 crate：web-time 1.1.0
 
@@ -6113,7 +6208,7 @@ SOFTWARE.
 ```
 
 
-### 132. MIT
+### 135. MIT
 
 覆盖 1 个 crate：window-vibrancy 0.8.1
 
@@ -6143,7 +6238,7 @@ SOFTWARE.
 ```
 
 
-### 133. MIT
+### 136. MIT
 
 覆盖 1 个 crate：wry 0.57.0
 
@@ -6173,7 +6268,7 @@ SOFTWARE.
 ```
 
 
-### 134. MIT OR Apache-2.0
+### 137. MIT OR Apache-2.0
 
 覆盖 1 个 crate：typenum 1.20.1
 
@@ -6183,7 +6278,7 @@ MIT OR Apache-2.0
 ```
 
 
-### 135. MPL-2.0
+### 138. MPL-2.0
 
 覆盖 21 个 crate：cssparser 0.37.0, cssparser-macros 0.7.1, dtoa-short 0.3.5, option-ext 0.2.0, selectors 0.38.0, symphonia 0.5.5, symphonia-bundle-flac 0.5.5, symphonia-bundle-mp3 0.5.5 等 21 个
 
@@ -6565,7 +6660,7 @@ Exhibit B - "Incompatible With Secondary Licenses" Notice
 ```
 
 
-### 136. This project is dual-licensed under the Unlicense and MIT licenses.
+### 139. This project is dual-licensed under the Unlicense and MIT licenses.
 
 覆盖 7 个 crate：aho-corasick 1.1.5, byteorder 1.5.0, jiff 0.2.38, jiff-core 0.1.1, memchr 2.8.3, same-file 1.0.6, walkdir 2.5.0
 
@@ -6577,7 +6672,7 @@ You may use this code under the terms of either license.
 ```
 
 
-### 137. Unlicense
+### 140. Unlicense
 
 覆盖 8 个 crate：aho-corasick 1.1.5, byteorder 1.5.0, byteorder-lite 0.1.0, jiff 0.2.38, jiff-core 0.1.1, memchr 2.8.3, same-file 1.0.6, walkdir 2.5.0
 
@@ -6610,7 +6705,7 @@ For more information, please refer to <http://unlicense.org/>
 ```
 
 
-### 138. windowing service for Tauri.
+### 141. windowing service for Tauri.
 
 覆盖 1 个 crate：wry 0.57.0
 

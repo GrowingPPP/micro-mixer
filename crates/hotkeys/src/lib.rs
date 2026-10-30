@@ -70,7 +70,7 @@ use global_hotkey::GlobalHotKeyManager;
 use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use std::sync::Arc;
 
-#[cfg(any(target_os = "windows", test))]
+#[cfg(any(target_os = "windows", test, feature = "test-support"))]
 mod owner;
 
 // ─────────────────────────────────────────── 平台：事件循环
@@ -330,7 +330,7 @@ pub struct HotkeyManager {
 enum ManagerOwner {
     #[cfg(not(target_os = "windows"))]
     Native(GlobalHotKeyManager),
-    #[cfg(any(target_os = "windows", test))]
+    #[cfg(any(target_os = "windows", test, feature = "test-support"))]
     Worker(owner::OwnerClient),
 }
 
@@ -346,7 +346,7 @@ impl HotkeyManager {
                     |key| manager.unregister(key).map_err(Into::into),
                 )
             }
-            #[cfg(any(target_os = "windows", test))]
+            #[cfg(any(target_os = "windows", test, feature = "test-support"))]
             ManagerOwner::Worker(owner) => owner.register(keys),
         }
     }
@@ -360,9 +360,57 @@ impl HotkeyManager {
                 self.events.discard_pending();
                 result
             }
-            #[cfg(any(target_os = "windows", test))]
+            #[cfg(any(target_os = "windows", test, feature = "test-support"))]
             ManagerOwner::Worker(owner) => owner.unregister(keys),
         }
+    }
+}
+
+/// 宿主回归使用的不注册系统热键的管理器替身。
+///
+/// 仅供 `test-support` 特性下的测试构建使用；生产构建不会编译这段代码。
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RecordingManager {
+        registrations: Arc<AtomicUsize>,
+    }
+
+    impl owner::NativeManager for RecordingManager {
+        fn register(&self, _: HotKey) -> Result<()> {
+            self.registrations.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn unregister(&self, _: HotKey) -> Result<()> {
+            Ok(())
+        }
+
+        fn pump(&self) {}
+    }
+
+    /// 返回共享管理器与累计注册次数；次数用于断言重建不重复绑定。
+    pub fn manager() -> Result<(Arc<HotkeyManager>, Arc<AtomicUsize>)> {
+        let events = Arc::new(EventInbox::default());
+        let registrations = Arc::new(AtomicUsize::new(0));
+        let worker_counts = registrations.clone();
+        let owner = owner::OwnerClient::spawn(
+            move || {
+                Ok(RecordingManager {
+                    registrations: worker_counts,
+                })
+            },
+            events.clone(),
+        )?;
+        Ok((
+            Arc::new(HotkeyManager {
+                inner: ManagerOwner::Worker(owner),
+                events,
+            }),
+            registrations,
+        ))
     }
 }
 
@@ -397,6 +445,42 @@ fn unregister_every_key(
         }
     }
     first_error.map_or(Ok(()), Err)
+}
+
+/// 跨组解析并检查重复键，错误列出冲突键与所属组。
+///
+/// 同一个物理键只能绑定一个动作；错误信息带组号，调用方据此指出冲突位置。
+pub fn validate_disjoint(groups: &[&[String]]) -> Result<()> {
+    let mut seen: HashMap<u32, (String, usize)> = HashMap::new();
+    for (group_index, group) in groups.iter().enumerate() {
+        for spec in group.iter() {
+            let spec = spec.trim();
+            if spec.is_empty() {
+                continue;
+            }
+            let key = parse_hotkey(spec)
+                .with_context(|| format!("第 {} 组热键「{spec}」无法解析", group_index + 1))?;
+            match seen.get(&key.id()) {
+                Some((first_spec, first_group)) if *first_group == group_index => {
+                    anyhow::bail!(
+                        "热键「{spec}」在第 {} 组内重复（已有「{first_spec}」）",
+                        group_index + 1
+                    );
+                }
+                Some((first_spec, first_group)) => {
+                    anyhow::bail!(
+                        "热键「{spec}」同时出现在第 {} 组（「{first_spec}」）与第 {} 组；每个键只能绑定一个动作",
+                        first_group + 1,
+                        group_index + 1
+                    );
+                }
+                None => {
+                    seen.insert(key.id(), (spec.to_owned(), group_index));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn parse_bindings(keys: &[String]) -> Result<Vec<(usize, HotKey)>> {
@@ -470,18 +554,34 @@ impl Hotkeys {
         !self.keys.is_empty()
     }
 
-    /// 使用同一平台管理器重新绑定。新配置失败时恢复旧绑定。
+    /// 使用同一平台管理器重新绑定：新键全部注册成功后才释放旧键。
+    ///
+    /// 系统级冲突时旧绑定保持不变，调用方可以把错误直接展示给用户。
+    /// 新配置里仍保留的键不重复注册，避免把自己的旧注册当成冲突。
     pub fn rebind(&mut self, keys: &[String]) -> Result<()> {
         let parsed = parse_bindings(keys)?;
         let raw: Vec<_> = parsed.iter().map(|(_, key)| *key).collect();
-        self.manager.unregister_all(&self.keys)?;
-        if let Err(error) = self.manager.register_batch(&raw) {
-            if let Err(rollback_error) = self.manager.register_batch(&self.keys) {
-                self.keys.clear();
-                self.id_to_slot.clear();
-                return Err(error.context(format!("恢复原热键也失败: {rollback_error:#}")));
+        let old_ids: std::collections::HashSet<u32> = self.keys.iter().map(HotKey::id).collect();
+        let new_ids: std::collections::HashSet<u32> = raw.iter().map(HotKey::id).collect();
+        let to_register: Vec<HotKey> = raw
+            .iter()
+            .copied()
+            .filter(|key| !old_ids.contains(&key.id()))
+            .collect();
+        if let Err(error) = self.manager.register_batch(&to_register) {
+            return Err(error.context("重新注册热键失败，原绑定保持不变"));
+        }
+        let to_unregister: Vec<HotKey> = self
+            .keys
+            .iter()
+            .copied()
+            .filter(|key| !new_ids.contains(&key.id()))
+            .collect();
+        if let Err(error) = self.manager.unregister_all(&to_unregister) {
+            if let Err(rollback_error) = self.manager.unregister_all(&to_register) {
+                log::error!("撤销新热键失败: {rollback_error:#}");
             }
-            return Err(error.context("重新注册热键失败，已恢复原绑定"));
+            return Err(error.context("释放旧热键失败，已保留原绑定"));
         }
         self.id_to_slot = parsed.iter().map(|(slot, key)| (key.id(), *slot)).collect();
         self.bindings = parsed
@@ -521,6 +621,165 @@ impl Drop for Hotkeys {
         if let Err(error) = self.manager.unregister_all(&self.keys) {
             log::error!("释放热键失败: {error:#}");
         }
+    }
+}
+
+/// 事件来自哪一组热键。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyGroup {
+    Slots,
+    Voice,
+}
+
+/// 音效槽位与人声效果共用一个平台管理器，但分属两组独立绑定。
+///
+/// 槽位集合随音频会话启停：待机只归还槽位按键，会话释放时丢弃该集合。
+/// 变声集合从程序启动保留到进程退出，因此无音频会话时仍能切换待用预设。
+/// 两个轮询器必须由同一个消费者排水：global-hotkey 的事件通道是进程共享的，
+/// 分别调用 [`HotkeyPoller::poll`] 会让先调用者吞掉另一组的按键。
+#[derive(Default)]
+pub struct HotkeyGroups {
+    slot_hotkeys: Option<Hotkeys>,
+    slot_poller: Option<HotkeyPoller>,
+    voice_hotkeys: Option<Hotkeys>,
+    voice_poller: Option<HotkeyPoller>,
+}
+
+impl HotkeyGroups {
+    pub fn new(slot_hotkeys: Option<Hotkeys>, voice_hotkeys: Option<Hotkeys>) -> Self {
+        let slot_poller = slot_hotkeys.as_ref().map(Hotkeys::poller);
+        let voice_poller = voice_hotkeys.as_ref().map(Hotkeys::poller);
+        Self {
+            slot_hotkeys,
+            slot_poller,
+            voice_hotkeys,
+            voice_poller,
+        }
+    }
+
+    pub fn slot_hotkeys(&self) -> Option<&Hotkeys> {
+        self.slot_hotkeys.as_ref()
+    }
+
+    pub fn voice_hotkeys(&self) -> Option<&Hotkeys> {
+        self.voice_hotkeys.as_ref()
+    }
+
+    pub fn set_slot_hotkeys(&mut self, hotkeys: Option<Hotkeys>) {
+        self.slot_poller = hotkeys.as_ref().map(Hotkeys::poller);
+        self.slot_hotkeys = hotkeys;
+    }
+
+    pub fn set_voice_hotkeys(&mut self, hotkeys: Option<Hotkeys>) {
+        self.voice_poller = hotkeys.as_ref().map(Hotkeys::poller);
+        self.voice_hotkeys = hotkeys;
+    }
+
+    pub fn slots_bound(&self) -> bool {
+        self.slot_hotkeys.as_ref().is_some_and(Hotkeys::is_bound)
+    }
+
+    pub fn voice_bound(&self) -> bool {
+        self.voice_hotkeys.as_ref().is_some_and(Hotkeys::is_bound)
+    }
+
+    /// 是否持有任一热键集合；空集合也代表平台管理器已介入。
+    pub fn has_sets(&self) -> bool {
+        self.slot_hotkeys.is_some() || self.voice_hotkeys.is_some()
+    }
+
+    /// 待机只注销槽位热键；人声效果热键保持注册。
+    pub fn standby(&mut self) -> Result<()> {
+        self.slot_poller = None;
+        match self.slot_hotkeys.as_mut() {
+            Some(hotkeys) => hotkeys.unbind_all(),
+            None => Ok(()),
+        }
+    }
+
+    /// 音频会话结束：注销并丢弃槽位集合；变声集合跨会话保留。
+    ///
+    /// 集合在这里丢弃，确保平台句柄的析构发生在调用方调度的线程上。
+    pub fn end_session(&mut self) -> Result<()> {
+        self.slot_poller = None;
+        let mut slots = self.slot_hotkeys.take();
+        let result = match slots.as_mut() {
+            Some(hotkeys) => hotkeys.unbind_all(),
+            None => Ok(()),
+        };
+        drop(slots);
+        result
+    }
+
+    /// 注销并丢弃变声集合；只在进程退出或显式关闭时调用。
+    pub fn clear_voice(&mut self) -> Result<()> {
+        self.voice_poller = None;
+        let mut voice = self.voice_hotkeys.take();
+        let result = match voice.as_mut() {
+            Some(hotkeys) => hotkeys.unbind_all(),
+            None => Ok(()),
+        };
+        drop(voice);
+        result
+    }
+
+    /// 进程退出：两组都注销并丢弃。
+    pub fn shutdown(&mut self) -> Result<()> {
+        let slots = self.end_session();
+        let voice = self.clear_voice();
+        slots.and(voice)
+    }
+
+    pub fn rebind_slots(&mut self, keys: &[String]) -> Result<()> {
+        let hotkeys = self
+            .slot_hotkeys
+            .as_mut()
+            .context("音效槽位热键集合不存在")?;
+        hotkeys.rebind(keys)?;
+        self.slot_poller = Some(hotkeys.poller());
+        Ok(())
+    }
+
+    pub fn rebind_voice(&mut self, keys: &[String]) -> Result<()> {
+        let hotkeys = self
+            .voice_hotkeys
+            .as_mut()
+            .context("人声效果热键集合不存在")?;
+        hotkeys.rebind(keys)?;
+        self.voice_poller = Some(hotkeys.poller());
+        Ok(())
+    }
+
+    /// 取走本次轮询到的按键，按所属组区分。
+    ///
+    /// 同一个键同时出现在两组属于配置错误；路由时槽位优先，避免一次按键
+    /// 触发两个动作。调用方在绑定前用 [`validate_disjoint`] 拒绝这种配置。
+    pub fn poll_actions(&self) -> Vec<(HotkeyGroup, usize)> {
+        let events = match (&self.slot_poller, &self.voice_poller) {
+            (Some(poller), _) => &poller.events,
+            (None, Some(poller)) => &poller.events,
+            (None, None) => return Vec::new(),
+        };
+        let mut hits = Vec::new();
+        while let Some(event) = events.next() {
+            if event.state != HotKeyState::Pressed {
+                continue;
+            }
+            if let Some(slot) = self
+                .slot_poller
+                .as_ref()
+                .and_then(|poller| poller.id_to_slot.get(&event.id()))
+            {
+                hits.push((HotkeyGroup::Slots, *slot));
+            } else if let Some(slot) = self
+                .voice_poller
+                .as_ref()
+                .and_then(|poller| poller.id_to_slot.get(&event.id()))
+            {
+                hits.push((HotkeyGroup::Voice, *slot));
+            }
+        }
+        hits
     }
 }
 
@@ -747,6 +1006,52 @@ mod tests {
         for spec in ["", "   ", "Cmd+", "Cmd+Shift", "A+B", "NotAKey"] {
             assert!(parse_hotkey(spec).is_err(), "「{spec}」应报错");
         }
+    }
+
+    #[test]
+    fn 跨组重复热键被拒绝并列出冲突() {
+        let slots = vec!["F1".to_owned(), "F9".to_owned()];
+        let voice = vec!["F9".to_owned(), String::new(), "F10".to_owned()];
+        let error = validate_disjoint(&[&slots, &voice])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("F9"), "错误必须点名冲突键：{error}");
+        assert!(
+            error.contains("第 1 组"),
+            "错误必须指出第一个所属组：{error}"
+        );
+        assert!(
+            error.contains("第 2 组"),
+            "错误必须指出第二个所属组：{error}"
+        );
+    }
+
+    #[test]
+    fn 无关热键与空位允许跨组共存() {
+        let slots = vec!["F1".to_owned(), String::new(), " ".to_owned()];
+        let voice = vec!["F2".to_owned(), "F3".to_owned(), "F4".to_owned()];
+        validate_disjoint(&[&slots, &voice]).unwrap();
+        let empty: &[String] = &[];
+        validate_disjoint(&[empty, empty]).unwrap();
+    }
+
+    #[test]
+    fn 组内重复热键同样被拒绝() {
+        let voice = vec!["F2".to_owned(), "f2".to_owned(), String::new()];
+        let error = validate_disjoint(&[&[], &voice]).unwrap_err().to_string();
+        assert!(error.contains("F2"), "错误必须点名重复键：{error}");
+        assert!(error.contains("第 2 组"), "错误必须指出所属组：{error}");
+    }
+
+    #[test]
+    fn 跨组校验报告无法解析的键和组() {
+        let slots = vec!["NotAKey".to_owned()];
+        let voice = vec!["F2".to_owned()];
+        let error = validate_disjoint(&[&slots, &voice])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("NotAKey"), "错误必须点名非法键：{error}");
+        assert!(error.contains("第 1 组"), "错误必须指出所属组：{error}");
     }
 }
 

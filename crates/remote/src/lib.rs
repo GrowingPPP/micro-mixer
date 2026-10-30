@@ -41,6 +41,28 @@ pub type PlayHook = Arc<dyn Fn(usize) + Send + Sync>;
 pub type PlayHandler = Arc<dyn Fn(usize) -> bool + Send + Sync>;
 pub type StopHandler = Arc<dyn Fn() + Send + Sync>;
 
+/// 手机页面展示的变声快照。
+///
+/// 预设以 `(id, name)` 保存：页面只需要展示与选择，完整参数留在宿主。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceRemoteState {
+    pub enabled: bool,
+    pub bypassed: bool,
+    pub preset_id: String,
+    pub preset_name: String,
+    pub presets: Vec<(String, String)>,
+}
+
+/// 宿主提供给遥控服务的变声入口。
+///
+/// 与播放路由分开保存：待机时播放路由被清除，变声仍需可用；释放会话时
+/// 两者一起清除。
+pub struct VoiceRoute {
+    pub state: Arc<dyn Fn() -> VoiceRemoteState + Send + Sync>,
+    pub set_enabled: Arc<dyn Fn(bool) -> bool + Send + Sync>,
+    pub select_preset: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+}
+
 #[derive(Default)]
 pub struct Shared {
     pub control: Mutex<Option<Arc<PlaybackControl>>>,
@@ -49,6 +71,7 @@ pub struct Shared {
     pub on_play: Mutex<Option<PlayHook>>,
     play_handler: Mutex<Option<PlayHandler>>,
     stop_handler: Mutex<Option<StopHandler>>,
+    voice_route: Mutex<Option<Arc<VoiceRoute>>>,
 }
 
 impl Shared {
@@ -79,17 +102,33 @@ impl Shared {
         *control = Some(ctl);
         *names = slots;
     }
+    /// 待机时清空播放入口，但保留停止处理器与变声路由。
+    ///
+    /// 手机停止仍是全局停止：人声试听可以在待机时继续录制，停止处理器只取消
+    /// 当前会话的试听，不重新发布播放控制，因此不会启动音效。
+    pub fn clear_playback(&self) {
+        let mut play = self.play_handler.lock().unwrap_or_else(|e| e.into_inner());
+        let mut control = self.control.lock().unwrap_or_else(|e| e.into_inner());
+        let mut names = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        let mut hook = self.on_play.lock().unwrap_or_else(|e| e.into_inner());
+        *play = None;
+        *control = None;
+        names.clear();
+        *hook = None;
+    }
     pub fn clear(&self) {
         let mut play = self.play_handler.lock().unwrap_or_else(|e| e.into_inner());
         let mut stop = self.stop_handler.lock().unwrap_or_else(|e| e.into_inner());
         let mut control = self.control.lock().unwrap_or_else(|e| e.into_inner());
         let mut names = self.slots.lock().unwrap_or_else(|e| e.into_inner());
         let mut hook = self.on_play.lock().unwrap_or_else(|e| e.into_inner());
+        let mut voice = self.voice_route.lock().unwrap_or_else(|e| e.into_inner());
         *play = None;
         *stop = None;
         *control = None;
         names.clear();
         *hook = None;
+        *voice = None;
     }
     pub fn set_hook(&self, hook: PlayHook) {
         *self.on_play.lock().unwrap_or_else(|e| e.into_inner()) = Some(hook);
@@ -99,6 +138,46 @@ impl Shared {
     }
     pub fn set_stop_handler(&self, handler: StopHandler) {
         *self.stop_handler.lock().unwrap_or_else(|e| e.into_inner()) = Some(handler);
+    }
+    /// Publish the voice route independently from playback.
+    pub fn set_voice_route(&self, route: VoiceRoute) {
+        *self.voice_route.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(route));
+    }
+    pub fn clear_voice_route(&self) {
+        *self.voice_route.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    fn voice_route(&self) -> Option<Arc<VoiceRoute>> {
+        self.voice_route
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+    /// 当前变声快照；没有发布路由（已释放）时为 `None`。
+    ///
+    /// 先克隆路由再调用状态闭包，避免持锁执行宿主回调。
+    pub fn voice_state(&self) -> Option<VoiceRemoteState> {
+        let route = self.voice_route()?;
+        Some((route.state)())
+    }
+    /// 执行一次遥控启用命令；路由已被替换时旧结果按失败处理。
+    pub fn voice_set_enabled(&self, enabled: bool) -> bool {
+        let Some(route) = self.voice_route() else {
+            return false;
+        };
+        let ok = (route.set_enabled)(enabled);
+        ok && self.current_voice_route(&route)
+    }
+    /// 执行一次遥控预设选择；路由已被替换时旧结果按失败处理。
+    pub fn voice_select_preset(&self, id: &str) -> bool {
+        let Some(route) = self.voice_route() else {
+            return false;
+        };
+        let ok = (route.select_preset)(id);
+        ok && self.current_voice_route(&route)
+    }
+    fn current_voice_route(&self, route: &Arc<VoiceRoute>) -> bool {
+        self.voice_route()
+            .is_some_and(|current| Arc::ptr_eq(&current, route))
     }
     pub fn play(&self, slot: usize) -> bool {
         let (handler, control, hook) = {
@@ -130,7 +209,8 @@ impl Shared {
         }
         ok
     }
-    pub fn stop_all(&self) {
+    /// 执行一次全局停止；返回是否真的有播放入口或停止处理器接住请求。
+    pub fn stop_all(&self) -> bool {
         let (handler, control) = {
             let handler = self.stop_handler.lock().unwrap_or_else(|e| e.into_inner());
             if handler.is_some() {
@@ -146,8 +226,12 @@ impl Shared {
         };
         if let Some(handler) = handler {
             handler();
+            true
         } else if let Some(control) = control {
             control.stop_all();
+            true
+        } else {
+            false
         }
     }
 }
@@ -188,6 +272,12 @@ impl Server {
             while !worker_shutdown.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((s, _)) => {
+                        // 监听端是非阻塞的，BSD 系系统（含 macOS）上 accept 出来的连接会继承该标志；
+                        // 不改回阻塞，请求稍晚到达就读到「暂时不可用」而被断开，读超时也不会生效。
+                        if let Err(e) = s.set_nonblocking(false) {
+                            log::warn!("遥控连接设为阻塞模式失败: {e}");
+                            continue;
+                        }
                         let shared = shared.clone();
                         // 每个连接一个线程：请求量极小，够用且简单
                         std::thread::spawn(move || {
@@ -263,32 +353,69 @@ fn handle(mut s: TcpStream, shared: &Shared) -> Result<()> {
         let slots = shared.slots.lock().unwrap_or_else(|e| e.into_inner());
         (control.clone(), slots.clone())
     };
-    let ctl = match ctl {
-        Some(c) => c,
-        None => {
-            return respond(
-                &mut s,
-                200,
-                "text/html; charset=utf-8",
-                "<meta charset=utf-8><body style='background:#111;color:#eee;font:16px -apple-system;padding:32px'>                 <h2>音频未启动</h2><p style='color:#888'>请在电脑上点「启动」。</p>                 <script>
-function pct(db){{return Math.max(0,Math.min(100,(db+60)/60*100));}}setTimeout(()=>location.reload(),2000)</script>",
-            )
+
+    // 变声路由独立于播放控制：待机时播放已清空，手机仍能启用与切换预设。
+    match path {
+        "/voice/status" => {
+            let body = match shared.voice_state() {
+                Some(state) => voice_json(true, None, &state),
+                None => unavailable_voice_json().to_owned(),
+            };
+            return respond(&mut s, 200, "application/json", &body);
         }
+        "/voice/enable/1" | "/voice/enable/0" => {
+            let enabled = path == "/voice/enable/1";
+            let ok = shared.voice_set_enabled(enabled);
+            return respond_voice_command(&mut s, shared, ok, "变声不可用");
+        }
+        p if p.starts_with("/voice/preset/") => {
+            let id = percent_decode(p.trim_start_matches("/voice/preset/"));
+            if id.is_empty() {
+                return respond(
+                    &mut s,
+                    404,
+                    "application/json",
+                    r#"{"ok":false,"error":"没有这个预设"}"#,
+                );
+            }
+            let ok = shared.voice_select_preset(&id);
+            return respond_voice_command(&mut s, shared, ok, "没有这个预设");
+        }
+        _ => {}
+    }
+
+    // 播放是否可用；待机页据此轮询，桌面恢复音效后整页刷新出现音效按钮。
+    if path == "/playback" {
+        let body = format!(r#"{{"available":{}}}"#, ctl.is_some());
+        return respond(&mut s, 200, "application/json", &body);
+    }
+
+    // 停止不依赖播放路由：待机时播放控制已清除，但停止处理器仍要取消人声试听。
+    if path == "/stop" {
+        let body = if shared.stop_all() {
+            r#"{"ok":true,"action":"stop_all"}"#
+        } else {
+            r#"{"ok":false,"error":"音频未启动"}"#
+        };
+        return respond(&mut s, 200, "application/json", body);
+    }
+
+    let Some(ctl) = ctl else {
+        // 待机时播放路由已清除，但变声路由仍在：页面要能继续操作变声。
+        if matches!(path, "/" | "/index.html") {
+            if let Some(state) = shared.voice_state() {
+                let html = control_page(&[], None, Some(&state));
+                return respond(&mut s, 200, "text/html; charset=utf-8", &html);
+            }
+        }
+        return respond(&mut s, 200, "text/html; charset=utf-8", NOT_STARTED_PAGE);
     };
+    let voice = shared.voice_state();
 
     match path {
         "/" | "/index.html" => {
-            let html = control_page(&slots, &ctl);
+            let html = control_page(&slots, Some(&ctl), voice.as_ref());
             respond(&mut s, 200, "text/html; charset=utf-8", &html)
-        }
-        "/stop" => {
-            shared.stop_all();
-            respond(
-                &mut s,
-                200,
-                "application/json",
-                r#"{"ok":true,"action":"stop_all"}"#,
-            )
         }
         "/status" => {
             let st = ctl.stats();
@@ -323,6 +450,97 @@ function pct(db){{return Math.max(0,Math.min(100,(db+60)/60*100));}}setTimeout((
     }
 }
 
+const NOT_STARTED_PAGE: &str = "<meta charset=utf-8><body style='background:#111;color:#eee;font:16px -apple-system;padding:32px'>                 <h2>音频未启动</h2><p style='color:#888'>请在电脑上点「启动」。</p>                 <script>
+function pct(db){return Math.max(0,Math.min(100,(db+60)/60*100));}setTimeout(()=>location.reload(),2000)</script>";
+
+fn unavailable_voice_json() -> &'static str {
+    r#"{"ok":false,"error":"音频未启动"}"#
+}
+
+fn respond_voice_command(s: &mut TcpStream, shared: &Shared, ok: bool, error: &str) -> Result<()> {
+    let body = match shared.voice_state() {
+        Some(state) => voice_json(ok, (!ok).then_some(error), &state),
+        None => unavailable_voice_json().to_owned(),
+    };
+    respond(s, 200, "application/json", &body)
+}
+
+fn voice_json(ok: bool, error: Option<&str>, state: &VoiceRemoteState) -> String {
+    let presets = state
+        .presets
+        .iter()
+        .map(|(id, name)| {
+            format!(
+                r#"{{"id":"{}","name":"{}"}}"#,
+                json_escape(id),
+                json_escape(name)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let error = error
+        .map(|error| format!(r#","error":"{}""#, json_escape(error)))
+        .unwrap_or_default();
+    format!(
+        r#"{{"ok":{},"enabled":{},"bypassed":{},"preset_id":"{}","preset_name":"{}","presets":[{}]{}}}"#,
+        ok,
+        state.enabled,
+        state.bypassed,
+        json_escape(&state.preset_id),
+        json_escape(&state.preset_name),
+        presets,
+        error
+    )
+}
+
+fn json_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if (ch as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", ch as u32));
+            }
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
+/// 把 URL 路径段还原成预设 ID；只处理 `%XX`，路径中的 `+` 保持原样。
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                (hex_digit(bytes[index + 1]), hex_digit(bytes[index + 2]))
+            {
+                out.push(high * 16 + low);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn respond(s: &mut TcpStream, code: u16, ctype: &str, body: &str) -> Result<()> {
     let reason = match code {
         200 => "OK",
@@ -341,8 +559,11 @@ fn respond(s: &mut TcpStream, code: u16, ctype: &str, body: &str) -> Result<()> 
 }
 
 /// 生成手机端控制页。刻意做成大按钮、深色、单手可点。
-fn control_page(slots: &[String], ctl: &PlaybackControl) -> String {
-    let st = ctl.stats();
+fn control_page(
+    slots: &[String],
+    ctl: Option<&PlaybackControl>,
+    voice: Option<&VoiceRemoteState>,
+) -> String {
     let mut buttons = String::new();
     for (i, name) in slots.iter().enumerate() {
         buttons.push_str(&format!(
@@ -352,6 +573,30 @@ fn control_page(slots: &[String], ctl: &PlaybackControl) -> String {
             i + 1
         ));
     }
+    let status = match ctl {
+        Some(ctl) => format!(
+            "点一下就播给对方听 · 当前 {}/{}",
+            if ctl.stats().playing {
+                "播放中"
+            } else {
+                "待机"
+            },
+            slots.len()
+        ),
+        None => "音频待机 · 变声仍可遥控".to_owned(),
+    };
+    let stop = if ctl.is_some() {
+        r#"<button class="stop" onclick="hit('/stop',this)">全部停止</button>"#
+    } else {
+        ""
+    };
+    let voice = voice.map(voice_card).unwrap_or_default();
+    // 待机页没有音效按钮；标记让页面脚本轮询 /playback，播放恢复后自动刷新。
+    let standby = if ctl.is_none() {
+        r#" data-standby="1""#
+    } else {
+        ""
+    };
     format!(
         r#"<!doctype html><html lang="zh"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
@@ -373,6 +618,20 @@ h1{{font-size:17px;font-weight:600;margin:0 0 4px}}
 .i{{font-size:12px;color:#777;font-weight:400;margin-top:6px}}
 .stop{{width:100%;margin-top:16px;min-height:60px;background:#3a1d1d;color:#ffb4b4;
   border:0;border-radius:16px;font-size:16px;font-weight:600}}
+.vcard{{margin-top:16px;padding:14px;border-radius:16px;background:#1a1c20;
+  border:1px solid #272b34}}
+.vtitle{{display:flex;align-items:center;justify-content:space-between;
+  font-weight:600;margin-bottom:10px}}
+.vbadge{{font-size:12px;color:#f5c451;border:1px solid #5c4a1e;background:#2c2512;
+  border-radius:999px;padding:2px 8px}}
+.vrow{{display:flex;align-items:center;justify-content:space-between;gap:12px;
+  font-size:14px;color:#c7ccd4;margin:8px 0}}
+.vrow strong{{color:#fff;font-weight:600}}
+.vlist{{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:10px}}
+.vp{{min-height:44px;padding:8px;border:1px solid #30343c;border-radius:10px;
+  background:#242424;color:#ddd;font-size:14px}}
+.vp.on{{background:#1f6feb;border-color:#1f6feb;color:#fff}}
+input[role=switch]{{width:48px;height:28px;accent-color:#1f6feb}}
 #m{{margin-top:12px;font-size:13px;color:#888;min-height:20px}}
 </style></head><body>
 <div id="meterwrap" style="position:sticky;top:0;background:#0e0f12;padding:10px 14px;border-bottom:1px solid #272b34">
@@ -383,17 +642,45 @@ h1{{font-size:17px;font-weight:600;margin:0 0 4px}}
   </div>
 </div>
 <h1>音效遥控</h1>
-<div id="s">点一下就播给对方听 · 当前 {}/{}</div>
+<div id="s"{standby}>{status}</div>
 <div class="grid">{buttons}</div>
-<button class="stop" onclick="hit('/stop',this)">全部停止</button>
+{stop}
+{voice}
 <div id="m"></div>
 <script>
 {script}
 </script></body></html>"#,
-        if st.playing { "播放中" } else { "待机" },
-        slots.len(),
+        status = status,
+        standby = standby,
         buttons = buttons,
+        stop = stop,
+        voice = voice,
         script = include_str!("control-page.js")
+    )
+}
+
+fn voice_card(state: &VoiceRemoteState) -> String {
+    let mut presets = String::new();
+    for (id, name) in &state.presets {
+        let selected = if *id == state.preset_id { " on" } else { "" };
+        presets.push_str(&format!(
+            r#"<button class="vp{}" data-id="{}" onclick="voicePick(this)">{}</button>"#,
+            selected,
+            html_escape(id),
+            html_escape(name)
+        ));
+    }
+    format!(
+        r#"<section class="vcard">
+  <div class="vtitle"><span>变声</span><span id="vbypass" class="vbadge"{}>临时旁路</span></div>
+  <label class="vrow"><span>启用变声</span><input id="venable" type="checkbox" role="switch"{} onchange="voiceEnable(this.checked)"></label>
+  <div class="vrow"><span>当前预设</span><strong id="vpreset">{}</strong></div>
+  <div class="vlist">{}</div>
+</section>"#,
+        if state.bypassed { "" } else { " hidden" },
+        if state.enabled { " checked" } else { "" },
+        html_escape(&state.preset_name),
+        presets
     )
 }
 

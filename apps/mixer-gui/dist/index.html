@@ -54,6 +54,22 @@
         <input id="micGainSlider" type="range" min="-60" max="36" step="1" value="0" aria-label="麦克风音量滑杆" aria-describedby="micGainHelp gainRangeHelp">
         <p id="micGainHelp" class="hint">调整对方听到的人声大小。</p>
       </div>
+      <section id="voiceBlock" class="voice-block" aria-labelledby="voiceBlockTitle">
+        <div class="voice-head">
+          <div><h3 id="voiceBlockTitle">人声效果</h3><span id="voiceState" class="voice-state">未读取</span></div>
+          <label class="switch-row" title="开启后按当前预设改变发送给对方的人声"><input id="voiceEnabled" type="checkbox" aria-label="启用变声"></label>
+        </div>
+        <div class="voice-preset-row">
+          <select id="voicePreset" aria-label="当前变声预设"></select>
+          <span id="bypassBadge" class="badge warn hidden">临时旁路</span>
+        </div>
+        <div class="voice-actions">
+          <button id="voiceAbBypass" class="ghost ab" aria-pressed="false" disabled title="音频未启动">按住听原声</button>
+          <button id="voicePreview" class="preview" aria-describedby="previewHint" disabled>试听 3 秒</button>
+          <button id="voiceEdit" class="ghost" aria-haspopup="dialog">编辑</button>
+        </div>
+        <p id="previewHint" class="voice-hint" role="status" aria-live="polite">音频未启动</p>
+      </section>
       <div class="gain-control">
         <div class="gain-heading"><label for="inSfxGain">音效总音量</label><span class="withunit"><input id="inSfxGain" type="number" value="-6" step="1" min="-60" max="36" aria-label="音效总音量" aria-describedby="sfxGainHelp gainRangeHelp"><i>dB</i></span></div>
         <input id="sfxGainSlider" type="range" min="-60" max="36" step="1" value="-6" aria-label="音效总音量滑杆" aria-describedby="sfxGainHelp gainRangeHelp">
@@ -83,6 +99,7 @@
     </div>
     <div class="statusbar">
       <span id="meter" class="meter off" title="送往虚拟麦克风的混合信号电平"><i class="zone"></i><i class="bar"></i><i class="peak"></i></span>
+      <span id="voiceStatus" class="voice-status">人声效果</span>
       <span id="signalLabel">音频设备未启动</span>
       <details id="healthDetails" class="health-details"><summary id="healthSummary">音频状态</summary><div id="metrics" class="metrics">设备未启动</div></details>
       <span class="status-spacer"></span><button id="remote" class="remote quiet"></button><button id="btnQr" class="quiet" aria-haspopup="dialog">手机遥控</button>
@@ -106,6 +123,14 @@
       <label>全局热键（逗号分隔，与音效顺序对应）<input id="inKeys" type="text" placeholder="F1,F2,F3"></label>
       <div class="setting-actions"><button id="btnClear" class="quiet danger">清空音效库</button><span class="hint">只移除列表，不删除原文件</span></div>
     </section>
+    <section class="settings-section"><h3>人声效果热键</h3>
+      <div class="row">
+        <label>临时旁路<input id="voiceKeyBypass" type="text" placeholder="例如 F9"></label>
+        <label>下一个预设<input id="voiceKeyNext" type="text" placeholder="例如 F10"></label>
+        <label>上一个预设<input id="voiceKeyPrev" type="text" placeholder="例如 F8"></label>
+      </div>
+      <p class="hint">输入变化立即保存并重绑；与音效热键重复时会提示冲突，旧绑定保持有效。</p>
+    </section>
     <section class="settings-section"><h3>手机遥控</h3><label class="switch-row"><span><strong>启用局域网遥控</strong><small>启动后，用同一网络中的手机扫码触发音效</small></span><input id="inRemote" type="checkbox" checked></label></section>
     <section class="settings-section"><h3>结束转发</h3><p class="hint">平常「停止播放」只停止音效；「关闭音效」仍转发人声。释放设备后，目标应用需要改回真实麦克风。</p><div class="setting-actions"><button id="btnRevertMic" class="ghost">切回真实麦克风</button><button id="btnRelease" class="ghost danger">彻底释放音频设备</button></div></section>
     <div class="dialog-footer"><button id="btnSetupSave" class="primary">保存设置并关闭</button></div>
@@ -121,6 +146,84 @@
     <p id="soundEditHelp" class="hint">名称、标签和热键在关闭音效后可修改；音量随时可调。</p>
     <div class="sound-tools"><button id="btnSoundLeft" class="ghost">前移</button><button id="btnSoundRight" class="ghost">后移</button><button id="btnSoundRemove" class="quiet danger">从库中移除</button></div>
     <div class="dialog-footer"><button id="btnSoundSave" class="primary">保存并关闭</button></div>
+  </section>
+</div>
+
+<div id="voiceOverlay" class="modal-overlay hidden">
+  <section class="dialog voice-dialog" role="dialog" aria-modal="true" aria-labelledby="voiceTitle">
+    <div class="dialog-heading">
+      <div><p class="eyebrow">麦克风人声</p><h2 id="voiceTitle">人声效果</h2></div>
+      <button id="voiceClose" class="quiet" aria-label="关闭人声效果">关闭</button>
+    </div>
+    <p class="voice-summary"><span>当前预设</span><b id="voiceCurrentPreset">未读取</b><span id="dirtyBadge" class="badge dirty hidden">● 已修改</span><span id="modalBypassBadge" class="badge warn hidden">临时旁路</span></p>
+    <section class="settings-section">
+      <h3>音高与音色</h3>
+      <div class="param-list">
+        <div class="param-row"><label for="pitch">音高</label><input id="pitch" type="range" min="-24" max="24" step="1" value="0" aria-describedby="pitchOut"><output id="pitchOut" for="pitch">0 半音</output></div>
+        <div class="param-row"><label for="formant">共振峰</label><input id="formant" type="range" min="-12" max="12" step="1" value="0" aria-describedby="formantOut"><output id="formantOut" for="formant">0 半音</output></div>
+      </div>
+      <p class="hint">参数立即作用于当前人声；未保存的修改只在本次运行有效。</p>
+    </section>
+    <section class="settings-section">
+      <h3>效果</h3>
+      <div class="param-list effect-list">
+        <div class="param-row effect-row">
+          <label class="effect-toggle"><input id="gateOn" type="checkbox" aria-label="噪声门">噪声门</label>
+          <input id="gate" type="range" min="-60" max="0" step="1" value="-45" aria-label="噪声门阈值" aria-describedby="gateOut">
+          <output id="gateOut" for="gate">−45 dB</output>
+        </div>
+        <div class="param-row effect-row">
+          <label class="effect-toggle"><input id="eqLowOn" type="checkbox" aria-label="低频 EQ">低频 EQ</label>
+          <input id="eqLow" type="range" min="-12" max="12" step="1" value="0" aria-label="低频 EQ 增益" aria-describedby="eqLowOut">
+          <output id="eqLowOut" for="eqLow">0 dB</output>
+        </div>
+        <div class="param-row effect-row">
+          <label class="effect-toggle"><input id="eqMidOn" type="checkbox" aria-label="中频 EQ">中频 EQ</label>
+          <input id="eqMid" type="range" min="-12" max="12" step="1" value="0" aria-label="中频 EQ 增益" aria-describedby="eqMidOut">
+          <output id="eqMidOut" for="eqMid">0 dB</output>
+        </div>
+        <div class="param-row effect-row">
+          <label class="effect-toggle"><input id="eqHighOn" type="checkbox" aria-label="高频 EQ">高频 EQ</label>
+          <input id="eqHigh" type="range" min="-12" max="12" step="1" value="0" aria-label="高频 EQ 增益" aria-describedby="eqHighOut">
+          <output id="eqHighOut" for="eqHigh">0 dB</output>
+        </div>
+        <div class="param-row effect-row">
+          <label class="effect-toggle"><input id="driveOn" type="checkbox" aria-label="软削波">软削波</label>
+          <input id="drive" type="range" min="0" max="1" step="0.05" value="0" aria-label="软削波量" aria-describedby="driveOut">
+          <output id="driveOut" for="drive">0.00</output>
+        </div>
+        <div class="param-row effect-row">
+          <label class="effect-toggle"><input id="robotOn" type="checkbox" aria-label="环形调制">环形调制</label>
+          <input id="robotHz" type="range" min="20" max="1000" step="1" value="50" aria-label="环形调制频率" aria-describedby="robotHzOut">
+          <output id="robotHzOut" for="robotHz">50 Hz</output>
+        </div>
+        <div class="param-row effect-row">
+          <label class="effect-sub-label" for="robotMix">混合</label>
+          <input id="robotMix" type="range" min="0" max="1" step="0.01" value="0.8" aria-label="环形调制混合" aria-describedby="robotMixOut">
+          <output id="robotMixOut" for="robotMix">0.80</output>
+        </div>
+      </div>
+      <p class="hint">开关与数值分别生效；关闭效果时保留当前数值，再次开启沿用。</p>
+    </section>
+    <section class="settings-section">
+      <h3>预设</h3>
+      <p id="voicePresetNote" class="hint">内置预设只读。修改后可另存为用户预设；当前修改只在本次运行有效。</p>
+      <div class="setting-actions preset-actions">
+        <button id="voiceSaveAs" class="primary">另存为用户预设</button>
+        <button id="voiceSaveChanges" class="ghost">保存修改</button>
+        <button id="voiceRename" class="ghost">重命名</button>
+        <button id="voiceDelete" class="quiet danger">删除</button>
+        <button id="voiceRestoreDraft" class="ghost hidden">恢复未保存修改</button>
+      </div>
+      <div id="voiceNameEditor" class="withbtn hidden">
+        <input id="voicePresetName" type="text" maxlength="40" placeholder="预设名称，例如：直播女声" aria-label="预设名称">
+        <button id="voiceNameConfirm" class="primary">保存</button>
+        <button id="voiceNameCancel" class="quiet">取消</button>
+      </div>
+      <p id="voiceSaveState" class="hint error hidden" role="status"></p>
+    </section>
+    <p id="voiceMetrics" class="hint voice-metrics" aria-live="off">—</p>
+    <div class="dialog-footer"><button id="voiceDone" class="primary">完成</button></div>
   </section>
 </div>
 

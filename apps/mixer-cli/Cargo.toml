@@ -23,5 +23,11 @@ log.workspace = true
 env_logger.workspace = true
 clap.workspace = true
 
+[features]
+# 默认启用变声，构建需要 C++ 工具链与 libclang；--no-default-features 仍可编译。
+# 请求变声却未编译该特性时，运行期给出明确错误而不是静默降级。
+default = ["voice"]
+voice = ["audio-session/voice"]
+
 [lints]
 workspace = true

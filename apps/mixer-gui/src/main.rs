@@ -11,6 +11,7 @@ mod host;
 #[cfg(target_os = "macos")]
 mod macos_audio;
 mod smoke;
+mod voice;
 mod window_lifecycle;
 
 use std::path::PathBuf;
@@ -20,6 +21,7 @@ use host::{AudioHost, DeviceDto, StartConfig, StatusDto};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, State};
+use voice::{VoiceParamsDto, VoicePresetDto, VoiceStatusDto};
 use window_lifecycle::MainWindowEvent;
 
 type Res<T> = Result<T, String>;
@@ -570,6 +572,126 @@ fn status(host: State<'_, AudioHost>) -> StatusDto {
     host.status()
 }
 
+// ─────────────────────────────────────────── 变声
+
+#[tauri::command]
+fn voice_status(host: State<'_, AudioHost>) -> VoiceStatusDto {
+    host.voice_status()
+}
+
+#[tauri::command]
+fn voice_presets(host: State<'_, AudioHost>) -> Vec<VoicePresetDto> {
+    host.voice_presets()
+}
+
+/// 麦克风校准开始：把变声切回原声，校准读到的才是真实人声电平。
+///
+/// 只改变声运行状态，不取生命周期锁，可在界面线程同步执行。
+#[tauri::command]
+fn voice_calibration_begin(host: State<'_, AudioHost>) {
+    host.voice_calibration_begin();
+}
+
+/// 麦克风校准结束：解除原声暂停；重复调用无副作用。
+#[tauri::command]
+fn voice_calibration_end(host: State<'_, AudioHost>) {
+    host.voice_calibration_end();
+}
+
+#[tauri::command]
+fn voice_set_enabled(host: State<'_, AudioHost>, enabled: bool) -> Res<VoiceStatusDto> {
+    host.voice_set_enabled(enabled).map_err(err)
+}
+
+#[tauri::command]
+fn voice_set_bypass(host: State<'_, AudioHost>, bypass: bool) -> Res<VoiceStatusDto> {
+    host.voice_set_bypass(bypass).map_err(err)
+}
+
+#[tauri::command]
+fn voice_set_ab_bypass(host: State<'_, AudioHost>, active: bool) -> Res<VoiceStatusDto> {
+    host.voice_set_ab_bypass(active).map_err(err)
+}
+
+#[tauri::command]
+fn voice_set_params(host: State<'_, AudioHost>, params: VoiceParamsDto) -> Res<VoiceStatusDto> {
+    host.voice_set_params(params).map_err(err)
+}
+
+#[tauri::command]
+fn voice_select_preset(host: State<'_, AudioHost>, id: String) -> Res<VoiceStatusDto> {
+    host.voice_select_preset(&id).map_err(err)
+}
+
+#[tauri::command]
+fn voice_save_as_user_preset(host: State<'_, AudioHost>, name: String) -> Res<VoiceStatusDto> {
+    host.voice_save_as_user_preset(&name).map_err(err)
+}
+
+#[tauri::command]
+fn voice_save_preset(host: State<'_, AudioHost>) -> Res<VoiceStatusDto> {
+    host.voice_save_preset().map_err(err)
+}
+
+#[tauri::command]
+fn voice_rename_preset(
+    host: State<'_, AudioHost>,
+    id: String,
+    name: String,
+) -> Res<VoiceStatusDto> {
+    host.voice_rename_preset(&id, &name).map_err(err)
+}
+
+#[tauri::command]
+fn voice_delete_preset(host: State<'_, AudioHost>, id: String) -> Res<VoiceStatusDto> {
+    host.voice_delete_preset(&id).map_err(err)
+}
+
+#[tauri::command]
+fn voice_restore_draft(host: State<'_, AudioHost>) -> Res<VoiceStatusDto> {
+    host.voice_restore_draft().map_err(err)
+}
+
+/// 试听会等待旧试听输出关闭，必须在后台线程执行，不能阻塞 WebView。
+#[tauri::command]
+async fn voice_preview_start(app: tauri::AppHandle) -> Res<VoiceStatusDto> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<AudioHost>().voice_preview_start().map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+
+#[tauri::command]
+async fn voice_preview_stop(app: tauri::AppHandle) -> Res<VoiceStatusDto> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<AudioHost>().voice_preview_stop().map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+
+/// 保存并重绑人声效果热键。
+///
+/// 它要拿生命周期锁（开流或释放时可能被持有数秒）并同步落盘；同步 Tauri 命令在界面线程
+/// 执行，会冻住界面，若恰逢 `start` 正等主线程绑定槽位热键，两边互等直到 6 秒超时，
+/// 槽位热键因此绑定失败。必须放到后台线程，与 `voice_preview_*` 一致。
+#[tauri::command]
+async fn voice_set_hotkeys(
+    app: tauri::AppHandle,
+    bypass: String,
+    next: String,
+    prev: String,
+) -> Res<VoiceStatusDto> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<AudioHost>()
+            .voice_set_hotkeys(&bypass, &next, &prev)
+            .map_err(err)
+    })
+    .await
+    .map_err(err)?
+}
+
 /// 前端加载完成后主动上报 —— 用来证明 WebView 真的渲染并执行了 JS。
 /// `--probe` 模式下会把它打印出来，供自动化验证。
 fn sound_item_dto(item: &app_config::SoundEntry) -> serde_json::Value {
@@ -636,10 +758,26 @@ fn parse_sound_items(items: &[serde_json::Value]) -> Vec<app_config::SoundEntry>
 }
 
 /// 读取上次保存的配置（音效目录、设备、增益、热键）。
+///
+/// 读取是宽松的；配置文件有问题时附带 `config_notices`，界面据此提示用户。
+/// `config_write_blocked` 为真表示保存会被拒绝，直到文件被修复。
 #[tauri::command]
 fn load_config() -> serde_json::Value {
-    let c = Config::load();
-    saved_config_dto(&c)
+    config_dto_with_notices(Config::load_report())
+}
+
+fn config_dto_with_notices(report: app_config::LoadReport) -> serde_json::Value {
+    let mut dto = saved_config_dto(&report.config);
+    dto["config_notices"] = serde_json::json!(report.notices);
+    dto["config_write_blocked"] = serde_json::json!(report.write_blocked);
+    dto
+}
+
+/// 把配置读取问题写入日志；打包后的 App 没有控制台，日志用于事后排查。
+fn log_config_notices(notices: &[String]) {
+    for notice in notices {
+        log::warn!("配置: {notice}");
+    }
 }
 
 fn saved_config_dto(c: &Config) -> serde_json::Value {
@@ -674,6 +812,11 @@ fn saved_config_dto(c: &Config) -> serde_json::Value {
         "mic_gain_db": c.mic_gain_db.unwrap_or(0.0),
         "sfx_gain_db": c.sfx_gain_db.unwrap_or(-6.0),
         "hotkeys": c.hotkeys.join(","),
+        "voice_hotkeys": {
+            "bypass": &c.voice.bypass_hotkey,
+            "next": &c.voice.next_preset_hotkey,
+            "prev": &c.voice.prev_preset_hotkey,
+        },
         "path": Config::path().display().to_string(),
     })
 }
@@ -694,35 +837,70 @@ fn save_config(
     sfx_gain_db: f32,
     hotkeys: String,
 ) -> Result<(), String> {
-    let mut c = Config::load();
-    c.sound_dirs = if dir.trim().is_empty() {
-        Vec::new()
-    } else {
-        vec![PathBuf::from(dir)]
-    };
-    c.set("monitor", if monitor { "true" } else { "false" })
-        .map_err(err)?;
-    if let Some(looping) = looping {
-        c.set("looping", if looping { "true" } else { "false" })
-            .map_err(err)?;
-    }
-    c.set("monitor_device", monitor_device.as_deref().unwrap_or(""))
-        .map_err(err)?;
+    save_config_at(
+        &Config::path(),
+        items,
+        monitor,
+        looping,
+        monitor_device,
+        dir,
+        input_device,
+        output_device,
+        buffer_ms,
+        mic_gain_db,
+        sfx_gain_db,
+        hotkeys,
+    )
+}
 
-    // 音效库：整组覆盖（路径/音量/名字/标签），保持并行数组一一对应
-    let parsed = parse_sound_items(&items);
-    c.set_sound_entries(&parsed);
-    c.set("input_device", input_device.as_deref().unwrap_or("none"))
-        .map_err(err)?;
-    c.set("output_device", output_device.as_deref().unwrap_or("none"))
-        .map_err(err)?;
-    c.set("buffer_ms", &buffer_ms.to_string()).map_err(err)?;
-    c.set("mic_gain_db", &mic_gain_db.to_string())
-        .map_err(err)?;
-    c.set("sfx_gain_db", &sfx_gain_db.to_string())
-        .map_err(err)?;
-    c.set("hotkeys", &hotkeys).map_err(err)?;
-    c.save().map(|_| ()).map_err(err)
+/// 完整配置保存只覆盖界面拥有的字段。重读磁盘后再写，变声节与用户预设
+/// 原样保留；与变声持久化共用写入门，避免两份整配置互相覆盖。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn save_config_at(
+    path: &std::path::Path,
+    items: Vec<serde_json::Value>,
+    monitor: bool,
+    looping: Option<bool>,
+    monitor_device: Option<String>,
+    dir: String,
+    input_device: Option<String>,
+    output_device: Option<String>,
+    buffer_ms: u32,
+    mic_gain_db: f32,
+    sfx_gain_db: f32,
+    hotkeys: String,
+) -> Result<(), String> {
+    crate::host::with_config_write(|| {
+        let mut c = Config::load_for_write_from(path).map_err(|error| format!("{error:#}"))?;
+        c.sound_dirs = if dir.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![PathBuf::from(dir)]
+        };
+        c.set("monitor", if monitor { "true" } else { "false" })
+            .map_err(err)?;
+        if let Some(looping) = looping {
+            c.set("looping", if looping { "true" } else { "false" })
+                .map_err(err)?;
+        }
+        c.set("monitor_device", monitor_device.as_deref().unwrap_or(""))
+            .map_err(err)?;
+
+        // 音效库：整组覆盖（路径/音量/名字/标签），保持并行数组一一对应
+        let parsed = parse_sound_items(&items);
+        c.set_sound_entries(&parsed);
+        c.set("input_device", input_device.as_deref().unwrap_or("none"))
+            .map_err(err)?;
+        c.set("output_device", output_device.as_deref().unwrap_or("none"))
+            .map_err(err)?;
+        c.set("buffer_ms", &buffer_ms.to_string()).map_err(err)?;
+        c.set("mic_gain_db", &mic_gain_db.to_string())
+            .map_err(err)?;
+        c.set("sfx_gain_db", &sfx_gain_db.to_string())
+            .map_err(err)?;
+        c.set("hotkeys", &hotkeys).map_err(err)?;
+        c.save_to(path).map_err(err)
+    })
 }
 
 #[tauri::command]
@@ -836,6 +1014,7 @@ fn request_exit(app: &tauri::AppHandle) {
             println!("[退出] 恢复真实麦克风失败: {e:#}");
         }
         host.release();
+        host.shutdown_hotkeys();
         host.finish_shutdown();
         app.exit(0);
     });
@@ -900,6 +1079,11 @@ fn main() {
         .setup(|app| {
             build_tray(app.handle())?;
             println!("[菜单栏] 图标已创建");
+
+            // 人声效果热键独立于音频会话：程序启动即绑定，释放设备后仍可用。
+            if let Err(error) = app.state::<AudioHost>().initialize_hotkeys(Some(app.handle())) {
+                println!("[人声热键] ❌ 启动绑定失败: {error:#}");
+            }
 
             // 记下用户原本的默认麦克风 —— 「切回真实麦克风」要还原成它。
             // 必须在这里（用户还没点过「启动」）记录，否则记录到的可能是我们自己改过的值。
@@ -1032,7 +1216,9 @@ fn main() {
             // 同样提前探测 —— 否则用户点「启动」时会**毫无反应**，
             // 因为文件读取在授权确定之前是直接阻塞的。
             {
-                let cfg = Config::load();
+                let report = Config::load_report();
+                log_config_notices(&report.notices);
+                let cfg = report.config;
                 let files: Vec<PathBuf> = if cfg.sound_files.is_empty() {
                     cfg.collect_sounds().unwrap_or_default()
                 } else {
@@ -1129,6 +1315,23 @@ fn main() {
             js_error,
             open_url,
             status,
+            voice_status,
+            voice_presets,
+            voice_calibration_begin,
+            voice_calibration_end,
+            voice_set_enabled,
+            voice_set_bypass,
+            voice_set_ab_bypass,
+            voice_set_params,
+            voice_select_preset,
+            voice_save_as_user_preset,
+            voice_save_preset,
+            voice_rename_preset,
+            voice_delete_preset,
+            voice_restore_draft,
+            voice_preview_start,
+            voice_preview_stop,
+            voice_set_hotkeys,
             frontend_ready,
             load_config,
             save_config,
@@ -1149,6 +1352,104 @@ fn main() {
             }
             _ => {}
         });
+}
+
+/// 同步 Tauri 命令在界面线程执行。会等待生命周期锁、解码、开关流或做配置落盘的命令
+/// 必须声明为异步并交给后台线程；这里按源码契约守住，运行时线程模型无法在单元测试里构造。
+#[cfg(test)]
+mod command_thread_tests {
+    const BLOCKING_COMMANDS: &[&str] = &[
+        "voice_set_hotkeys",
+        "voice_preview_start",
+        "voice_preview_stop",
+    ];
+
+    fn command_source(name: &str) -> (&'static str, &'static str) {
+        let source = include_str!("main.rs");
+        let declaration = format!("fn {name}(");
+        let at = source
+            .find(&declaration)
+            .unwrap_or_else(|| panic!("找不到命令 {name}"));
+        let end = source[at..]
+            .find("#[tauri::command]")
+            .map_or(source.len(), |offset| at + offset);
+        (&source[..at], &source[at..end])
+    }
+
+    #[test]
+    fn 会阻塞的变声命令必须是异步后台命令() {
+        for name in BLOCKING_COMMANDS {
+            let (before, body) = command_source(name);
+            assert!(
+                before.ends_with("async "),
+                "{name} 不是 async fn：同步命令会在界面线程执行并冻住 WebView"
+            );
+            assert!(
+                body.contains("spawn_blocking"),
+                "{name} 必须把阻塞工作交给 spawn_blocking"
+            );
+            assert!(
+                !body.contains("State<'_, AudioHost>"),
+                "{name} 用 AppHandle 取宿主，避免把借用跨越 await"
+            );
+        }
+    }
+
+    fn registered_commands() -> Vec<&'static str> {
+        include_str!("main.rs")
+            .split("tauri::generate_handler![")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .expect("找不到 generate_handler 列表")
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .collect()
+    }
+
+    /// 交付界面按字面名称调用的命令都必须已注册；漏注册时界面只会得到运行时错误。
+    #[test]
+    fn 界面调用的命令都已注册到命令处理器() {
+        let registered = registered_commands();
+        let script = include_str!("../dist/main.js");
+        let mut checked = 0;
+        for call in ["invoke('", "invokeAudio('"] {
+            for part in script.split(call).skip(1) {
+                let Some(name) = part.split('\'').next() else {
+                    continue;
+                };
+                if name.is_empty() || !name.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                    continue;
+                }
+                assert!(registered.contains(&name), "界面调用的命令 {name} 未注册");
+                checked += 1;
+            }
+        }
+        assert!(checked > 20, "应检查到界面调用的命令，实际 {checked}");
+        for name in ["voice_calibration_begin", "voice_calibration_end"] {
+            assert!(registered.contains(&name), "{name} 未注册");
+            assert!(
+                script.contains(&format!("invoke('{name}')")),
+                "界面没有调用 {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn 阻塞命令都已注册到命令处理器() {
+        let source = include_str!("main.rs");
+        let handler = source
+            .split("tauri::generate_handler![")
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .expect("找不到 generate_handler 列表");
+        for name in BLOCKING_COMMANDS {
+            assert!(
+                handler.split(',').any(|item| item.trim() == *name),
+                "{name} 未注册到 generate_handler"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1367,5 +1668,17 @@ mod sound_item_dto_tests {
             "file": "legacy.wav", "tags": " old, second| third; ",
         })]);
         assert_eq!(parsed[0].tags, ["old", "second", "third"]);
+    }
+
+    #[test]
+    fn 载入配置暴露三个人声效果热键() {
+        let mut config = Config::default();
+        config.voice.bypass_hotkey = "F9".into();
+        config.voice.next_preset_hotkey = "F10".into();
+        config.voice.prev_preset_hotkey = "F8".into();
+        let dto = saved_config_dto(&config);
+        assert_eq!(dto["voice_hotkeys"]["bypass"], "F9");
+        assert_eq!(dto["voice_hotkeys"]["next"], "F10");
+        assert_eq!(dto["voice_hotkeys"]["prev"], "F8");
     }
 }

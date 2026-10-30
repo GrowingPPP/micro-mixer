@@ -3,11 +3,17 @@ use audio_core::device::{AudioStream, CaptureCallback, DeviceInfo, RenderCallbac
 use audio_core::engine::SfxSlot;
 use std::sync::atomic::AtomicUsize;
 
+#[cfg(feature = "voice")]
+use crate::voice::{VoiceParamsDto, VoiceService, VoiceStartConfig};
+#[cfg(feature = "voice")]
+use audio_core::voice::{VoiceBackend, VoiceParams, VoicePhase, VoicePreviewClip};
+
 type CloseBarrier = (mpsc::Sender<()>, Arc<Mutex<mpsc::Receiver<()>>>);
 
 #[derive(Clone, Default)]
 struct FakeBackend {
     outputs: Arc<Mutex<Vec<RenderCallback>>>,
+    captures: Arc<Mutex<Vec<CaptureCallback>>>,
     opened: Arc<Mutex<Option<mpsc::Sender<()>>>>,
     close_barrier: Arc<Mutex<Option<CloseBarrier>>>,
     closed: Arc<Mutex<Option<mpsc::Sender<()>>>>,
@@ -59,8 +65,9 @@ impl AudioBackend for FakeBackend {
         &self,
         _: &DeviceId,
         format: Option<StreamFormat>,
-        _: CaptureCallback,
+        callback: CaptureCallback,
     ) -> Result<Box<dyn AudioStream>> {
+        self.captures.lock().unwrap().push(callback);
         Ok(Box::new(FakeStream(format.unwrap(), None, None)))
     }
     fn open_output(
@@ -98,6 +105,7 @@ fn config() -> StartConfig {
         monitor: true,
         monitor_device: Some("fake monitor".into()),
         remote_port: Some(8765),
+        voice: None,
     }
 }
 // 既有 PCM 场景使用单位增益，产品默认增益在专门的回归中验证。
@@ -107,7 +115,7 @@ fn preview_test_host() -> AudioHost {
     host
 }
 
-fn fixture() -> (AudioHost, FakeBackend) {
+fn running_fixture() -> (Running, FakeBackend) {
     let cfg = config();
     let backend = FakeBackend::default();
     let format = StreamFormat::stereo(44_100);
@@ -132,30 +140,17 @@ fn fixture() -> (AudioHost, FakeBackend) {
                 format,
                 slots: vec![slot],
             }),
+            voice: None,
         },
         backend.clone(),
         backend.clone(),
     )
     .unwrap();
-    let playback = session.playback.clone();
-    let host = preview_test_host();
-    host.next_generation.store(1, Ordering::Relaxed);
-    host.audio_requests.register_session(1);
-    let shared = Arc::new(remote::Shared::default());
-    shared.set_routed(
-        playback.control.clone(),
-        vec!["Good".into()],
-        host.play_handler(playback.clone(), 1),
-        host.remote_stop_handler(playback.clone(), 1),
-    );
-    *host.remote.lock().unwrap() = Some(shared);
-    *host.running.lock().unwrap() = Some(Running {
+    let running = Running {
         generation: 1,
         stats: session.stats.clone(),
-        playback,
+        playback: session.playback.clone(),
         session,
-        shutdown: Arc::new(AtomicBool::new(false)),
-        hotkey_thread: None,
         slots_meta: vec![SlotDto {
             index: 0,
             source_index: 1,
@@ -174,12 +169,186 @@ fn fixture() -> (AudioHost, FakeBackend) {
         monitor_error: Mutex::new(None),
         started_at: std::time::Instant::now(),
         skipped_notes: vec!["Invalid".into()],
-        hotkeys: Arc::new(Mutex::new(None)),
-        poller: Arc::new(Mutex::new(None)),
+        cfg_key: cfg_fingerprint(&cfg),
+        cfg,
+    };
+    (running, backend)
+}
+
+fn fixture() -> (AudioHost, FakeBackend) {
+    let (running, backend) = running_fixture();
+    let host = preview_test_host();
+    host.next_generation.store(1, Ordering::Relaxed);
+    host.audio_requests.register_session(1);
+    let playback = running.playback.clone();
+    let shared = Arc::new(remote::Shared::default());
+    shared.set_routed(
+        playback.control.clone(),
+        vec!["Good".into()],
+        host.play_handler(playback.clone(), 1),
+        host.remote_stop_handler(playback.clone(), 1),
+    );
+    *host.remote.lock().unwrap() = Some(shared);
+    *host.running.lock().unwrap() = Some(running);
+    (host, backend)
+}
+
+#[test]
+fn 启动阶段记录的人声提示在会话发布后仍然可见() {
+    let host = preview_test_host();
+    let (running, _backend) = running_fixture();
+    host.record_voice_notice("热键冲突，未绑定：F9");
+
+    let unpublished = host.publish_running(running, None);
+
+    assert!(unpublished.is_none());
+    let status = host.status();
+    assert!(status.running);
+    assert_eq!(
+        status.voice_notice.as_deref(),
+        Some("热键冲突，未绑定：F9"),
+        "发布成功不能清掉本轮启动刚记录的提示"
+    );
+    assert!(status.voice_notice_generation > 0);
+}
+
+#[test]
+fn 被取代的启动归还宿主级槽位热键() {
+    let host = preview_test_host();
+    let (running, _backend) = running_fixture();
+    let (manager, _registrations) = hotkeys::test_support::manager().unwrap();
+    *host.hotkey_manager.lock().unwrap() = Some(manager.clone());
+    let slot = Hotkeys::bind_with(manager, &["F1".into()]).unwrap();
+    host.install_slot_hotkeys(Some(slot)).unwrap();
+    *host.slot_action.lock().unwrap() = Some(host.play_handler(running.playback.clone(), 1));
+    assert!(host.hotkeys.lock().unwrap().slots_bound());
+
+    host.discard_unpublished_session(running);
+
+    assert!(
+        !host.hotkeys.lock().unwrap().slots_bound(),
+        "被取代且未发布的启动必须归还槽位热键"
+    );
+    assert!(host.slot_action.lock().unwrap().is_none());
+    assert!(host.running.lock().unwrap().is_none());
+}
+
+#[cfg(feature = "voice")]
+struct FakeVoiceBackend {
+    /// 放大系数用于区分干声与湿声，默认 1.0 保持既有回归的直通语义。
+    scale: f32,
+}
+
+#[cfg(feature = "voice")]
+impl VoiceBackend for FakeVoiceBackend {
+    fn process(&mut self, input: &[f32], output: &mut [f32]) -> usize {
+        let frames = input.len().min(output.len());
+        for (out, sample) in output[..frames].iter_mut().zip(&input[..frames]) {
+            *out = *sample * self.scale;
+        }
+        frames
+    }
+
+    fn latency_frames(&self) -> usize {
+        0
+    }
+
+    fn reset(&mut self) {}
+
+    fn set_params(&mut self, _: VoiceParams) {}
+}
+
+#[cfg(feature = "voice")]
+fn voice_fixture(enabled: bool) -> (AudioHost, FakeBackend, TemporaryDir) {
+    voice_fixture_scaled(enabled, 1.0)
+}
+
+#[cfg(feature = "voice")]
+fn voice_fixture_scaled(enabled: bool, scale: f32) -> (AudioHost, FakeBackend, TemporaryDir) {
+    let cfg = config();
+    let backend = FakeBackend::default();
+    let format = StreamFormat::stereo(44_100);
+    let slot = SfxSlot {
+        name: "Good".into(),
+        samples: Arc::new(vec![0.2; 88_200]),
+        looping: false,
+        gain_db: 0.0,
+    };
+    let dir = TemporaryDir::new();
+    let mut host = preview_test_host();
+    host.voice =
+        VoiceService::new_with_path(&app_config::Config::default(), dir.0.join("config.toml"));
+    let params = VoiceParams {
+        pitch_semitones: 4.0,
+        ..VoiceParams::neutral()
+    };
+    host.voice
+        .apply_start_config(&VoiceStartConfig {
+            enabled,
+            params: Some(params.into()),
+            block_ms: Some(crate::voice::DEFAULT_VOICE_BLOCK_MS),
+        })
+        .unwrap();
+    let session = Session::open_with_backend(
+        SessionOptions {
+            input: DeviceId::new("fake input"),
+            output: DeviceId::new("fake output"),
+            input_format: format,
+            output_format: format,
+            buffer_ms: cfg.buffer_ms,
+            slots: vec![slot.clone()],
+            mic_gain_db: 0.0,
+            sfx_gain_db: 0.0,
+            monitor: Some(MonitorOptions {
+                device: DeviceId::new("fake monitor"),
+                format,
+                slots: vec![slot],
+            }),
+            voice: Some(audio_session::VoiceOptions {
+                enabled,
+                params,
+                block_ms: crate::voice::DEFAULT_VOICE_BLOCK_MS,
+                backend: Box::new(move |_| Ok(Box::new(FakeVoiceBackend { scale }))),
+            }),
+        },
+        backend.clone(),
+        backend.clone(),
+    )
+    .unwrap();
+    let control = session.voice_control();
+    let preview_control = session.voice_preview_control();
+    let playback = session.playback.clone();
+    host.next_generation.store(1, Ordering::Relaxed);
+    host.audio_requests.register_session(1);
+    *host.running.lock().unwrap() = Some(Running {
+        generation: 1,
+        stats: session.stats.clone(),
+        playback,
+        session,
+        slots_meta: vec![SlotDto {
+            index: 0,
+            source_index: 0,
+            id: "good-id".into(),
+            name: "Good".into(),
+            file: "good.wav".into(),
+            duration: 1.0,
+            peak_db: -14.0,
+            hotkey: String::new(),
+            gain_db: 0.0,
+        }],
+        out_device: "fake output".into(),
+        in_device: "fake input".into(),
+        input_id: DeviceId::new("fake input"),
+        output_id: DeviceId::new("fake output"),
+        monitor_error: Mutex::new(None),
+        started_at: std::time::Instant::now(),
+        skipped_notes: Vec::new(),
         cfg_key: cfg_fingerprint(&cfg),
         cfg,
     });
-    (host, backend)
+    host.attach_voice_control(control);
+    host.attach_voice_preview(preview_control);
+    (host, backend, dir)
 }
 
 #[test]
@@ -218,6 +387,341 @@ fn every_start_setting_changes_the_fingerprint() {
 }
 
 #[test]
+fn 变声字段不参与启动指纹() {
+    let mut cfg = config();
+    let key = cfg_fingerprint(&cfg);
+    cfg.voice = Some(crate::voice::VoiceStartConfig {
+        enabled: true,
+        params: Some(crate::voice::VoiceParamsDto {
+            pitch_semitones: 12.0,
+            ..crate::voice::VoiceParamsDto::default()
+        }),
+        block_ms: Some(20.0),
+    });
+    assert_eq!(
+        key,
+        cfg_fingerprint(&cfg),
+        "变声参数只能作用于运行控制，不能触发音频会话重启"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 变声参数变化不重启音频会话() {
+    let (host, backend, _dir) = voice_fixture(true);
+    let before_generation = host.audio_progress().0;
+    let before_key = host.running_cfg_key().unwrap();
+    let before_outputs = backend.outputs.lock().unwrap().len();
+
+    let status = host
+        .voice_set_params(VoiceParamsDto {
+            pitch_semitones: 9.0,
+            formant_semitones: -3.0,
+            ..VoiceParamsDto::default()
+        })
+        .unwrap();
+
+    assert_eq!(status.params.pitch_semitones, 9.0);
+    assert_eq!(status.params.formant_semitones, -3.0);
+    assert_eq!(host.audio_progress().0, before_generation);
+    assert_eq!(host.running_cfg_key().unwrap(), before_key);
+    assert_eq!(backend.outputs.lock().unwrap().len(), before_outputs);
+    let control = host.voice_control.lock().unwrap().clone().unwrap();
+    assert_eq!(control.params().pitch_semitones, 9.0);
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 变声待机保留变声控制() {
+    let (host, _backend, _dir) = voice_fixture(true);
+    let before = host.status().voice.expect("运行时应带变声状态");
+
+    host.stop();
+
+    let status = host.status();
+    assert!(!status.running);
+    assert!(status.passthrough);
+    assert!(
+        host.voice_control.lock().unwrap().is_some(),
+        "待机只关闭音效，变声控制句柄必须保留"
+    );
+    let voice = status.voice.expect("待机仍应报告变声状态");
+    assert!(voice.enabled);
+    assert_eq!(voice.phase, before.phase);
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 变声释放后重建使用最新配置() {
+    let (host, _backend, dir) = voice_fixture(false);
+    host.release();
+    assert!(host.voice_control.lock().unwrap().is_none());
+
+    host.voice_set_params(VoiceParamsDto {
+        pitch_semitones: 9.0,
+        ..VoiceParamsDto::default()
+    })
+    .unwrap();
+    host.voice_set_enabled(true).unwrap();
+
+    let options = host
+        .voice
+        .prepare_options(crate::voice::DEFAULT_VOICE_BLOCK_MS)
+        .unwrap();
+    assert!(options.enabled, "重建会话必须采用最新启用状态");
+    assert_eq!(options.params.pitch_semitones, 9.0);
+
+    let control = VoiceControl::new(options.params);
+    if options.enabled {
+        control.request_enable();
+    }
+    host.attach_voice_control(Some(control.clone()));
+    assert_eq!(control.phase(), VoicePhase::Warmup);
+    assert_eq!(control.params().pitch_semitones, 9.0);
+    host.voice.flush_saves();
+    let saved = app_config::Config::load_from(&dir.0.join("config.toml"));
+    assert!(saved.voice.enabled);
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 变声自检暂停期间旁路并在结束后恢复() {
+    let (host, _backend, dir) = voice_fixture(true);
+    host.voice_set_enabled(true).unwrap();
+    host.voice.flush_saves();
+    assert_eq!(host.voice_status().phase, "warmup");
+
+    host.voice.suspend();
+    let options = host
+        .voice
+        .prepare_options(crate::voice::DEFAULT_VOICE_BLOCK_MS)
+        .unwrap();
+    assert!(!options.enabled, "暂停期间重建会话也不得启用人声");
+    assert!(host.voice_status().bypassed);
+    assert_eq!(host.voice_status().phase, "off", "旁路期间输出干声");
+
+    // 生产释放路径会 detach 控制句柄，但暂停层必须保留到 restore。
+    host.release_inner();
+    assert!(host.voice_control.lock().unwrap().is_none());
+    assert!(host.voice_status().bypassed);
+    assert_eq!(host.voice_status().phase, "off");
+
+    host.voice.restore();
+    let status = host.voice_status();
+    assert!(status.enabled);
+    assert!(!status.bypassed);
+
+    // 模拟恢复音频后绑定新会话句柄。
+    let rebuilt = VoiceControl::new(VoiceParams::neutral());
+    host.attach_voice_control(Some(rebuilt.clone()));
+    assert_eq!(rebuilt.phase(), VoicePhase::Warmup);
+    host.voice.flush_saves();
+    assert!(
+        app_config::Config::load_from(&dir.0.join("config.toml"))
+            .voice
+            .enabled,
+        "自检暂停与恢复不得改写启用配置"
+    );
+}
+
+/// 自检暂停期间的会话重建是同一次使用中的临时让出设备：用户的临时旁路要保留到结束后。
+#[cfg(feature = "voice")]
+#[test]
+fn 变声自检暂停重建会话后保留用户临时旁路() {
+    let dir = TemporaryDir::new();
+    let mut host = preview_test_host();
+    host.voice =
+        VoiceService::new_with_path(&app_config::Config::default(), dir.0.join("config.toml"));
+    host.attach_voice_control(Some(VoiceControl::new(VoiceParams::neutral())));
+    host.voice_set_enabled(true).unwrap();
+    host.voice_set_bypass(true).unwrap();
+
+    host.with_suspended(None, || {
+        // 与 start_inner 一致：先释放旧会话，再绑定重建后的新控制句柄。
+        host.attach_voice_control(None);
+        let rebuilt = VoiceControl::new(VoiceParams::neutral());
+        host.attach_voice_control(Some(rebuilt.clone()));
+        assert_eq!(
+            rebuilt.phase(),
+            VoicePhase::Off,
+            "暂停期间新会话也必须是干声"
+        );
+        assert!(host.voice_status().bypassed);
+        Ok(())
+    })
+    .unwrap();
+
+    let status = host.voice_status();
+    assert!(status.enabled, "自检不改写启用状态");
+    assert!(status.bypassed, "自检暂停结束后必须回到用户原来的临时旁路");
+    let rebuilt = host.voice_control.lock().unwrap().clone().unwrap();
+    assert_eq!(rebuilt.phase(), VoicePhase::Off, "旁路仍在，新会话保持干声");
+
+    // 没有暂停层的会话重建（释放后重新启动、看门狗重启、设备恢复）按常规规则清除旁路。
+    host.attach_voice_control(None);
+    host.attach_voice_control(Some(VoiceControl::new(VoiceParams::neutral())));
+    let status = host.voice_status();
+    assert!(!status.bypassed, "普通会话重建必须清除临时旁路");
+    assert_eq!(status.phase, "warmup");
+}
+
+/// 校准读取送往虚拟麦克风的电平（`StatusDto.out_peak_db`）。变声启用时那是变声之后的
+/// 信号，校准暂停必须让该读数回到干声。
+#[cfg(feature = "voice")]
+#[test]
+fn 变声校准暂停让电平读数回到干声并在结束后恢复湿声() {
+    // 假后端把人声缩放到 0.5：湿声读数约 -16.5 dBFS，干声约 -10.5 dBFS。
+    let (host, backend, dir) = voice_fixture_scaled(true, 0.5);
+    let peak = |host: &AudioHost, backend: &FakeBackend| {
+        for _ in 0..8 {
+            drive_voice(backend, 4_410, 0.3);
+        }
+        host.status().out_peak_db
+    };
+    for _ in 0..200 {
+        drive_voice(&backend, 4_410, 0.3);
+    }
+    assert_eq!(host.voice_status().phase, "wet");
+    let wet = peak(&host, &backend);
+    assert!(
+        (wet - (-16.5)).abs() < 1.0,
+        "变声启用时读到的是变声之后的电平，实测 {wet:.2}"
+    );
+
+    host.voice_calibration_begin();
+    assert!(
+        wait_for(Duration::from_secs(2), || {
+            drive_voice(&backend, 4_410, 0.3);
+            host.status()
+                .voice
+                .is_some_and(|voice| voice.phase == "off")
+        }),
+        "校准暂停后人声链必须回到 off"
+    );
+    let dry = peak(&host, &backend);
+    assert!(
+        (dry - (-10.46)).abs() < 1.0,
+        "校准读数必须是干声电平（约 -10.5 dBFS），实测 {dry:.2}"
+    );
+    assert!(
+        dry - wet > 4.0,
+        "干湿读数应有明确差距：干 {dry:.2} 湿 {wet:.2}"
+    );
+    let status = host.voice_status();
+    assert!(status.enabled, "校准不改写启用状态");
+
+    host.voice_calibration_end();
+    assert!(
+        wait_for(Duration::from_secs(2), || {
+            drive_voice(&backend, 4_410, 0.3);
+            host.voice_status().phase == "wet"
+        }),
+        "校准结束后必须恢复到变声启用前的湿声"
+    );
+    let restored = peak(&host, &backend);
+    assert!(
+        (restored - wet).abs() < 1.0,
+        "恢复后读数应回到湿声 {wet:.2}，实测 {restored:.2}"
+    );
+    host.voice.flush_saves();
+    assert!(
+        !dir.0.join("config.toml").exists(),
+        "校准暂停与恢复只改运行状态，不得写配置"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 变声校准暂停不改用户临时旁路也不取生命周期锁() {
+    let (host, _backend, _dir) = voice_fixture(true);
+    host.voice_set_bypass(true).unwrap();
+    let host = Arc::new(host);
+
+    // 开流或释放可能持有生命周期锁数秒；校准命令在界面线程执行，不能等它。
+    let lifecycle = host.lifecycle.lock().unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let worker = {
+        let host = host.clone();
+        std::thread::spawn(move || {
+            host.voice_calibration_begin();
+            host.voice_calibration_end();
+            done_tx.send(()).unwrap();
+        })
+    };
+    assert!(
+        done_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+        "校准命令不得等待生命周期锁"
+    );
+    worker.join().unwrap();
+    drop(lifecycle);
+
+    let status = host.voice_status();
+    assert!(
+        status.bypassed,
+        "结束校准只解除自己那一层，用户的临时旁路保持"
+    );
+    assert_eq!(status.phase, "off");
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 变声暂停期间的关闭命令不会被恢复覆盖() {
+    let (host, _backend, dir) = voice_fixture(true);
+    host.voice.suspend();
+    host.voice_set_enabled(false).unwrap();
+    assert!(
+        host.voice_status().bypassed,
+        "暂停层仍在时即使显式关闭也应保持干声"
+    );
+
+    host.release_inner();
+    host.voice.restore();
+
+    let status = host.voice_status();
+    assert!(!status.enabled, "恢复不能把暂停期间的关闭命令改回启用");
+    assert!(!status.bypassed);
+    assert_eq!(status.phase, "off");
+    host.voice.flush_saves();
+    assert!(
+        !app_config::Config::load_from(&dir.0.join("config.toml"))
+            .voice
+            .enabled,
+        "暂停期间的关闭命令必须保持落盘结果"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 变声监听路径不接受人声() {
+    let (host, backend, _dir) = voice_fixture(true);
+    host.set_gains(0.0, 0.0);
+    let mut primary_tail = 0.0;
+    for _ in 0..400 {
+        for callback in backend.captures.lock().unwrap().iter_mut() {
+            callback(&vec![0.3; 4_410 * 2]);
+        }
+        let mut outputs = backend.outputs.lock().unwrap();
+        let mut primary = vec![0.0; 4_410 * 2];
+        outputs[0](&mut primary);
+        let mut monitor = vec![0.0; 4_410 * 2];
+        outputs[1](&mut monitor);
+        primary_tail = primary[primary.len() - 2_000..]
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+        assert!(
+            monitor.iter().all(|sample| sample.abs() < 1e-6),
+            "监听路径只能播放音效，不能混入人声"
+        );
+    }
+    assert!(primary_tail > 0.1, "主输出应收到人声，实际 {primary_tail}");
+    assert_eq!(
+        host.status().voice.unwrap().phase,
+        "wet",
+        "驱动采集与渲染后应进入湿声"
+    );
+}
+
+#[test]
 fn status_uses_the_negotiated_sample_rate_for_time_and_ring_fill() {
     let (host, _) = fixture();
     {
@@ -246,6 +750,131 @@ fn standby_rejects_gui_and_remote_triggers_and_activate_restores_remote() {
     assert!(shared.play(0));
     assert!(shared.control.lock().unwrap().is_some());
     assert_eq!(host.status().monitor_plays, 1);
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 待机与重建保留遥控变声路由释放后清除() {
+    let (mut host, _backend) = fixture();
+    let dir = TemporaryDir::new();
+    host.voice =
+        VoiceService::new_with_path(&app_config::Config::default(), dir.0.join("config.toml"));
+    let shared = host.remote.lock().unwrap().as_ref().unwrap().clone();
+
+    shared.set_voice_route(host.voice.remote_route());
+    assert!(shared.voice_state().is_some());
+
+    host.stop();
+    assert!(shared.control.lock().unwrap().is_none());
+    assert!(shared.voice_state().is_some(), "待机仍可遥控变声");
+    assert!(shared.voice_set_enabled(true), "待机启用变声必须生效");
+    assert!(host.status().voice.unwrap().enabled);
+    host.voice.flush_saves();
+
+    host.activate(None).unwrap();
+    assert!(shared.voice_state().is_some(), "重建后必须重新发布变声路由");
+
+    host.release();
+    assert!(shared.voice_state().is_none(), "释放后变声接口不可用");
+    assert!(shared.control.lock().unwrap().is_none());
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 待机时手机停止取消人声试听且不启动播放() {
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let clips = install_voice_preview_player(&host);
+    let shared = Arc::new(remote::Shared::default());
+    {
+        let running = host.running.lock().unwrap();
+        let playback = running.as_ref().unwrap().playback.clone();
+        shared.set_routed(
+            playback.control.clone(),
+            vec!["Good".into()],
+            host.play_handler(playback.clone(), 1),
+            host.remote_stop_handler(playback.clone(), 1),
+        );
+    }
+    shared.set_voice_route(host.voice.remote_route());
+    *host.remote.lock().unwrap() = Some(shared.clone());
+
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    for _ in 0..5 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+    assert_eq!(host.voice_status().preview.state, "recording");
+
+    host.stop();
+    assert!(!host.status().running);
+    assert!(host.status().passthrough);
+    assert!(shared.control.lock().unwrap().is_none());
+    assert_eq!(
+        host.voice_status().preview.state,
+        "recording",
+        "待机本身只关闭音效，人声试听仍在录制"
+    );
+
+    shared.stop_all();
+    assert_eq!(
+        host.voice_status().preview.state,
+        "idle",
+        "待机时手机停止必须取消人声试听"
+    );
+    assert!(
+        wait_for(Duration::from_secs(1), || {
+            host.voice_status();
+            host.voice_preview_thread.lock().unwrap().is_none()
+        }),
+        "取消后录制线程必须退出"
+    );
+    assert!(clips.try_recv().is_err(), "取消后不得播放半段录制");
+    assert!(!host.status().running, "停止不得启动播放");
+    assert!(host.status().passthrough);
+}
+
+#[test]
+fn 待机时手机停止取消音效试听() {
+    let (host, session_backend) = fixture();
+    let shared = host.remote.lock().unwrap().as_ref().unwrap().clone();
+    host.stop();
+    assert!(!host.status().running);
+    // 待机仍保留输出流；驱动一次让两路确认停止，试听才能开始。
+    drain_primary(&session_backend);
+    assert!(
+        host.running
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .playback
+            .stop_all_finished(),
+        "待机停止应先被两路输出确认"
+    );
+
+    // 待机允许本机音效试听；手机停止必须静音，而不是只报告成功。
+    let backend = FakeBackend::default();
+    launch_fake_preview(&host, &backend, Arc::new(vec![0.3; 88_200]));
+    // 新的试听会再次提交停止代次，驱动两路输出确认后才允许试听出声。
+    drain_primary(&session_backend);
+    let mut pcm = vec![0.0; 600];
+    backend.outputs.lock().unwrap()[0](&mut pcm);
+    assert!(
+        pcm.iter().any(|sample| sample.abs() > 0.1),
+        "待机应允许音效试听"
+    );
+
+    shared.stop_all();
+    pcm.fill(0.0);
+    backend.outputs.lock().unwrap()[0](&mut pcm);
+    assert!(
+        pcm.iter().all(|sample| *sample == 0.0),
+        "待机时手机停止必须静音音效试听"
+    );
+    assert!(!host.status().preview_playing);
+    assert!(host.preview_control.lock().unwrap().is_none());
+    assert!(!host.status().running, "停止不得启动播放");
+    assert!(host.status().passthrough);
 }
 
 #[test]
@@ -1337,7 +1966,9 @@ fn combo_newer_card_hotkey_phone_preview_or_shutdown_retires_queued_audio() {
                 "phone" => assert!(remote.play(0)),
                 "preview" => launch_fake_preview(&host, &preview, Arc::new(vec![0.3; 88_200])),
                 "stop" => host.stop_all().unwrap(),
-                "phone-stop" => remote.stop_all(),
+                "phone-stop" => {
+                    remote.stop_all();
+                }
                 "standby" => host.stop(),
                 "release" => host.release(),
                 _ => unreachable!(),
@@ -1705,6 +2336,10 @@ fn combo_session_publication_rejects_old_start_but_transfers_committed_owner_to_
     for cancelled_before_commit in [false, true] {
         let (host, _) = fixture();
         host.release();
+        let (manager, _registrations) = hotkeys::test_support::manager().unwrap();
+        *host.hotkey_manager.lock().unwrap() = Some(manager.clone());
+        let slot = Hotkeys::bind_with(manager, &["F1".into()]).unwrap();
+        host.install_slot_hotkeys(Some(slot)).unwrap();
         let (prepared_host, prepared_audio) = fixture();
         let mut running = prepared_host.running.lock().unwrap().take().unwrap();
         running.generation = 2;
@@ -1723,8 +2358,13 @@ fn combo_session_publication_rejects_old_start_but_transfers_committed_owner_to_
         let rejected = host.publish_running(running, Some(start));
         if cancelled_before_commit {
             assert!(!host.status().passthrough);
-            shared.clear();
-            host.close_running(rejected.expect("a superseded start cannot publish its owner"));
+            host.discard_unpublished_session(
+                rejected.expect("a superseded start cannot publish its owner"),
+            );
+            assert!(
+                !host.hotkeys.lock().unwrap().slots_bound(),
+                "被取代的启动必须归还槽位热键"
+            );
             for callback in prepared_audio.outputs.lock().unwrap().iter_mut() {
                 let mut pcm = [1.0; 8_192];
                 callback(&mut pcm);
@@ -1746,6 +2386,10 @@ fn combo_session_publication_rejects_old_start_but_transfers_committed_owner_to_
             assert!(
                 host.status().passthrough,
                 "committed owner remains the host's responsibility"
+            );
+            assert!(
+                host.hotkeys.lock().unwrap().slots_bound(),
+                "已提交会话保留槽位热键"
             );
             for callback in prepared_audio.outputs.lock().unwrap().iter_mut() {
                 let mut pcm = [0.0; 8_192];
@@ -2160,5 +2804,1032 @@ fn 超范围的有限音量被所有入口拒绝且不会污染试听或正式�
         assert!(pcm
             .iter()
             .all(|sample| sample.is_finite() && sample.abs() <= 10.0f32.powf(-1.0 / 20.0)));
+    }
+}
+
+#[cfg(feature = "voice")]
+fn install_fake_hotkeys(host: &AudioHost) -> Arc<AtomicUsize> {
+    let (manager, registrations) = hotkeys::test_support::manager().unwrap();
+    *host.hotkey_manager.lock().unwrap() = Some(manager);
+    registrations
+}
+
+#[cfg(feature = "voice")]
+fn voice_config_with_hotkeys(enabled: bool) -> app_config::Config {
+    app_config::Config {
+        voice: app_config::VoiceConfig {
+            enabled,
+            active_preset: "builtin:female".into(),
+            bypass_hotkey: "F9".into(),
+            next_preset_hotkey: "F10".into(),
+            prev_preset_hotkey: "F8".into(),
+            ..app_config::VoiceConfig::default()
+        },
+        ..app_config::Config::default()
+    }
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 启动初始化校验槽位与人声热键冲突() {
+    let dir = TemporaryDir::new();
+    let path = dir.0.join("config.toml");
+    let mut config = voice_config_with_hotkeys(false);
+    config.sound_files = vec![PathBuf::from("/sounds/a.wav")];
+    config.hotkeys = vec!["F9".into()];
+    config.save_to(&path).unwrap();
+    let mut host = preview_test_host();
+    host.voice = VoiceService::new_with_path(&config, path);
+    install_fake_hotkeys(&host);
+
+    let error = host.initialize_hotkeys(None).unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("F9"),
+        "启动初始化必须报告跨组冲突：{error:#}"
+    );
+    assert!(
+        !host.hotkeys.lock().unwrap().voice_bound(),
+        "冲突时不能绑定人声热键"
+    );
+    let status = host.status();
+    assert!(
+        status
+            .voice_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("F9")),
+        "冲突提示必须可显示：{:?}",
+        status.voice_notice
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 启动前绑定人声热键且重复初始化不重复注册() {
+    let dir = TemporaryDir::new();
+    let mut host = preview_test_host();
+    host.voice =
+        VoiceService::new_with_path(&voice_config_with_hotkeys(false), dir.0.join("config.toml"));
+    let registrations = install_fake_hotkeys(&host);
+
+    host.initialize_hotkeys(None).unwrap();
+
+    assert!(
+        host.hotkeys.lock().unwrap().voice_bound(),
+        "程序启动后必须先绑定人声热键"
+    );
+    assert!(
+        host.hotkey_thread.lock().unwrap().is_some(),
+        "轮询线程应已启动"
+    );
+    let first = registrations.load(Ordering::Relaxed);
+    assert_eq!(first, 3, "三个人声热键各注册一次");
+
+    host.initialize_hotkeys(None).unwrap();
+    host.ensure_voice_hotkeys(None).unwrap();
+    assert_eq!(
+        registrations.load(Ordering::Relaxed),
+        first,
+        "设备重建或重复初始化不得重复注册"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 释放音频设备保留人声热键并注销槽位() {
+    let (mut host, _backend, _dir) = voice_fixture(true);
+    let dir = TemporaryDir::new();
+    let path = dir.0.join("config.toml");
+    host.voice = VoiceService::new_with_path(&voice_config_with_hotkeys(true), path);
+    host.attach_voice_control(Some(VoiceControl::new(VoiceParams::neutral())));
+    install_fake_hotkeys(&host);
+    host.initialize_hotkeys(None).unwrap();
+    let manager = host.hotkey_manager.lock().unwrap().clone().unwrap();
+    let slot = Hotkeys::bind_with(manager, &["F1".into()]).unwrap();
+    host.install_slot_hotkeys(Some(slot)).unwrap();
+    assert!(host.hotkeys.lock().unwrap().slots_bound());
+
+    host.stop_inner();
+    assert!(
+        !host.hotkeys.lock().unwrap().slots_bound(),
+        "待机必须让出槽位热键"
+    );
+    assert!(
+        host.hotkeys.lock().unwrap().voice_bound(),
+        "待机必须保留人声热键"
+    );
+
+    host.release_inner();
+    assert!(
+        host.hotkeys.lock().unwrap().voice_bound(),
+        "释放设备不能注销人声热键"
+    );
+    assert!(
+        host.hotkey_thread.lock().unwrap().is_some(),
+        "线程跨会话存活"
+    );
+    let before = host.voice.status().preset_id;
+    host.voice_hotkey_handler()(1);
+    assert_ne!(host.voice.status().preset_id, before, "无会话时仍可切预设");
+    assert!(!host.status().running, "切预设不能启动音频");
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 无音频会话时变声热键不启动音频() {
+    let dir = TemporaryDir::new();
+    let path = dir.0.join("config.toml");
+    let mut host = preview_test_host();
+    host.voice = VoiceService::new_with_path(&voice_config_with_hotkeys(false), path.clone());
+    install_fake_hotkeys(&host);
+    host.initialize_hotkeys(None).unwrap();
+
+    host.voice_hotkey_handler()(1); // 下一个预设
+
+    assert!(
+        host.running.lock().unwrap().is_none(),
+        "热键不能建立音频会话"
+    );
+    assert!(!host.status().running);
+    assert_eq!(host.voice.status().preset_id, "builtin:male");
+    host.voice.flush_saves();
+    assert_eq!(
+        app_config::Config::load_from(&path).voice.active_preset,
+        "builtin:male"
+    );
+
+    host.voice_hotkey_handler()(0); // 旁路
+    let status = host.status();
+    assert!(
+        status
+            .voice_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("音频未启动")),
+        "无会话旁路必须提示音频未启动：{:?}",
+        status.voice_notice
+    );
+    assert!(status.last_error.is_none(), "不能复用启动错误通道");
+    assert!(!status.voice.as_ref().unwrap().bypassed);
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 运行中与待机旁路提示走独立字段() {
+    let (host, _backend, _dir) = voice_fixture(false);
+    let handler = host.voice_hotkey_handler();
+
+    handler(0);
+    let running = host.status();
+    assert!(running.running);
+    assert!(
+        running
+            .voice_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("变声未开启")),
+        "运行中关闭变声时旁路必须提示：{:?}",
+        running.voice_notice
+    );
+    assert!(running.last_error.is_none(), "人声提示不能写入启动错误");
+
+    host.stop_inner();
+    let standby = host.status();
+    assert!(!standby.running && standby.passthrough, "应处于待机");
+    handler(0);
+    let standby = host.status();
+    assert!(
+        standby
+            .voice_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("变声未开启")),
+        "待机旁路也必须提示：{:?}",
+        standby.voice_notice
+    );
+    assert!(standby.last_error.is_none());
+    assert!(standby.voice_notice_generation > running.voice_notice_generation);
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 音频恢复后清除人声提示() {
+    let (host, _backend, _dir) = voice_fixture(true);
+    host.record_voice_notice("音频未启动，旁路热键不生效");
+    let before = host.status();
+    assert!(before.voice_notice.is_some());
+
+    host.activate(None).unwrap();
+
+    let after = host.status();
+    assert!(after.voice_notice.is_none(), "音频恢复后旧提示必须清除");
+    assert!(after.voice_notice_generation > before.voice_notice_generation);
+
+    host.record_voice_notice("旧提示");
+    host.voice_hotkey_handler()(0);
+    assert!(
+        host.status().voice_notice.is_none(),
+        "生效的热键动作也要清除旧提示"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 变声热键命令校验跨组冲突并持久化() {
+    let dir = TemporaryDir::new();
+    let path = dir.0.join("config.toml");
+    let config = app_config::Config {
+        sound_files: vec![PathBuf::from("/sounds/a.wav")],
+        hotkeys: vec!["F9".into()],
+        ..app_config::Config::default()
+    };
+    config.save_to(&path).unwrap();
+    let mut host = preview_test_host();
+    host.voice = VoiceService::new_with_path(&config, path.clone());
+    install_fake_hotkeys(&host);
+
+    let error = host.voice_set_hotkeys("F9", "F10", "F8").unwrap_err();
+    assert!(
+        error.to_string().contains("F9"),
+        "冲突错误必须点名重复键：{error}"
+    );
+    let unchanged = app_config::Config::load_from(&path);
+    assert!(unchanged.voice.bypass_hotkey.is_empty(), "冲突不能写入配置");
+    assert!(unchanged.voice.next_preset_hotkey.is_empty());
+
+    host.voice_set_hotkeys("F5", "F6", "F7").unwrap();
+    let saved = app_config::Config::load_from(&path);
+    assert_eq!(saved.voice.bypass_hotkey, "F5");
+    assert_eq!(saved.voice.next_preset_hotkey, "F6");
+    assert_eq!(saved.voice.prev_preset_hotkey, "F7");
+    assert_eq!(saved.hotkeys, vec!["F9".to_owned()], "音效热键保持不变");
+    assert!(host.hotkeys.lock().unwrap().voice_bound(), "无会话也要绑定");
+}
+
+// ── 三秒人声试听 ─────────────────────────────────────────────
+
+#[cfg(feature = "voice")]
+type VoicePreviewPlayer =
+    Arc<dyn Fn(VoicePreviewClip, u64, Arc<AtomicU64>) -> Result<()> + Send + Sync>;
+
+#[cfg(feature = "voice")]
+fn install_voice_preview_player(host: &AudioHost) -> mpsc::Receiver<VoicePreviewClip> {
+    let (sender, receiver) = mpsc::channel();
+    let player: VoicePreviewPlayer = Arc::new(move |clip, _generation, _epoch| {
+        let _ = sender.send(clip);
+        Ok(())
+    });
+    *host.voice_preview_player.lock().unwrap() = Some(player);
+    receiver
+}
+
+#[cfg(feature = "voice")]
+fn install_blocking_voice_preview_player(
+    host: &AudioHost,
+) -> (mpsc::Receiver<VoicePreviewClip>, Arc<AtomicBool>) {
+    let (sender, receiver) = mpsc::channel();
+    let released = Arc::new(AtomicBool::new(false));
+    let flag = released.clone();
+    let player: VoicePreviewPlayer = Arc::new(move |clip, generation, epoch| {
+        let _ = sender.send(clip);
+        while epoch.load(Ordering::Acquire) == generation && !flag.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Ok(())
+    });
+    *host.voice_preview_player.lock().unwrap() = Some(player);
+    (receiver, released)
+}
+
+#[cfg(feature = "voice")]
+fn install_failing_voice_preview_player(host: &AudioHost, message: &'static str) {
+    let player: VoicePreviewPlayer =
+        Arc::new(move |_clip, _generation, _epoch| anyhow::bail!("{message}"));
+    *host.voice_preview_player.lock().unwrap() = Some(player);
+}
+
+/// 采集与渲染同步推进；返回主输出 PCM，供转发断言使用。
+#[cfg(feature = "voice")]
+fn drive_voice(backend: &FakeBackend, frames: usize, sample: f32) -> Vec<f32> {
+    let input = vec![sample; frames * 2];
+    for callback in backend.captures.lock().unwrap().iter_mut() {
+        callback(&input);
+    }
+    let mut main = vec![0.0; frames * 2];
+    for (index, callback) in backend.outputs.lock().unwrap().iter_mut().enumerate() {
+        let mut output = vec![0.0; frames * 2];
+        callback(&mut output);
+        if index == 0 {
+            main = output;
+        }
+    }
+    main
+}
+
+#[cfg(feature = "voice")]
+fn wait_for(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if condition() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// 等录制真正开始后再推进回调，避免驱动速度快于试听线程启动。
+#[cfg(feature = "voice")]
+fn wait_voice_preview_recording(host: &AudioHost) {
+    assert!(
+        wait_for(Duration::from_secs(2), || host.voice_status().preview.state
+            == "recording"),
+        "试听应在阶段稳定后开始录制"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 启用状态试听记录渲染人声且音效不进入记录() {
+    let (host, backend, _dir) = voice_fixture_scaled(true, 0.5);
+    let clips = install_voice_preview_player(&host);
+    for _ in 0..200 {
+        drive_voice(&backend, 4_410, 0.3);
+    }
+    assert_eq!(
+        host.voice_status().phase,
+        "wet",
+        "驱动采集与渲染后应进入湿声"
+    );
+
+    let status = host.voice_preview_start().unwrap();
+    assert!(
+        matches!(status.preview.state.as_str(), "preparing" | "recording"),
+        "开始时不能报告旧状态：{}",
+        status.preview.state
+    );
+    wait_voice_preview_recording(&host);
+    assert!(host.play(0).unwrap(), "正式播放应与试听并存");
+
+    let mut main_peak = 0.0f32;
+    for index in 0..35 {
+        let output = drive_voice(&backend, 4_410, 0.3);
+        if index == 0 {
+            assert!(host.status().playing, "人声试听不能替换正式播放");
+        }
+        main_peak = main_peak.max(output.iter().fold(0.0f32, |m, s| m.max(s.abs())));
+    }
+    let clip = clips
+        .recv_timeout(Duration::from_secs(3))
+        .expect("三秒后应回放试听片段");
+    assert_eq!(clip.samples.len(), 44_100 * 3);
+    assert!(clip.post_limiter, "湿声试听来自渲染侧限幅之后");
+    assert!(
+        clip.samples[100_000..]
+            .iter()
+            .all(|sample| (sample - 0.15).abs() < 0.02),
+        "记录样本必须等于正式转发人声"
+    );
+    assert!(main_peak > 0.3, "主输出应混入音效，实际峰值 {main_peak}");
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 关闭状态试听不改变转发且能听到变声() {
+    let (host, backend, _dir) = voice_fixture_scaled(false, 0.5);
+    let clips = install_voice_preview_player(&host);
+
+    let status = host.voice_preview_start().unwrap();
+    assert!(matches!(
+        status.preview.state.as_str(),
+        "preparing" | "recording"
+    ));
+    wait_voice_preview_recording(&host);
+
+    let mut main = Vec::new();
+    for _ in 0..40 {
+        main = drive_voice(&backend, 4_410, 0.3);
+    }
+    let clip = clips
+        .recv_timeout(Duration::from_secs(3))
+        .expect("关闭状态也应完成三秒试听");
+    assert!(!clip.post_limiter, "采集预览需要应用试听限幅");
+    assert!(
+        clip.samples[10_000..]
+            .iter()
+            .all(|sample| (sample - 0.15).abs() < 0.01),
+        "试听应是变声后的人声"
+    );
+    assert!(
+        main[main.len() - 1_000..]
+            .iter()
+            .all(|sample| (sample - 0.3).abs() < 1e-3),
+        "转发必须保持原声，试听不改变对方听到的声音"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 试听与音效试听互斥() {
+    // 开始音效试听会取消正在录制的人声试听。
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let clips = install_voice_preview_player(&host);
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    for _ in 0..5 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+    assert_eq!(host.voice_status().preview.state, "recording");
+
+    let sound = FakeBackend::default();
+    launch_fake_preview(&host, &sound, Arc::new(vec![0.2; 88_200]));
+    assert_eq!(
+        host.voice_status().preview.state,
+        "idle",
+        "音效试听开始后必须取消人声试听"
+    );
+    assert!(host.voice_preview_thread.lock().unwrap().is_none());
+    assert!(clips.try_recv().is_err(), "被取消的录制不得进入回放");
+
+    // 开始人声试听会取消音效试听。
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let _clips = install_voice_preview_player(&host);
+    let sound = FakeBackend::default();
+    launch_fake_preview(&host, &sound, Arc::new(vec![0.2; 88_200]));
+    drain_primary(&backend);
+    let mut pcm = vec![0.0; 600];
+    sound.outputs.lock().unwrap()[0](&mut pcm);
+    assert!(host.status().preview_playing);
+
+    host.voice_preview_start().unwrap();
+    assert!(
+        !host.status().preview_playing,
+        "人声试听开始后不能再报告音效试听"
+    );
+    assert!(host.preview_thread.lock().unwrap().is_none());
+    pcm.fill(0.0);
+    sound.outputs.lock().unwrap()[0](&mut pcm);
+    assert!(
+        pcm.iter().all(|sample| *sample == 0.0),
+        "旧音效试听输出必须静音"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 全局停止取消录制与回放并清空记录() {
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let clips = install_voice_preview_player(&host);
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    for _ in 0..5 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+    host.stop_all().unwrap();
+    assert_eq!(host.voice_status().preview.state, "idle");
+    assert!(host.voice_preview_thread.lock().unwrap().is_none());
+    assert!(clips.try_recv().is_err(), "停止后不得播放半段录制");
+    let control = host.voice.preview_control().expect("会话仍应保留试听句柄");
+    assert!(!control.is_finished(), "取消后记录区不得报告完成");
+    assert!(control.take().is_none(), "取消后记录区必须清空");
+
+    // 回放中的全局停止同样立即生效。
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let (clips, _released) = install_blocking_voice_preview_player(&host);
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    for _ in 0..35 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+    clips
+        .recv_timeout(Duration::from_secs(3))
+        .expect("三秒后应进入回放");
+    assert_eq!(host.voice_status().preview.state, "playing");
+    host.stop_all().unwrap();
+    assert_eq!(host.voice_status().preview.state, "idle");
+    assert!(host.voice_preview_thread.lock().unwrap().is_none());
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 切换预设取消试听且不播放半段() {
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let clips = install_voice_preview_player(&host);
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    for _ in 0..10 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+    assert_eq!(host.voice_status().preview.state, "recording");
+
+    let status = host.voice_select_preset("builtin:male").unwrap();
+    assert_eq!(status.preview.state, "idle", "切换预设必须立即取消");
+    assert!(
+        wait_for(Duration::from_secs(1), || {
+            host.voice_status();
+            host.voice_preview_thread.lock().unwrap().is_none()
+        }),
+        "取消后录制线程必须退出"
+    );
+    assert!(clips.try_recv().is_err(), "取消后不得播放半段");
+    let control = host.voice.preview_control().unwrap();
+    assert!(control.take().is_none(), "记录区应被清空");
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 音效试听与人声试听互斥且全局停止取消() {
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let voice_clips = install_voice_preview_player(&host);
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    for _ in 0..5 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+
+    // 音效试听开始后，人声试听必须立即停止且不留下半段。
+    let sound = FakeBackend::default();
+    launch_fake_preview(&host, &sound, Arc::new(vec![0.2; 88_200]));
+    assert_eq!(host.voice_status().preview.state, "idle");
+    assert!(
+        wait_for(Duration::from_secs(1), || host
+            .voice_preview_thread
+            .lock()
+            .unwrap()
+            .is_none()),
+        "音效试听开始后录制线程必须退出"
+    );
+    assert!(voice_clips.try_recv().is_err(), "被取消的录制不得回放");
+
+    // 人声试听开始后，音效试听必须静音并释放输出线程。
+    host.voice_preview_start().unwrap();
+    assert!(!host.status().preview_playing);
+    assert!(host.preview_thread.lock().unwrap().is_none());
+    let mut pcm = vec![0.0; 600];
+    sound.outputs.lock().unwrap()[0](&mut pcm);
+    assert!(
+        pcm.iter().all(|sample| *sample == 0.0),
+        "旧音效试听输出必须静音"
+    );
+    wait_voice_preview_recording(&host);
+    for _ in 0..5 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+
+    // 全局停止同时取消录制，并等待所有者线程退出。
+    let started = std::time::Instant::now();
+    host.stop_all().unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(host.voice_status().preview.state, "idle");
+    assert!(
+        wait_for(Duration::from_secs(1), || host
+            .voice_preview_thread
+            .lock()
+            .unwrap()
+            .is_none()),
+        "全局停止后录制线程必须退出"
+    );
+    assert!(voice_clips.try_recv().is_err(), "停止后不得播放半段");
+    let control = host.voice.preview_control().expect("会话仍应保留试听句柄");
+    assert!(control.take().is_none(), "停止后记录区必须清空");
+    eprintln!(
+        "全局停止取消人声试听耗时 {:.1} ms",
+        elapsed.as_secs_f64() * 1000.0
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "全局停止不应阻塞界面，实测 {elapsed:?}"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 监听与自检不经过人声链() {
+    let (host, backend, _dir) = voice_fixture(true);
+    host.set_gains(0.0, 0.0);
+    host.set_looping(true);
+    assert!(host.play(0).unwrap());
+    let mut primary_tail = 0.0;
+    let mut monitor_tail = 0.0;
+    for _ in 0..400 {
+        for callback in backend.captures.lock().unwrap().iter_mut() {
+            callback(&vec![0.3; 4_410 * 2]);
+        }
+        let mut outputs = backend.outputs.lock().unwrap();
+        let mut primary = vec![0.0; 4_410 * 2];
+        outputs[0](&mut primary);
+        let mut monitor = vec![0.0; 4_410 * 2];
+        outputs[1](&mut monitor);
+        primary_tail = primary[primary.len() - 2_000..]
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+        monitor_tail = monitor[monitor.len() - 2_000..]
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+    }
+    assert!(primary_tail > 0.4, "主输出应同时收到湿声人声与音效");
+    assert!(
+        (monitor_tail - 0.2).abs() < 1e-3,
+        "监听只能收到音效 0.2，不得混入 0.3 的人声湿声，实测峰值 {monitor_tail}"
+    );
+    assert_eq!(host.voice_status().phase, "wet");
+
+    // 自检使用的生产暂停入口 `with_suspended`：暂停期间必须旁路并回到干声。
+    // 校准不释放会话，走独立的校准暂停层，见 `变声校准暂停让电平读数回到干声并在结束后恢复湿声`。
+    let dir = TemporaryDir::new();
+    let mut selftest_host = preview_test_host();
+    selftest_host.voice =
+        VoiceService::new_with_path(&app_config::Config::default(), dir.0.join("config.toml"));
+    selftest_host
+        .voice
+        .attach(VoiceControl::new(VoiceParams::neutral()));
+    selftest_host.voice.set_enabled(true).unwrap();
+    selftest_host
+        .with_suspended(None, || {
+            assert!(
+                selftest_host.running.lock().unwrap().is_none(),
+                "自检期间设备会话必须已释放"
+            );
+            let paused = selftest_host.voice_status();
+            assert!(paused.bypassed, "自检期间人声链必须旁路");
+            assert_eq!(paused.phase, "off", "自检期间只能输出干声");
+            Ok(())
+        })
+        .unwrap();
+    let restored = selftest_host.voice_status();
+    assert!(restored.enabled, "自检结束后应恢复启用状态");
+    assert!(!restored.bypassed, "自检结束后应解除旁路");
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 预热阶段显示准备中并在稳定后自动开始() {
+    let (host, backend, _dir) = voice_fixture_scaled(true, 1.0);
+    let clips = install_voice_preview_player(&host);
+
+    let status = host.voice_preview_start().unwrap();
+    assert_eq!(
+        status.preview.state, "preparing",
+        "预热阶段必须先显示准备中，不写记录区"
+    );
+
+    assert!(
+        wait_for(Duration::from_secs(2), || {
+            drive_voice(&backend, 4_410, 0.2);
+            matches!(
+                host.voice_status().preview.state.as_str(),
+                "recording" | "playing"
+            )
+        }),
+        "阶段稳定后应自动开始录制"
+    );
+    for _ in 0..35 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+    clips
+        .recv_timeout(Duration::from_secs(3))
+        .expect("稳定后应完成试听");
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 预热超时显示不可用原因且不写记录区() {
+    let (host, _backend, _dir) = voice_fixture_scaled(true, 1.0);
+    let _clips = install_voice_preview_player(&host);
+
+    let status = host.voice_preview_start().unwrap();
+    assert_eq!(status.preview.state, "preparing");
+    assert!(
+        wait_for(Duration::from_secs(3), || host.voice_status().preview.state
+            == "unavailable"),
+        "预热超过一秒必须返回不可用"
+    );
+    let preview = host.voice_status().preview;
+    let reason = preview.reason.unwrap_or_default();
+    assert!(
+        reason.contains("阶段") || reason.contains("准备"),
+        "预热超时必须说明具体原因，实际「{reason}」"
+    );
+    assert!(
+        !host.voice.preview_control().unwrap().is_finished(),
+        "超时前不得写入记录区"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 人声试听回放不进入虚拟麦克风() {
+    let (host, backend, _dir) = voice_fixture_scaled(false, 0.5);
+    let clips = install_voice_preview_player(&host);
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    let mut main = Vec::new();
+    for _ in 0..40 {
+        main = drive_voice(&backend, 4_410, 0.3);
+    }
+    let clip = clips
+        .recv_timeout(Duration::from_secs(3))
+        .expect("试听应完成");
+    assert!(clip.samples[10_000..]
+        .iter()
+        .all(|sample| (sample - 0.15).abs() < 0.01));
+    assert!(
+        main[main.len() - 1_000..]
+            .iter()
+            .all(|sample| (sample - 0.3).abs() < 1e-3),
+        "虚拟麦克风只能得到干声，试听样本不得混入"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 人声试听失败显示具体原因() {
+    // 未启动。
+    let host = preview_test_host();
+    let status = host.voice_preview_start().unwrap();
+    assert_eq!(status.preview.state, "unavailable");
+    assert_eq!(status.preview.reason.as_deref(), Some("音频未启动"));
+
+    // 会话释放后。
+    let (host, _backend, _dir) = voice_fixture_scaled(false, 1.0);
+    host.release();
+    let status = host.voice_preview_start().unwrap();
+    assert_eq!(status.preview.state, "unavailable");
+    assert_eq!(status.preview.reason.as_deref(), Some("音频未启动"));
+
+    // 输出设备失败。
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    install_failing_voice_preview_player(&host, "系统没有默认输出设备（试听需要它）");
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    for _ in 0..35 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+    assert!(
+        wait_for(Duration::from_secs(2), || {
+            let preview = host.voice_status().preview;
+            preview.state == "unavailable"
+                && preview
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("试听输出失败"))
+        }),
+        "输出设备失败必须显示具体原因"
+    );
+
+    // 记录为空。
+    let (host, _backend, _dir) = voice_fixture_scaled(false, 1.0);
+    host.voice_preview_start().unwrap();
+    assert!(
+        wait_for(Duration::from_secs(6), || {
+            let preview = host.voice_status().preview;
+            preview.state == "unavailable"
+                && preview
+                    .reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("没有录到人声"))
+        }),
+        "没有录到人声必须给出明确提示"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 旧试听完成不覆盖新试听() {
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let (clips, _released) = install_blocking_voice_preview_player(&host);
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    for _ in 0..35 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+    let old = clips
+        .recv_timeout(Duration::from_secs(3))
+        .expect("第一段应进入回放");
+    assert_eq!(old.samples.len(), 44_100 * 3);
+    assert_eq!(host.voice_status().preview.state, "playing");
+
+    // 旧回放仍未结束时开始新试听；旧完成结果必须被丢弃。
+    let status = host.voice_preview_start().unwrap();
+    assert!(
+        matches!(status.preview.state.as_str(), "preparing" | "recording"),
+        "新试听不能被旧状态覆盖"
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        matches!(
+            host.voice_status().preview.state.as_str(),
+            "preparing" | "recording"
+        ),
+        "旧回放完成不能把新试听改成空闲"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 采集试听回放使用负三分贝限幅而渲染试听不重复限幅() {
+    let ceiling = 10.0f32.powf(-3.0 / 20.0);
+    for (post_limiter, expected) in [(false, ceiling), (true, 1.0)] {
+        let backend = FakeBackend::default();
+        let (opened_tx, opened_rx) = mpsc::channel();
+        *backend.opened.lock().unwrap() = Some(opened_tx);
+        let audio = Arc::new(PreviewAudioState {
+            gain: AtomicF32::new(1.0),
+            total_gain: Arc::new(AtomicF32::new(1.0)),
+            drained_frames: AtomicU64::new(0),
+            rendered_frames: AtomicU64::new(0),
+            total_frames: AtomicU64::new(0),
+            sample_rate: AtomicU32::new(0),
+            finished: AtomicBool::new(false),
+            previous_playback: None,
+            owner_observed_source_end: Mutex::new(None),
+        });
+        let generation = Arc::new(AtomicU64::new(9));
+        let playing = backend.clone();
+        let limit = preview_limit_for(post_limiter);
+        let worker = std::thread::spawn(move || {
+            play_samples_with_limit(
+                playing,
+                Arc::new(vec![1.0f32; 44_100 * 2]),
+                DeviceId::new("fake"),
+                StreamFormat::new(44_100, 2),
+                audio,
+                9,
+                generation,
+                limit,
+            )
+        });
+        opened_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // 第一块输出包含全部源样本；后续调用只用于排空限幅器尾部。
+        let mut pcm = vec![0.0; 44_100 * 2];
+        backend.outputs.lock().unwrap()[0](&mut pcm);
+        let peak = pcm.iter().fold(0.0f32, |max, sample| max.max(sample.abs()));
+        for _ in 0..3 {
+            let mut tail = vec![0.0; 4_410 * 2];
+            backend.outputs.lock().unwrap()[0](&mut tail);
+        }
+        worker.join().unwrap().unwrap();
+        assert!(
+            (peak - expected).abs() < 1e-4,
+            "post_limiter={post_limiter} 的输出峰值应为 {expected}，实际 {peak}"
+        );
+    }
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 录制中修改参数立即取消试听且不播放() {
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let clips = install_voice_preview_player(&host);
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    for _ in 0..5 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+    assert_eq!(host.voice_status().preview.state, "recording");
+
+    let status = host
+        .voice_set_params(VoiceParamsDto {
+            pitch_semitones: 9.0,
+            ..VoiceParamsDto::default()
+        })
+        .unwrap();
+    assert_eq!(status.preview.state, "idle", "改参必须立即结束录制状态");
+    assert!(
+        wait_for(Duration::from_secs(1), || {
+            host.voice_status();
+            host.voice_preview_thread.lock().unwrap().is_none()
+        }),
+        "改参取消后录制线程必须退出"
+    );
+    assert!(clips.try_recv().is_err(), "改参取消后不得播放半段");
+    assert!(
+        host.voice.preview_control().unwrap().take().is_none(),
+        "记录区应被清空"
+    );
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 手机停止在待机时取消人声试听() {
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let clips = install_voice_preview_player(&host);
+    host.stop();
+    assert!(!host.status().running, "关闭音效应进入待机");
+    assert!(host.status().passthrough, "待机会话仍在转发人声");
+
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    for _ in 0..5 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+
+    let playback = host
+        .running
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .playback
+        .clone();
+    host.remote_stop_handler(playback, 1)();
+
+    assert_eq!(
+        host.voice_status().preview.state,
+        "idle",
+        "待机时手机停止也必须取消人声试听"
+    );
+    assert!(
+        wait_for(Duration::from_secs(1), || {
+            host.voice_status();
+            host.voice_preview_thread.lock().unwrap().is_none()
+        }),
+        "取消后录制线程必须退出"
+    );
+    assert!(clips.try_recv().is_err(), "取消后不得回放半段");
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 过期手机停止不能取消新会话的人声试听() {
+    let (host, backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let clips = install_voice_preview_player(&host);
+    let playback = host
+        .running
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .playback
+        .clone();
+    let stale = host.remote_stop_handler(playback, 1);
+    host.audio_requests.register_session(2);
+
+    host.voice_preview_start().unwrap();
+    wait_voice_preview_recording(&host);
+    for _ in 0..5 {
+        drive_voice(&backend, 4_410, 0.2);
+    }
+
+    stale();
+    assert_eq!(
+        host.voice_status().preview.state,
+        "recording",
+        "旧会话回调不能取消新会话的人声试听"
+    );
+    assert!(clips.try_recv().is_err());
+    host.stop_all().unwrap();
+}
+
+#[cfg(feature = "voice")]
+#[test]
+fn 人声与音效试听并发开始时最多一个本机输出() {
+    let (host, _backend, _dir) = voice_fixture_scaled(false, 1.0);
+    let host = Arc::new(host);
+    for _ in 0..20 {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let voice_host = host.clone();
+        let voice_barrier = barrier.clone();
+        let voice = std::thread::spawn(move || {
+            voice_barrier.wait();
+            voice_host.voice_preview_start().unwrap();
+        });
+
+        let sound_host = host.clone();
+        let sound_barrier = barrier.clone();
+        let sound = std::thread::spawn(move || {
+            sound_barrier.wait();
+            let backend = FakeBackend::default();
+            let _ = sound_host.launch_preview(
+                "contended-sound".into(),
+                0.0,
+                || Ok(Arc::new(vec![0.2; 88_200])),
+                move |samples, token, generation, audio| {
+                    play_samples(
+                        backend,
+                        samples,
+                        DeviceId::new("fake preview"),
+                        StreamFormat::new(44_100, 6),
+                        audio,
+                        token,
+                        generation,
+                    )
+                },
+            );
+        });
+
+        voice.join().unwrap();
+        sound.join().unwrap();
+
+        let voice_active = matches!(
+            host.voice_status().preview.state.as_str(),
+            "preparing" | "recording" | "playing"
+        );
+        let sound_active = host.preview_control.lock().unwrap().is_some();
+        assert!(
+            !(voice_active && sound_active),
+            "人声试听与音效试听不能同时占用本机输出"
+        );
+        host.stop_all().unwrap();
     }
 }

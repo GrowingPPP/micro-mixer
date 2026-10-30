@@ -78,26 +78,64 @@ def shipped_packages(meta: dict) -> list[dict]:
     )
 
 
+def _looks_like_license_file(name: str) -> bool:
+    """按文件名判断是否为许可证文本。
+
+    只按前缀匹配会把 `copying.rs` 这类源码当成许可证，子目录扫描时尤其容易
+    误收；这里排除常见源码扩展名，同时保留 `LICENSE-MIT`、`COPYING.LESSER`
+    这类真实许可证命名。
+    """
+    upper = name.upper()
+    if not upper.startswith(("LICENSE", "LICENCE", "COPYING", "UNLICENSE", "NOTICE")):
+        return False
+    source_suffixes = {
+        ".rs", ".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx",
+        ".py", ".js", ".ts", ".go", ".java", ".toml", ".json", ".xml",
+    }
+    return pathlib.Path(upper).suffix.lower() not in source_suffixes
+
+
+def _license_files_in(directory: pathlib.Path) -> list[tuple[str, str]]:
+    """读取一个目录直接包含的许可证文件。"""
+    found = []
+    try:
+        entries = sorted(directory.iterdir())
+    except OSError:
+        return found
+    for f in entries:
+        if not f.is_file() or not _looks_like_license_file(f.name):
+            continue
+        try:
+            text = f.read_text(errors="replace").strip()
+        except OSError:
+            continue
+        if text:
+            found.append((f.name, text))
+    return found
+
+
 def find_license_files(pkg: dict) -> list[tuple[str, str]]:
-    """在 registry 源码目录里找这个 crate 自带的许可证文件。"""
+    """在 registry 源码目录里找这个 crate 自带的许可证文件。
+
+    部分 crate 通过 git submodule 把上游实现放在子目录（例如
+    `signalsmith-stretch` 的 `signalsmith-stretch/` 与 `signalsmith-linear/`），
+    这些头文件会被 `cc` 静态编入最终二进制。子目录里的 LICENSE 必须一并收集，
+    否则随包保留的版权声明不完整。
+    """
     src = pkg.get("manifest_path")
     if not src:
         return []
     d = pathlib.Path(src).parent
     if not d.exists():
         return []
-    found = []
-    for f in sorted(d.iterdir()):
-        if not f.is_file():
-            continue
-        n = f.name.upper()
-        if n.startswith(("LICENSE", "LICENCE", "COPYING", "UNLICENSE", "NOTICE")):
-            try:
-                text = f.read_text(errors="replace").strip()
-            except OSError:
-                continue
-            if text:
-                found.append((f.name, text))
+    found = _license_files_in(d)
+    try:
+        children = sorted(d.iterdir())
+    except OSError:
+        children = []
+    for child in children:
+        if child.is_dir() and not child.name.startswith("."):
+            found.extend(_license_files_in(child))
     return found
 
 
@@ -259,8 +297,15 @@ def main() -> int:
         "注意不同 crate 的 MIT/Apache 正文里版权人不同，所以看起来相似的条文会有多份 —— "
         "这是对的，每个版权声明都要保留。\n"
     )
+    # 标题相同的多份原文（不同版权人）按覆盖的 crate 列表决定顺序。
+    # 否则相同标题会退回到字典插入顺序，而该顺序取决于跨进程不稳定的集合遍历，
+    # 连续生成会出现内容相同但顺序不同的差异。
     for i, (_key, (title, (text, users))) in enumerate(
-        sorted(texts.items(), key=lambda kv: kv[1][0].lower()), start=1
+        sorted(
+            texts.items(),
+            key=lambda kv: (kv[1][0].lower(), tuple(sorted(set(kv[1][1][1])))),
+        ),
+        start=1,
     ):
         L.append(f"\n### {i}. {title}\n")
         crates = users

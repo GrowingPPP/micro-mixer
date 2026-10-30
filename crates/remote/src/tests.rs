@@ -35,8 +35,10 @@ fn start(shared: Arc<Shared>) -> Server {
 
 fn get(port: u16, path: &str) -> String {
     let mut socket = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    // Workspace 并行测试会占满 CPU；给本地回环响应留出调度余量，
+    // 超时只影响测试等待，不放宽任何路由或内容断言。
     socket
-        .set_read_timeout(Some(Duration::from_secs(2)))
+        .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     write!(
         socket,
@@ -46,6 +48,285 @@ fn get(port: u16, path: &str) -> String {
     let mut response = String::new();
     socket.read_to_string(&mut response).unwrap();
     response
+}
+
+#[derive(Clone)]
+struct TestVoiceState {
+    enabled: bool,
+    bypassed: bool,
+    preset_id: String,
+    preset_name: String,
+    presets: Vec<(String, String)>,
+}
+
+impl TestVoiceState {
+    fn new() -> Self {
+        Self {
+            enabled: false,
+            bypassed: false,
+            preset_id: "builtin:female".into(),
+            preset_name: "女声".into(),
+            presets: vec![
+                ("builtin:female".into(), "女声".into()),
+                ("builtin:male".into(), "男声".into()),
+                ("user:test-abcdef".into(), "我的<声>&\"引号".into()),
+            ],
+        }
+    }
+
+    fn snapshot(&self) -> VoiceRemoteState {
+        VoiceRemoteState {
+            enabled: self.enabled,
+            bypassed: self.bypassed,
+            preset_id: self.preset_id.clone(),
+            preset_name: self.preset_name.clone(),
+            presets: self.presets.clone(),
+        }
+    }
+}
+
+fn test_voice_route(
+    state: Arc<Mutex<TestVoiceState>>,
+    calls: Arc<Mutex<Vec<String>>>,
+) -> VoiceRoute {
+    let state_for_read = state.clone();
+    let state_for_enable = state.clone();
+    let state_for_preset = state;
+    let calls_for_enable = calls.clone();
+    VoiceRoute {
+        state: Arc::new(move || {
+            state_for_read
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .snapshot()
+        }),
+        set_enabled: Arc::new(move |enabled| {
+            calls_for_enable
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(format!("enable:{enabled}"));
+            state_for_enable
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .enabled = enabled;
+            true
+        }),
+        select_preset: Arc::new(move |id| {
+            calls
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(format!("preset:{id}"));
+            let mut state = state_for_preset
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            match state
+                .presets
+                .iter()
+                .find(|(preset_id, _)| preset_id == id)
+                .cloned()
+            {
+                Some((preset_id, preset_name)) => {
+                    state.preset_id = preset_id;
+                    state.preset_name = preset_name;
+                    true
+                }
+                None => false,
+            }
+        }),
+    }
+}
+
+fn json_body(response: &str) -> &str {
+    response.split("\r\n\r\n").nth(1).unwrap_or("")
+}
+
+#[test]
+fn 变声状态路由返回当前预设与旁路() {
+    let shared = Arc::new(Shared::default());
+    let state = Arc::new(Mutex::new(TestVoiceState::new()));
+    state.lock().unwrap().enabled = true;
+    state.lock().unwrap().bypassed = true;
+    state.lock().unwrap().preset_id = "user:test-abcdef".into();
+    state.lock().unwrap().preset_name = "我的<声>&\"引号".into();
+    shared.set_voice_route(test_voice_route(state, Arc::new(Mutex::new(Vec::new()))));
+    let server = start(shared);
+
+    let body = json_body(&get(server.port, "/voice/status")).to_owned();
+
+    assert!(body.contains("\"ok\":true"), "{body}");
+    assert!(body.contains("\"enabled\":true"), "{body}");
+    assert!(body.contains("\"bypassed\":true"), "{body}");
+    assert!(
+        body.contains("\"preset_id\":\"user:test-abcdef\""),
+        "{body}"
+    );
+    assert!(
+        body.contains("\"preset_name\":\"我的<声>&\\\"引号\""),
+        "{body}"
+    );
+    assert!(
+        body.contains("{\"id\":\"builtin:female\",\"name\":\"女声\"}"),
+        "{body}"
+    );
+}
+
+#[test]
+fn 遥控启用写入宿主配置并返回新状态() {
+    let shared = Arc::new(Shared::default());
+    let state = Arc::new(Mutex::new(TestVoiceState::new()));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    shared.set_voice_route(test_voice_route(state.clone(), calls.clone()));
+    let server = start(shared);
+
+    let enabled = json_body(&get(server.port, "/voice/enable/1")).to_owned();
+    assert!(enabled.contains("\"ok\":true"), "{enabled}");
+    assert!(enabled.contains("\"enabled\":true"), "{enabled}");
+    assert_eq!(calls.lock().unwrap().as_slice(), ["enable:true".to_owned()]);
+
+    let disabled = json_body(&get(server.port, "/voice/enable/0")).to_owned();
+    assert!(disabled.contains("\"ok\":true"), "{disabled}");
+    assert!(disabled.contains("\"enabled\":false"), "{disabled}");
+    assert!(!state.lock().unwrap().enabled, "响应必须来自当前状态");
+    assert_eq!(
+        calls.lock().unwrap().as_slice(),
+        ["enable:true".to_owned(), "enable:false".to_owned()]
+    );
+}
+
+#[test]
+fn 遥控选择预设不改变启用() {
+    let shared = Arc::new(Shared::default());
+    let state = Arc::new(Mutex::new(TestVoiceState::new()));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    shared.set_voice_route(test_voice_route(state.clone(), calls.clone()));
+    let server = start(shared);
+
+    let body = json_body(&get(server.port, "/voice/preset/builtin:male")).to_owned();
+
+    assert!(body.contains("\"ok\":true"), "{body}");
+    assert!(body.contains("\"enabled\":false"), "{body}");
+    assert!(body.contains("\"preset_name\":\"男声\""), "{body}");
+    let state = state.lock().unwrap();
+    assert!(!state.enabled);
+    assert_eq!(state.preset_id, "builtin:male");
+    assert_eq!(
+        calls.lock().unwrap().as_slice(),
+        ["preset:builtin:male".to_owned()]
+    );
+}
+
+#[test]
+fn 未知预设返回失败且不改变当前状态() {
+    let shared = Arc::new(Shared::default());
+    let state = Arc::new(Mutex::new(TestVoiceState::new()));
+    shared.set_voice_route(test_voice_route(
+        state.clone(),
+        Arc::new(Mutex::new(Vec::new())),
+    ));
+    let server = start(shared);
+
+    let body = json_body(&get(server.port, "/voice/preset/missing")).to_owned();
+
+    assert!(body.contains("\"ok\":false"), "{body}");
+    assert!(body.contains("\"preset_id\":\"builtin:female\""), "{body}");
+    assert!(body.contains("\"preset_name\":\"女声\""), "{body}");
+    let state = state.lock().unwrap();
+    assert_eq!(state.preset_id, "builtin:female");
+    assert!(!state.enabled);
+}
+
+#[test]
+fn 用户预设名称在页面中转义() {
+    let shared = Arc::new(Shared::default());
+    let state = Arc::new(Mutex::new(TestVoiceState::new()));
+    {
+        let mut state = state.lock().unwrap();
+        state.preset_id = "user:test-abcdef".into();
+        state.preset_name = "我的<声>&\"引号".into();
+    }
+    shared.set_voice_route(test_voice_route(state, Arc::new(Mutex::new(Vec::new()))));
+    let server = start(shared);
+
+    let page = get(server.port, "/");
+
+    assert!(page.contains("我的&lt;声&gt;&amp;&quot;引号"), "{page}");
+    assert!(!page.contains("我的<声>"), "页面不能输出未转义的用户名称");
+}
+
+#[test]
+fn 退休会话的回复不覆盖新状态() {
+    let shared = Arc::new(Shared::default());
+    let old_state = Arc::new(Mutex::new(TestVoiceState::new()));
+    let old_for_state = old_state.clone();
+    let old_for_enable = old_state;
+    let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+    let (resume_tx, resume_rx) = mpsc::sync_channel(1);
+    let resume_rx = Mutex::new(resume_rx);
+    shared.set_voice_route(VoiceRoute {
+        state: Arc::new(move || {
+            old_for_state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .snapshot()
+        }),
+        set_enabled: Arc::new(move |enabled| {
+            entered_tx.send(()).unwrap();
+            resume_rx.lock().unwrap().recv().unwrap();
+            old_for_enable
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .enabled = enabled;
+            true
+        }),
+        select_preset: Arc::new(|_| true),
+    });
+    let server = start(shared.clone());
+    let port = server.port;
+    let request = std::thread::spawn(move || get(port, "/voice/enable/1"));
+    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    let mut new_state = TestVoiceState::new();
+    new_state.preset_name = "新会话".into();
+    let new_state = Arc::new(Mutex::new(new_state));
+    shared.set_voice_route(test_voice_route(
+        new_state.clone(),
+        Arc::new(Mutex::new(Vec::new())),
+    ));
+    resume_tx.send(()).unwrap();
+
+    let body = json_body(&request.join().unwrap()).to_owned();
+    assert!(body.contains("\"ok\":false"), "旧路由结果必须丢弃: {body}");
+    assert!(body.contains("\"preset_name\":\"新会话\""), "{body}");
+    assert!(body.contains("\"enabled\":false"), "{body}");
+    assert!(!new_state.lock().unwrap().enabled);
+}
+
+#[test]
+fn 清除路由后变声接口返回不可用() {
+    let shared = Arc::new(Shared::default());
+    let state = Arc::new(Mutex::new(TestVoiceState::new()));
+    shared.set_voice_route(test_voice_route(state, Arc::new(Mutex::new(Vec::new()))));
+    let server = start(shared.clone());
+    assert!(get(server.port, "/voice/status").contains("\"ok\":true"));
+
+    shared.clear_voice_route();
+    for path in [
+        "/voice/status",
+        "/voice/enable/1",
+        "/voice/preset/builtin:male",
+    ] {
+        let body = json_body(&get(server.port, path)).to_owned();
+        assert!(body.contains("\"ok\":false"), "{path}: {body}");
+        assert!(body.contains("音频未启动"), "{path}: {body}");
+    }
+    assert!(get(server.port, "/").contains("音频未启动"));
+
+    let state = Arc::new(Mutex::new(TestVoiceState::new()));
+    shared.set_voice_route(test_voice_route(state, Arc::new(Mutex::new(Vec::new()))));
+    shared.clear();
+    assert!(json_body(&get(server.port, "/voice/status"))
+        .to_owned()
+        .contains("\"ok\":false"));
 }
 
 #[test]
@@ -125,6 +406,125 @@ fn http_uses_unified_handlers_and_clear_then_set_restores_a_new_session() {
     assert_eq!(new_stops.load(Ordering::Relaxed), 1);
     assert_eq!(old_plays.load(Ordering::Relaxed), 1);
     assert_eq!(old_stops.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn 待机时停止请求不依赖播放控制即可到达宿主() {
+    let shared = Arc::new(Shared::default());
+    let stops = Arc::new(AtomicUsize::new(0));
+    let stop_count = stops.clone();
+    let stop: StopHandler = Arc::new(move || {
+        stop_count.fetch_add(1, Ordering::Relaxed);
+    });
+    shared.set_stop_handler(stop);
+    shared.set_voice_route(test_voice_route(
+        Arc::new(Mutex::new(TestVoiceState::new())),
+        Arc::new(Mutex::new(Vec::new())),
+    ));
+    let server = start(shared.clone());
+
+    let response = get(server.port, "/stop");
+    assert!(
+        response.contains("\"ok\":true") && response.contains("\"action\":\"stop_all\""),
+        "待机停止应成功并报告停止动作，实际 {response}"
+    );
+    assert_eq!(stops.load(Ordering::Relaxed), 1, "停止处理器必须被调用");
+    assert!(
+        shared.control.lock().unwrap().is_none(),
+        "待机停止不得重新发布播放控制"
+    );
+    assert!(!shared.play(0), "待机停止后不得通过回退控制启动播放");
+}
+
+/// 监听端是非阻塞的；BSD 系系统（含 macOS）上 accept 出来的连接会继承这个标志，
+/// 请求行稍晚到达就读到「暂时不可用」而被直接断开，客户端看到连接被重置。
+/// 手机经 Wi-Fi 发来的请求可能分几个报文到达，必须等待而不是立刻失败。
+#[test]
+fn 请求晚于连接到达时仍能得到完整响应() {
+    let shared = Arc::new(Shared::default());
+    let server = start(shared);
+
+    for delay_ms in [60u64, 150] {
+        let mut socket = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        // 先让服务端接受连接并开始读请求行，再发送请求。
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        // 请求分两段到达：请求行之后的头部更晚。
+        socket.write_all(b"GET /playback HTTP/1.1\r\n").unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        socket
+            .write_all(b"Host: localhost\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        socket
+            .read_to_string(&mut response)
+            .unwrap_or_else(|error| panic!("延迟 {delay_ms} ms 的请求被断开: {error}"));
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(json_body(&response), r#"{"available":false}"#);
+    }
+}
+
+#[test]
+fn 待机页轮询播放可用性且活动页不轮询() {
+    let parts = engine();
+    let shared = Arc::new(Shared::default());
+    shared.set_voice_route(test_voice_route(
+        Arc::new(Mutex::new(TestVoiceState::new())),
+        Arc::new(Mutex::new(Vec::new())),
+    ));
+    let server = start(shared.clone());
+
+    // 待机：没有播放控制，页面仍可操作变声，但没有音效按钮，需要自己发现播放恢复。
+    let standby = get(server.port, "/");
+    assert!(standby.contains("data-standby"), "待机页必须带待机标记");
+    assert!(standby.contains("音频待机"), "{standby}");
+    assert!(
+        standby.contains("pollPlayback"),
+        "待机页必须携带轮询播放可用性的脚本"
+    );
+    assert_eq!(
+        json_body(&get(server.port, "/playback")),
+        r#"{"available":false}"#
+    );
+
+    // 桌面恢复音效：同一个路由开始报告可用，待机页据此整页刷新。
+    shared.set(parts.control, vec!["tone".into()]);
+    assert_eq!(
+        json_body(&get(server.port, "/playback")),
+        r#"{"available":true}"#
+    );
+    let active = get(server.port, "/");
+    assert!(
+        !active.contains("data-standby"),
+        "活动页有音效按钮，不应轮询播放可用性"
+    );
+    assert!(active.contains("tone"));
+
+    // 再次待机：路由回到不可用。
+    shared.clear_playback();
+    assert_eq!(
+        json_body(&get(server.port, "/playback")),
+        r#"{"available":false}"#
+    );
+    assert!(get(server.port, "/").contains("data-standby"));
+}
+
+#[test]
+fn 未启动页保持两秒整页刷新() {
+    let shared = Arc::new(Shared::default());
+    let server = start(shared);
+    let page = get(server.port, "/");
+    assert!(page.contains("音频未启动"));
+    assert!(
+        page.contains("location.reload()") && page.contains("2000"),
+        "没有任何路由时仍按原行为每两秒刷新：{page}"
+    );
+    assert_eq!(
+        json_body(&get(server.port, "/playback")),
+        r#"{"available":false}"#
+    );
 }
 
 #[test]

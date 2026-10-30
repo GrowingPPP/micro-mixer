@@ -1,6 +1,6 @@
 //! # audio-core
 //!
-//! 平台无关的音频核心：设备抽象、混音引擎、重采样、限幅、解码。
+//! 平台无关的音频核心：设备抽象、混音引擎、重采样、限幅、解码与变声。
 //!
 //! 设计要点见 `docs/engineering/技术设计-音频架构与驱动.md`：
 //! - **纯环回架构** —— 驱动只做环回，混音全部在 App 内完成
@@ -13,6 +13,10 @@ pub mod device;
 pub mod engine;
 pub mod limiter;
 pub mod resample;
+pub mod voice;
+
+#[cfg(test)]
+mod test_support;
 
 pub use device::{AudioBackend, AudioStream, DeviceId, DeviceInfo, Direction, StreamFormat};
 pub use engine::{Command, EngineParts, EngineStats, PlaybackControl, SfxSlot, StatsSnapshot};

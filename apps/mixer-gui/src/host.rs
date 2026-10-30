@@ -24,7 +24,15 @@ use audio_core::device::{AudioBackend, DeviceId, StreamFormat};
 use audio_core::engine::{AtomicF32, EngineStats};
 use audio_core::limiter::Limiter;
 use backend_cpal::CpalBackend;
-use hotkeys::Hotkeys;
+use hotkeys::{HotkeyGroup, HotkeyGroups, HotkeyManager, Hotkeys};
+
+#[cfg(feature = "voice")]
+use crate::voice::{VoiceHotkeyAction, VoiceHotkeyOutcome, VoiceService, DEFAULT_VOICE_BLOCK_MS};
+use crate::voice::{VoiceParamsDto, VoicePresetDto, VoiceStartConfig, VoiceStatusDto};
+#[cfg(feature = "voice")]
+use audio_core::voice::{
+    PreviewError, VoiceControl, VoicePhase, VoicePreviewClip, VoicePreviewControl,
+};
 
 // ─────────────────────────────────────────── DTO
 
@@ -84,6 +92,10 @@ pub struct StartConfig {
     /// 手机遥控端口；None 表示不开启
     #[serde(default)]
     pub remote_port: Option<u16>,
+    /// 会话初始变声值；不参与启动指纹，缺省时沿用宿主当前配置。
+    #[serde(default, skip_serializing)]
+    #[cfg_attr(not(feature = "voice"), allow(dead_code))]
+    pub voice: Option<VoiceStartConfig>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -109,6 +121,9 @@ pub struct StatusDto {
     /// 送往虚拟麦克风的短时 RMS（dBFS）
     pub out_rms_db: f32,
     pub hotkeys_active: bool,
+    /// 人声效果热键的一次性提示；界面按代次只展示一次。
+    pub voice_notice: Option<String>,
+    pub voice_notice_generation: u64,
     pub last_error: Option<String>,
     pub uptime_secs: f32,
     pub remote_urls: Vec<String>,
@@ -128,6 +143,8 @@ pub struct StatusDto {
     ///
     /// `running=false, passthrough=true` = **待机**：对方仍听得到你说话，但音效不响应。
     pub passthrough: bool,
+    /// 变声状态；未编译变声后端时为 `None`。
+    pub voice: Option<VoiceStatusDto>,
 }
 
 impl StatusDto {
@@ -152,6 +169,8 @@ impl StatusDto {
             out_peak_db: -100.0,
             out_rms_db: -100.0,
             hotkeys_active: false,
+            voice_notice: None,
+            voice_notice_generation: 0,
             last_error: None,
             uptime_secs: 0.0,
             remote_urls: Vec::new(),
@@ -162,6 +181,7 @@ impl StatusDto {
             device_lost: None,
             last_panic: None,
             audio_stalled: None,
+            voice: None,
         }
     }
 }
@@ -190,6 +210,24 @@ pub fn scan_dir(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
+// ─────────────────────────────────────────── 配置写入
+
+/// 完整配置保存与变声持久化共用这一把进程内门，防止两者各自读到旧文件后
+/// 用整份快照互相覆盖。持门期间只做配置读写，不等待音频或界面线程。
+///
+/// 持门写入一律先用 `Config::load_for_write_from` 严格读取：无效 TOML、读取失败或
+/// 含被拒绝的变声条目时放弃写入并把错误交给界面，磁盘上的文件保持原样。
+static CONFIG_WRITE_GATE: Mutex<()> = Mutex::new(());
+
+pub(crate) fn with_config_write<T, E>(
+    action: impl FnOnce() -> std::result::Result<T, E>,
+) -> std::result::Result<T, E> {
+    let _guard = CONFIG_WRITE_GATE
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    action()
+}
+
 // ─────────────────────────────────────────── 宿主
 
 struct Running {
@@ -197,8 +235,6 @@ struct Running {
     session: Session,
     playback: Arc<Playback>,
     stats: Arc<EngineStats>,
-    shutdown: Arc<AtomicBool>,
-    hotkey_thread: Option<JoinHandle<()>>,
     slots_meta: Vec<SlotDto>,
     out_device: String,
     in_device: String,
@@ -207,8 +243,6 @@ struct Running {
     monitor_error: Mutex<Option<String>>,
     started_at: std::time::Instant,
     skipped_notes: Vec<String>,
-    hotkeys: Arc<Mutex<Option<Hotkeys>>>,
-    poller: Arc<Mutex<Option<hotkeys::HotkeyPoller>>>,
     cfg_key: String,
     cfg: StartConfig,
 }
@@ -365,6 +399,33 @@ pub fn install_panic_hook() {
     }));
 }
 
+/// 校准暂停的租约时长。界面的完整校准约 8 秒；租约只是界面失联时的兜底，
+/// 正常结束由 `voice_calibration_end` 解除。
+#[cfg(feature = "voice")]
+const CALIBRATION_VOICE_LEASE: Duration = Duration::from_secs(30);
+
+/// 人声热键提示按代次展示一次，避免 250 ms 轮询反复弹出。
+#[derive(Default)]
+pub(crate) struct VoiceNoticeState {
+    pub(crate) generation: u64,
+    pub(crate) message: Option<String>,
+}
+
+fn set_voice_notice(state: &Mutex<VoiceNoticeState>, message: impl Into<String>) {
+    let mut notice = state.lock().unwrap_or_else(|e| e.into_inner());
+    notice.generation = notice.generation.wrapping_add(1);
+    notice.message = Some(message.into());
+}
+
+fn clear_voice_notice(state: &Mutex<VoiceNoticeState>) {
+    let mut notice = state.lock().unwrap_or_else(|e| e.into_inner());
+    if notice.message.take().is_some() {
+        notice.generation = notice.generation.wrapping_add(1);
+    }
+}
+
+type SlotAction = Arc<dyn Fn(usize) -> bool + Send + Sync>;
+
 #[derive(Default)]
 pub struct AudioHost {
     quitting: AtomicBool,
@@ -377,6 +438,16 @@ pub struct AudioHost {
     gains: Mutex<HostGains>,
     next_generation: AtomicU64,
     last_error: Mutex<Option<String>>,
+    /// 人声热键的可见提示；独立于启动错误，界面按代次只展示一次。
+    voice_notice: Arc<Mutex<VoiceNoticeState>>,
+    /// 进程内唯一的平台热键管理器；音效与变声热键都用它绑定。
+    hotkey_manager: Arc<Mutex<Option<Arc<HotkeyManager>>>>,
+    /// 槽位随会话、变声随进程；由同一个轮询线程排水。
+    hotkeys: Arc<Mutex<HotkeyGroups>>,
+    /// 当前会话的槽位动作；待机或释放后清空，防止旧会话继续响应。
+    slot_action: Arc<Mutex<Option<SlotAction>>>,
+    hotkey_shutdown: Arc<AtomicBool>,
+    hotkey_thread: Mutex<Option<JoinHandle<()>>>,
     /// 试听代号：每次试听自增，旧的那次看到代号变了就自行停止。
     /// 用它避免连点多个音效时声音叠在一起。
     preview_gen: Arc<AtomicU64>,
@@ -397,7 +468,23 @@ pub struct AudioHost {
     ///
     /// 只在**第一次启动音频之前**记录：之后我们再改默认设备也不会污染这个基准。
     original_default_input: Mutex<Option<(u32, String)>>,
+    /// 变声状态与持久化；命令和状态轮询都从这里取快照。
+    #[cfg(feature = "voice")]
+    voice: VoiceService,
+    /// 当前会话的控制句柄；待机保留，释放时丢弃。
+    #[cfg(feature = "voice")]
+    voice_control: Mutex<Option<VoiceControl>>,
+    /// 试听准备/录制/回放的所有者线程；取消时由控制线程收尾。
+    #[cfg(feature = "voice")]
+    voice_preview_thread: Mutex<Option<JoinHandle<()>>>,
+    /// 回归测试注入试听回放实现，避免测试依赖真实输出设备。
+    #[cfg(all(test, feature = "voice"))]
+    voice_preview_player: Mutex<Option<VoicePreviewPlayer>>,
 }
+
+#[cfg(all(test, feature = "voice"))]
+type VoicePreviewPlayer =
+    Arc<dyn Fn(VoicePreviewClip, u64, Arc<AtomicU64>) -> Result<()> + Send + Sync>;
 
 /// Only request publication and session registration use this short gate. It is
 /// never retained while decoding, opening / closing streams or waiting on audio.
@@ -425,6 +512,15 @@ impl AudioRequestState {
     fn reserve_for_session(&self, playback: &Playback, generation: u64) -> Option<u64> {
         let _publication = self.gate.lock().unwrap_or_else(|e| e.into_inner());
         if self.generation.load(Ordering::Acquire) != generation || !playback.active() {
+            return None;
+        }
+        Some(self.current.fetch_add(1, Ordering::AcqRel) + 1)
+    }
+
+    /// 只校验会话代次，不要求播放活跃；待机停止仍需取消本机试听。
+    fn reserve_for_generation(&self, generation: u64) -> Option<u64> {
+        let _publication = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        if self.generation.load(Ordering::Acquire) != generation {
             return None;
         }
         Some(self.current.fetch_add(1, Ordering::AcqRel) + 1)
@@ -532,6 +628,15 @@ impl AudioHost {
     pub fn status(&self) -> StatusDto {
         let (preview_sound_id, preview_playing, preview_playhead_secs, preview_duration_secs) =
             self.preview_status();
+        let (voice_notice_generation, voice_notice) = {
+            let notice = self.voice_notice.lock().unwrap_or_else(|e| e.into_inner());
+            (notice.generation, notice.message.clone())
+        };
+        // 变声状态来自宿主的控制侧快照，不读取音频线程内部状态。
+        #[cfg(feature = "voice")]
+        let voice = Some(self.voice.status());
+        #[cfg(not(feature = "voice"))]
+        let voice: Option<VoiceStatusDto> = None;
         let guard = self.running.lock().unwrap_or_else(|e| e.into_inner());
         let Some(r) = guard.as_ref() else {
             let mut s = StatusDto::stopped();
@@ -559,6 +664,9 @@ impl AudioHost {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
+            s.voice_notice = voice_notice;
+            s.voice_notice_generation = voice_notice_generation;
+            s.voice = voice;
             return s;
         };
         let st = r.stats.snapshot();
@@ -590,11 +698,13 @@ impl AudioHost {
             limiter_db: st.limiter_gain_db,
             out_peak_db: st.out_peak_db,
             out_rms_db: st.out_rms_db,
-            hotkeys_active: r
+            hotkeys_active: self
                 .hotkeys
                 .lock()
-                .map(|h| h.as_ref().map(|x| x.is_bound()).unwrap_or(false))
+                .map(|groups| groups.slots_bound())
                 .unwrap_or(false),
+            voice_notice,
+            voice_notice_generation,
             last_error: self
                 .last_error
                 .lock()
@@ -621,6 +731,7 @@ impl AudioHost {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
+            voice,
         }
     }
 
@@ -696,6 +807,12 @@ impl AudioHost {
         if !self.prepare_start_gains(&mut cfg, ticket)? {
             return Ok(());
         }
+        // StartConfig 只提供本次会话的初始值；之后的重建都使用宿主最新状态。
+        #[cfg(feature = "voice")]
+        let voice_block_ms = match cfg.voice.take() {
+            Some(start) => self.voice.apply_start_config(&start)?,
+            None => DEFAULT_VOICE_BLOCK_MS,
+        };
         // 设备与音效列表都没变（典型情况：从「待机」点「开启音效」）→
         // **不重开音频流**，只把音效重新打开。瞬间生效，用户来回切毫无卡顿。
         if let Some(k) = self.running_cfg_key() {
@@ -709,6 +826,9 @@ impl AudioHost {
         //    这个泄漏被"停止=彻底关闭"的旧语义掩盖了很久，改待机后才暴露出来。
         self.release_inner();
         *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // 上一次“音频未启动”之类的提示在新一轮启动开始时失效；
+        // 本轮启动后段记录的冲突/绑定提示不能被发布动作清掉。
+        self.dismiss_voice_notice();
 
         let b = CpalBackend::new();
 
@@ -872,6 +992,10 @@ impl AudioHost {
             .find(|d| d.id == in_id && d.direction == audio_core::device::Direction::Input)
             .map(|d| d.name.clone())
             .unwrap_or_else(|| in_id.to_string());
+        #[cfg(feature = "voice")]
+        let voice_options = Some(self.voice.prepare_options(voice_block_ms)?);
+        #[cfg(not(feature = "voice"))]
+        let voice_options: Option<audio_session::VoiceOptions> = None;
         let session = Session::open(SessionOptions {
             input: in_id.clone(),
             output: out_id.clone(),
@@ -882,44 +1006,66 @@ impl AudioHost {
             mic_gain_db: cfg.mic_gain_db,
             sfx_gain_db: cfg.sfx_gain_db,
             monitor,
+            voice: voice_options,
         })?;
+        #[cfg(feature = "voice")]
+        let voice_control = session.voice_control();
+        #[cfg(feature = "voice")]
+        let voice_preview_control = session.voice_preview_control();
         let playback = session.playback.clone();
         let control = playback.control.clone();
         let stats = session.stats.clone();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let hotkeys = Arc::new(Mutex::new(None));
-        let poller = Arc::new(Mutex::new(None));
-        let filtered_specs: Vec<_> = slots_meta.iter().map(|s| s.hotkey.clone()).collect();
-        if filtered_specs.iter().any(|s| !s.is_empty()) {
-            match bind_hotkeys_on_main_thread(app, &filtered_specs) {
-                Ok((hk, how)) => {
-                    println!("[热键] 绑定成功（{how}）");
-                    *poller.lock().unwrap_or_else(|e| e.into_inner()) = Some(hk.poller());
-                    *hotkeys.lock().unwrap_or_else(|e| e.into_inner()) = Some(hk);
+        let slot_specs: Vec<_> = slots_meta.iter().map(|s| s.hotkey.clone()).collect();
+        #[cfg(feature = "voice")]
+        let voice_specs = self.voice.hotkey_specs();
+        #[cfg(not(feature = "voice"))]
+        let voice_specs: Vec<String> = Vec::new();
+        let has_slot_keys = slot_specs.iter().any(|spec| !spec.trim().is_empty());
+        let has_voice_keys = voice_specs.iter().any(|spec| !spec.trim().is_empty());
+        let voice_bound = self
+            .hotkeys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .voice_bound();
+        let disjoint_ok = if has_slot_keys || has_voice_keys {
+            match hotkeys::validate_disjoint(&[&slot_specs, &voice_specs]) {
+                Ok(()) => true,
+                Err(error) => {
+                    // 冲突不能阻止音频启动：变声热键常驻时让槽位退让，否则槽位优先。
+                    self.record_voice_notice(format!("热键冲突，未绑定：{error:#}"));
+                    false
                 }
-                Err(e) => println!("[热键] ❌ 绑定失败: {e:#}"),
+            }
+        } else {
+            true
+        };
+        let bind_slots = has_slot_keys && (disjoint_ok || !voice_bound);
+        let slot_hotkeys = if bind_slots {
+            match self.bind_hotkeys_on_main_thread(app, &slot_specs) {
+                Ok((hotkeys, how)) => {
+                    println!("[热键] 绑定成功（{how}）");
+                    Some(hotkeys)
+                }
+                Err(error) => {
+                    println!("[热键] ❌ 绑定失败: {error:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        self.install_slot_hotkeys(slot_hotkeys)?;
+        #[cfg(feature = "voice")]
+        if has_voice_keys && !voice_bound && disjoint_ok {
+            // 启动时通常已常驻绑定；这里只覆盖首次失败后的重试，不重复注册。
+            if let Err(error) = self.ensure_voice_hotkeys(app) {
+                self.record_voice_notice(format!("人声效果热键绑定失败：{error:#}"));
             }
         }
-        // Always keep a poll worker, even when the initial key registration fails.
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
-        let play = self.play_handler(playback.clone(), generation);
-        let sd = shutdown.clone();
-        let hks = poller.clone();
-        let hotkey_thread = Some(std::thread::Builder::new().name("hotkeys".into()).spawn(
-            move || {
-                while !sd.load(Ordering::Acquire) {
-                    let slot = hks
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .as_ref()
-                        .and_then(|h: &hotkeys::HotkeyPoller| h.poll());
-                    if let Some(slot) = slot {
-                        play(slot);
-                    }
-                    std::thread::sleep(Duration::from_millis(12));
-                }
-            },
-        )?);
+        *self.slot_action.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(self.play_handler(playback.clone(), generation));
+        self.ensure_hotkey_thread();
 
         // 手机遥控：作为热键失效时的兜底通路，随引擎一起待命
         match cfg.remote_port {
@@ -938,6 +1084,8 @@ impl AudioHost {
                             self.play_handler(playback.clone(), generation),
                             self.remote_stop_handler(playback.clone(), generation),
                         );
+                        #[cfg(feature = "voice")]
+                        sh.set_voice_route(self.voice.remote_route());
                     }
                     println!("[遥控] 已就绪: {}", urls.join("  "));
                     // 防火墙会拦住未签名程序的入站连接，手机就连不上 —— 直接给出放行命令
@@ -963,6 +1111,8 @@ impl AudioHost {
                     .unwrap_or_else(|e| e.into_inner())
                     .as_ref()
                 {
+                    #[cfg(feature = "voice")]
+                    self.voice.retire_remote_route();
                     sh.clear(); // 关掉开关后，手机端会显示"音频未启动"
                 }
             }
@@ -973,8 +1123,6 @@ impl AudioHost {
             session,
             playback,
             stats,
-            shutdown,
-            hotkey_thread,
             slots_meta,
             out_device: out_name,
             in_device: in_name,
@@ -983,23 +1131,39 @@ impl AudioHost {
             monitor_error: Mutex::new(None),
             started_at: std::time::Instant::now(),
             skipped_notes,
-            hotkeys,
-            poller,
             cfg_key: cfg_fingerprint(&cfg),
             cfg,
         };
-        if let Some(unpublished) = self.publish_running(running, ticket) {
-            if let Some(shared) = self
-                .remote
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-            {
-                shared.clear();
-            }
-            self.close_running(unpublished);
+        let unpublished = self.publish_running(running, ticket);
+        #[cfg(feature = "voice")]
+        if unpublished.is_none() {
+            // 只把已发布的会话句柄交给命令层；被拒绝的会话随后直接关闭。
+            self.attach_voice_control(voice_control);
+            self.attach_voice_preview(voice_preview_control);
+        }
+        if let Some(unpublished) = unpublished {
+            self.discard_unpublished_session(unpublished);
         }
         Ok(())
+    }
+
+    /// 被取代的启动从未发布，但它的槽位热键已装入宿主级集合，必须一并归还。
+    ///
+    /// 调用方持有生命周期锁，更新会话不可能在此时完成发布，因此不会误清
+    /// 已提交会话的热键。
+    fn discard_unpublished_session(&self, running: Running) {
+        if let Some(shared) = self
+            .remote
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            #[cfg(feature = "voice")]
+            self.voice.retire_remote_route();
+            shared.clear();
+        }
+        self.end_session_hotkeys();
+        self.close_running(running);
     }
 
     /// Commit ownership and its routable generation together. No reservation can
@@ -1042,6 +1206,8 @@ impl AudioHost {
                 .clone());
         }
         if let Some(shared) = g.as_ref() {
+            #[cfg(feature = "voice")]
+            self.voice.retire_remote_route();
             shared.clear();
         }
         *server = None;
@@ -1062,7 +1228,8 @@ impl AudioHost {
     /// 一旦连转发也断了，虚拟声卡里就是一片死寂（实测精确为 0），**对方会突然听不到他说话**。
     /// 所以「停止」的语义是「关掉音效」，不是「把我变成哑巴」。
     ///
-    /// 进入待机时会**注销热键** —— 否则 F1/F2 仍被我们截走，游戏里按这两个键毫无反应。
+    /// 进入待机时只注销**槽位热键** —— 否则 F1/F2 仍被我们截走，游戏里按这两个键毫无反应。
+    /// 人声效果热键继续保留，待机时仍可切换预设。
     pub fn stop(&self) {
         self.stop_requested(self.reserve_audio_request());
     }
@@ -1081,7 +1248,7 @@ impl AudioHost {
             return;
         }
         self.stop_preview_inner();
-        let handles = {
+        let groups = {
             let _admission = self
                 .preview_control
                 .lock()
@@ -1094,13 +1261,12 @@ impl AudioHost {
                 return;
             };
             r.playback.standby();
-            *r.poller.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            r.hotkeys.clone()
+            self.hotkeys.clone()
         };
-        if let Err(e) = self.with_hotkeys(handles, |h| {
-            h.as_mut().map(Hotkeys::unbind_all).transpose().map(|_| ())
-        }) {
-            self.record_error(format!("注销热键失败: {e:#}"));
+        *self.slot_action.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        // 待机只归还音效槽位按键；变声热键继续可用。
+        if let Err(error) = self.with_hotkey_groups(groups, |groups| groups.standby()) {
+            self.record_error(format!("注销热键失败: {error:#}"));
         }
         if let Some(sh) = self
             .remote
@@ -1108,7 +1274,11 @@ impl AudioHost {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
         {
-            sh.clear();
+            // 待机只关闭播放入口；停止处理器与变声路由保留，手机仍能停止
+            // 正在录制的人声试听、启用变声与切换预设，且不会重新启动音效。
+            sh.clear_playback();
+            #[cfg(feature = "voice")]
+            sh.set_voice_route(self.voice.remote_route());
         }
     }
 
@@ -1129,6 +1299,8 @@ impl AudioHost {
         if ticket.is_some_and(|t| !self.audio_request_is_current(t)) {
             return;
         }
+        #[cfg(feature = "voice")]
+        self.cancel_voice_preview_inner();
         self.stop_preview_inner();
         let admission = self
             .preview_control
@@ -1145,6 +1317,8 @@ impl AudioHost {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
         {
+            #[cfg(feature = "voice")]
+            self.voice.retire_remote_route();
             sh.clear();
         }
         let running = self
@@ -1153,50 +1327,56 @@ impl AudioHost {
             .unwrap_or_else(|e| e.into_inner())
             .take();
         self.audio_requests.register_session(0);
+        #[cfg(feature = "voice")]
+        if running.is_some() {
+            // 会话释放后旧句柄不能再影响新会话，下一次启动重新构建。
+            self.attach_voice_control(None);
+            self.attach_voice_preview(None);
+        }
         if let Some(r) = running {
             r.playback.standby();
             // A hotkey worker may be waiting for preview admission. Its captured
-            // playback is inactive before we release the lock and join it.
+            // playback is inactive before we release the lock.
             drop(admission);
+            self.end_session_hotkeys();
             self.close_running(r);
+        } else {
+            drop(admission);
+            self.end_session_hotkeys();
         }
     }
 
-    fn close_running(&self, mut running: Running) {
+    /// 会话释放只注销槽位热键；人声效果热键保留到进程退出。
+    fn end_session_hotkeys(&self) {
+        *self.slot_action.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        if let Err(error) =
+            self.with_hotkey_groups(self.hotkeys.clone(), |groups| groups.end_session())
+        {
+            self.record_error(format!("释放槽位热键失败: {error:#}"));
+        }
+    }
+
+    fn close_running(&self, running: Running) {
         running.playback.standby();
-        running.shutdown.store(true, Ordering::Release);
-        if let Some(thread) = running.hotkey_thread.take() {
-            let _ = thread.join();
-        }
-        if let Err(error) = self.with_hotkeys(running.hotkeys.clone(), |handle| {
-            if let Some(mut hotkeys) = handle.take() {
-                hotkeys.unbind_all()?;
-                drop(hotkeys);
-            }
-            Ok(())
-        }) {
-            self.record_error(format!("释放热键失败: {error:#}"));
-        }
         drop(running); // Session closes all streams on their owner thread.
     }
 
-    fn with_hotkeys<T: Send + 'static>(
+    fn with_hotkey_groups<T: Send + 'static>(
         &self,
-        handle: Arc<Mutex<Option<Hotkeys>>>,
-        action: impl FnOnce(&mut Option<Hotkeys>) -> Result<T> + Send + 'static,
+        handle: Arc<Mutex<HotkeyGroups>>,
+        action: impl FnOnce(&mut HotkeyGroups) -> Result<T> + Send + 'static,
     ) -> Result<T> {
-        if handle.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+        if !handle.lock().unwrap_or_else(|e| e.into_inner()).has_sets() {
             return action(&mut handle.lock().unwrap_or_else(|e| e.into_inner()));
         }
         if !cfg!(target_os = "macos") || hotkeys::is_main_thread() {
             return action(&mut handle.lock().unwrap_or_else(|e| e.into_inner()));
         }
-        let app = self
-            .app
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-            .context("热键操作需要主线程上下文")?;
+        let app = self.app.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let Some(app) = app else {
+            // 无 GUI 上下文（测试或 --smoke）：没有可调度的主线程，直接执行。
+            return action(&mut handle.lock().unwrap_or_else(|e| e.into_inner()));
+        };
         let (tx, rx) = mpsc::sync_channel(1);
         app.run_on_main_thread(move || {
             let result = action(&mut handle.lock().unwrap_or_else(|e| e.into_inner()));
@@ -1213,12 +1393,11 @@ impl AudioHost {
     }
 
     fn activate_inner(&self, app: Option<&tauri::AppHandle>) -> Result<()> {
-        let (handle, poller, playback, specs, names, remote_port, generation) = {
+        let (handle, playback, specs, names, remote_port, generation) = {
             let guard = self.running.lock().unwrap_or_else(|e| e.into_inner());
             let r = guard.as_ref().context("音频还没启动")?;
             (
-                r.hotkeys.clone(),
-                r.poller.clone(),
+                self.hotkeys.clone(),
                 r.playback.clone(),
                 r.slots_meta
                     .iter()
@@ -1232,27 +1411,32 @@ impl AudioHost {
                 r.generation,
             )
         };
-        if specs.iter().any(|s| !s.is_empty()) {
-            let has_manager = handle.lock().unwrap_or_else(|e| e.into_inner()).is_some();
-            let result = if has_manager {
-                self.with_hotkeys(handle.clone(), move |h| {
-                    h.as_mut().context("热键管理器已释放")?.rebind(&specs)
-                })
+        if specs.iter().any(|s| !s.trim().is_empty()) {
+            let has_slot_set = handle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .slot_hotkeys()
+                .is_some();
+            let result = if has_slot_set {
+                self.with_hotkey_groups(handle, move |groups| groups.rebind_slots(&specs))
             } else {
-                bind_hotkeys_on_main_thread(app, &specs)
-                    .map(|(h, _)| *handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(h))
+                self.bind_hotkeys_on_main_thread(app, &specs)
+                    .map(|(hotkeys, _)| {
+                        handle
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .set_slot_hotkeys(Some(hotkeys));
+                    })
             };
-            match result {
-                Ok(()) => {
-                    *poller.lock().unwrap_or_else(|e| e.into_inner()) = handle
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .as_ref()
-                        .map(|h| h.poller())
-                }
-                Err(e) => self.record_error(format!("恢复热键失败: {e:#}")),
+            if let Err(error) = result {
+                self.record_error(format!("恢复热键失败: {error:#}"));
             }
         }
+        *self.slot_action.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(self.play_handler(playback.clone(), generation));
+        self.ensure_hotkey_thread();
+        // 音频恢复后不再保留“音频未启动”等旧提示。
+        self.dismiss_voice_notice();
         if remote_port.is_some() {
             if let Some(sh) = self
                 .remote
@@ -1266,6 +1450,8 @@ impl AudioHost {
                     self.play_handler(playback.clone(), generation),
                     self.remote_stop_handler(playback.clone(), generation),
                 );
+                #[cfg(feature = "voice")]
+                sh.set_voice_route(self.voice.remote_route());
             }
         }
         playback.activate();
@@ -1279,6 +1465,9 @@ impl AudioHost {
         test: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
         let _operation = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        // 自检期间不使用人声；只叠加暂停层，不改配置。暂停层存在时会话重建保留临时旁路。
+        #[cfg(feature = "voice")]
+        self.voice.suspend();
         let saved = self
             .running
             .lock()
@@ -1287,14 +1476,26 @@ impl AudioHost {
             .map(|r| (r.cfg.clone(), r.playback.active()));
         self.release_inner();
         let result = test();
-        if let Some((cfg, active)) = saved {
-            if let Err(e) = self.start_inner(cfg, app) {
-                self.record_error(format!("自检后恢复音频失败: {e:#}"));
-                anyhow::bail!("自检已结束，但恢复音频失败: {e:#}");
+        let restore_error = if let Some((cfg, active)) = saved {
+            match self.start_inner(cfg, app) {
+                Ok(()) => {
+                    if !active {
+                        self.stop_inner();
+                    }
+                    None
+                }
+                Err(e) => {
+                    self.record_error(format!("自检后恢复音频失败: {e:#}"));
+                    Some(anyhow::anyhow!("自检已结束，但恢复音频失败: {e:#}"))
+                }
             }
-            if !active {
-                self.stop_inner();
-            }
+        } else {
+            None
+        };
+        #[cfg(feature = "voice")]
+        self.voice.restore();
+        if let Some(error) = restore_error {
+            return Err(error);
         }
         result
     }
@@ -1639,6 +1840,8 @@ impl AudioHost {
             return Ok(());
         }
         self.stop_preview_inner();
+        #[cfg(feature = "voice")]
+        self.cancel_voice_preview_inner();
         let _admission = self
             .preview_control
             .lock()
@@ -1661,22 +1864,31 @@ impl AudioHost {
         let preview_generation = self.preview_gen.clone();
         let controls = self.preview_control.clone();
         let requests = self.audio_requests.clone();
+        #[cfg(feature = "voice")]
+        let voice = self.voice.clone();
         Arc::new(move || {
+            // 手机停止也是全局停止：待机时 playback 已不活跃，但人声试听仍可用。
+            // 只取消仍属于当前会话的代次，且不在监听回调里 join 所有者线程。
+            #[cfg(feature = "voice")]
+            if requests.generation.load(Ordering::Acquire) == generation {
+                voice.preview_cancel();
+            }
             // A handler may already have been cloned when its session is released.
             // Only affect a preview associated with that exact session. Avoid
             // joining under a remote listener callback (listener shutdown could
             // otherwise wait on it). Serialize stop with preview/play submission.
-            let Some(ticket) = requests.reserve_for_session(&playback, generation) else {
+            // 待机时 playback 不活跃，但音效试听仍可能在本机播放，因此只按
+            // 会话代次校验，不能提前返回；播放本身仍只在活跃时停止。
+            let Some(ticket) = requests.reserve_for_generation(generation) else {
                 return;
             };
             let mut control = controls.lock().unwrap_or_else(|e| e.into_inner());
             if requests.current.load(Ordering::Acquire) != ticket {
                 return;
             }
-            if !playback.active()
-                || control
-                    .as_ref()
-                    .is_some_and(|c| c.session_generation != generation)
+            if control
+                .as_ref()
+                .is_some_and(|c| c.session_generation != generation)
             {
                 return;
             }
@@ -1684,7 +1896,9 @@ impl AudioHost {
                 preview_generation.fetch_add(1, Ordering::AcqRel);
                 *control = None;
             }
-            playback.stop_all();
+            if playback.active() {
+                playback.stop_all();
+            }
         })
     }
 
@@ -1896,6 +2110,10 @@ impl AudioHost {
             if !self.audio_request_is_current(ticket) {
                 return Ok(());
             }
+            // 取消人声试听与分配音效试听 token 必须在同一临界区，
+            // 否则新的人声试听可能夹在两次加锁之间启动，两个本机试听同时输出。
+            #[cfg(feature = "voice")]
+            self.cancel_voice_preview_inner();
             let (session_generation, playback) = self
                 .running
                 .lock()
@@ -2055,14 +2273,754 @@ impl AudioHost {
         }
     }
 
+    // ─────────────────────────────────────── 变声命令
+
+    /// 麦克风校准开始：人声路径回到原声，直到 [`voice_calibration_end`] 或租约到期。
+    ///
+    /// 校准读取送往虚拟麦克风的电平，变声启用时那是变声与路径限幅之后的信号，
+    /// 得到的增益会偏离真实人声。该层只读写变声状态，不取生命周期锁、不重建会话，
+    /// 因此可在界面线程上同步调用。
+    ///
+    /// [`voice_calibration_end`]: Self::voice_calibration_end
+    pub fn voice_calibration_begin(&self) {
+        #[cfg(feature = "voice")]
+        self.voice.begin_calibration(CALIBRATION_VOICE_LEASE);
+    }
+
+    /// 麦克风校准结束：解除暂停；没有在校准时无操作。
+    pub fn voice_calibration_end(&self) {
+        #[cfg(feature = "voice")]
+        self.voice.end_calibration();
+    }
+
+    pub fn voice_status(&self) -> VoiceStatusDto {
+        #[cfg(feature = "voice")]
+        {
+            // 命令取消后工作线程会自行退出；轮询顺手回收已结束的所有者。
+            self.reap_voice_preview_thread();
+            self.voice.status()
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            VoiceStatusDto::disabled()
+        }
+    }
+
+    #[cfg(feature = "voice")]
+    fn reap_voice_preview_thread(&self) {
+        let mut slot = self
+            .voice_preview_thread
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if slot.as_ref().is_some_and(JoinHandle::is_finished) {
+            if let Some(thread) = slot.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    pub fn voice_presets(&self) -> Vec<VoicePresetDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.presets()
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            Vec::new()
+        }
+    }
+
+    pub fn voice_set_enabled(&self, enabled: bool) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.set_enabled(enabled)
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            let _ = enabled;
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    pub fn voice_set_bypass(&self, bypass: bool) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.set_bypass(bypass)
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            let _ = bypass;
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    /// 按住对比原声；只改运行态，不写配置、不改用户旁路。
+    pub fn voice_set_ab_bypass(&self, active: bool) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.set_ab_bypass(active)
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            let _ = active;
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    pub fn voice_set_params(&self, params: VoiceParamsDto) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.set_params(params)
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            let _ = params;
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    pub fn voice_select_preset(&self, id: &str) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.select_preset(id)
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            let _ = id;
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    pub fn voice_save_as_user_preset(&self, name: &str) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.save_as_user_preset(name)
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            let _ = name;
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    pub fn voice_save_preset(&self) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.save_preset()
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    pub fn voice_rename_preset(&self, id: &str, name: &str) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.rename_preset(id, name)
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            let _ = (id, name);
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    pub fn voice_delete_preset(&self, id: &str) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.delete_preset(id)
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            let _ = id;
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    pub fn voice_restore_draft(&self) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice.restore_draft()
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    // ─────────────────────────────────────── 三秒人声试听
+
+    /// 开始三秒人声试听；与音效试听共用本机输出仲裁。
+    ///
+    /// 未启动或刚释放时以 `Unavailable` 报告原因，界面直接显示具体文案。
+    pub fn voice_preview_start(&self) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            self.voice_preview_start_inner()
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    /// 取消人声试听；第二次点击、预设切换与全局停止走同一清理路径。
+    pub fn voice_preview_stop(&self) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            let _operation = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            self.cancel_voice_preview_inner();
+            Ok(self.voice_status())
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    #[cfg(feature = "voice")]
+    fn voice_preview_start_inner(&self) -> Result<VoiceStatusDto> {
+        let _operation = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+        if self.is_quitting() {
+            self.voice.preview_unavailable_now("程序正在退出");
+            return Ok(self.voice_status());
+        }
+        let Some(preview) = self.voice.preview_control() else {
+            self.voice.preview_unavailable_now("音频未启动");
+            return Ok(self.voice_status());
+        };
+        let phase_control = self
+            .voice_control
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(phase_control) = phase_control else {
+            self.voice.preview_unavailable_now("音频未启动");
+            return Ok(self.voice_status());
+        };
+
+        // 本机输出互斥：音效试听及其输出线程必须先结束。
+        self.stop_preview_inner();
+        self.voice.preview_cancel();
+        let generation = self.voice.preview_begin();
+        let service = self.voice.clone();
+        let epoch = service.preview_epoch();
+
+        let mut slot = self
+            .voice_preview_thread
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(previous) = slot.take() {
+            let _ = previous.join();
+        }
+        #[cfg(test)]
+        let player = self
+            .voice_preview_player
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let job = VoicePreviewJob {
+            service,
+            preview,
+            phase_control,
+            generation,
+            epoch,
+            #[cfg(test)]
+            player,
+        };
+        match std::thread::Builder::new()
+            .name("voice-preview".into())
+            .spawn(move || run_voice_preview(job))
+        {
+            Ok(thread) => *slot = Some(thread),
+            Err(error) => {
+                self.voice
+                    .preview_unavailable(generation, format!("启动人声试听线程失败：{error}"));
+            }
+        }
+        drop(slot);
+        Ok(self.voice_status())
+    }
+
+    /// 取消录制或回放并等待所有者线程退出；记录区由试听句柄原子复位。
+    #[cfg(feature = "voice")]
+    fn cancel_voice_preview_inner(&self) {
+        self.voice.preview_cancel();
+        let thread = self
+            .voice_preview_thread
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(thread) = thread {
+            let _ = thread.join();
+        }
+    }
+
+    /// 程序启动后绑定配置里的人声效果热键，并启动唯一的轮询线程。
+    ///
+    /// 绑定失败不阻止程序启动；提示通过独立的人声提示字段交给界面。
+    pub fn initialize_hotkeys(&self, app: Option<&tauri::AppHandle>) -> Result<()> {
+        if let Some(app) = app {
+            *self.app.lock().unwrap_or_else(|e| e.into_inner()) = Some(app.clone());
+        }
+        self.ensure_hotkey_thread();
+        #[cfg(feature = "voice")]
+        {
+            if let Err(error) = self.ensure_voice_hotkeys(app) {
+                self.record_voice_notice(format!("人声效果热键绑定失败：{error:#}"));
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// 确保变声热键已绑定；已绑定时不重复注册。
+    #[cfg(feature = "voice")]
+    fn ensure_voice_hotkeys(&self, app: Option<&tauri::AppHandle>) -> Result<()> {
+        let specs = self.voice.hotkey_specs();
+        if !specs.iter().any(|spec| !spec.trim().is_empty()) {
+            return Ok(());
+        }
+        if self
+            .hotkeys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .voice_hotkeys()
+            .is_some()
+        {
+            return Ok(());
+        }
+        // 启动时槽位热键尚未绑定，但配置里的键位仍会与常驻的人声热键冲突。
+        let slot_specs = self.slot_hotkey_specs();
+        hotkeys::validate_disjoint(&[&slot_specs, &specs]).context("人声效果热键与音效热键冲突")?;
+        let (bound, how) = self.bind_hotkeys_on_main_thread(app, &specs)?;
+        println!("[人声热键] 绑定成功（{how}）");
+        self.install_voice_hotkeys(bound)?;
+        self.ensure_hotkey_thread();
+        Ok(())
+    }
+
+    /// 启动唯一的轮询线程；槽位与变声事件由同一个消费者排水。
+    fn ensure_hotkey_thread(&self) {
+        let mut handle = self.hotkey_thread.lock().unwrap_or_else(|e| e.into_inner());
+        if handle.is_some() {
+            return;
+        }
+        let shutdown = self.hotkey_shutdown.clone();
+        let groups = self.hotkeys.clone();
+        let slot_action = self.slot_action.clone();
+        let voice_action = self.voice_hotkey_handler();
+        match std::thread::Builder::new()
+            .name("hotkeys".into())
+            .spawn(move || {
+                while !shutdown.load(Ordering::Acquire) {
+                    let actions = groups
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .poll_actions();
+                    for (group, index) in actions {
+                        match group {
+                            HotkeyGroup::Slots => {
+                                let action = slot_action
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .clone();
+                                if let Some(action) = action {
+                                    action(index);
+                                }
+                            }
+                            HotkeyGroup::Voice => voice_action(index),
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(12));
+                }
+            }) {
+            Ok(thread) => *handle = Some(thread),
+            Err(error) => {
+                drop(handle);
+                self.record_voice_notice(format!("启动热键轮询线程失败：{error}"));
+            }
+        }
+    }
+
+    /// 进程退出前注销全部热键并 join 轮询线程；可重复调用。
+    pub fn shutdown_hotkeys(&self) {
+        self.hotkey_shutdown.store(true, Ordering::Release);
+        if let Some(thread) = self
+            .hotkey_thread
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = thread.join();
+        }
+        *self.slot_action.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let groups = self.hotkeys.clone();
+        if let Err(error) = self.with_hotkey_groups(groups.clone(), |groups| groups.shutdown()) {
+            // 应用退出时主线程调度可能已不可用；直接注销比留下系统热键更安全。
+            log::warn!("主线程注销热键失败，改为直接注销: {error:#}");
+            if let Err(error) = groups.lock().unwrap_or_else(|e| e.into_inner()).shutdown() {
+                self.record_error(format!("释放热键失败: {error:#}"));
+            }
+        }
+    }
+
+    fn install_slot_hotkeys(&self, hotkeys: Option<Hotkeys>) -> Result<()> {
+        self.with_hotkey_groups(self.hotkeys.clone(), move |groups| {
+            groups.set_slot_hotkeys(hotkeys);
+            Ok(())
+        })
+    }
+
+    #[cfg(feature = "voice")]
+    fn install_voice_hotkeys(&self, hotkeys: Hotkeys) -> Result<()> {
+        self.with_hotkey_groups(self.hotkeys.clone(), move |groups| {
+            groups.set_voice_hotkeys(Some(hotkeys));
+            Ok(())
+        })
+    }
+
+    fn record_voice_notice(&self, message: impl Into<String>) {
+        set_voice_notice(&self.voice_notice, message);
+    }
+
+    fn dismiss_voice_notice(&self) {
+        clear_voice_notice(&self.voice_notice);
+    }
+
+    /// 保存三个人声效果热键并立即重绑；与音频会话无关。
+    ///
+    /// 先校验跨组冲突再落盘；重绑失败保留旧绑定并把错误返回界面。
+    pub fn voice_set_hotkeys(
+        &self,
+        bypass: &str,
+        next: &str,
+        prev: &str,
+    ) -> Result<VoiceStatusDto> {
+        #[cfg(feature = "voice")]
+        {
+            let _operation = self.lifecycle.lock().unwrap_or_else(|e| e.into_inner());
+            let voice_specs = vec![
+                bypass.trim().to_owned(),
+                next.trim().to_owned(),
+                prev.trim().to_owned(),
+            ];
+            let slot_specs = self.slot_hotkey_specs();
+            hotkeys::validate_disjoint(&[&slot_specs, &voice_specs])?;
+            // 先保存用户选择；系统级冲突导致重绑失败时，旧绑定仍然有效。
+            self.voice
+                .save_hotkeys(&voice_specs[0], &voice_specs[1], &voice_specs[2])?;
+            let has_voice_set = self
+                .hotkeys
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .voice_hotkeys()
+                .is_some();
+            if !voice_specs.iter().any(|spec| !spec.trim().is_empty()) {
+                if has_voice_set {
+                    self.with_hotkey_groups(self.hotkeys.clone(), |groups| groups.clear_voice())
+                        .context("注销人声效果热键失败")?;
+                }
+                self.dismiss_voice_notice();
+                return Ok(self.voice.status());
+            }
+            if has_voice_set {
+                self.with_hotkey_groups(self.hotkeys.clone(), move |groups| {
+                    groups.rebind_voice(&voice_specs)
+                })
+                .context("人声效果热键重绑失败，原热键仍然有效")?;
+            } else {
+                let app = self.app.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let (bound, _) = self.bind_hotkeys_on_main_thread(app.as_ref(), &voice_specs)?;
+                self.install_voice_hotkeys(bound)?;
+            }
+            self.ensure_hotkey_thread();
+            self.dismiss_voice_notice();
+            Ok(self.voice.status())
+        }
+        #[cfg(not(feature = "voice"))]
+        {
+            let _ = (bypass, next, prev);
+            anyhow::bail!("当前构建未启用变声")
+        }
+    }
+
+    /// 当前生效的音效槽位热键；无会话时读取配置里的持久列表。
+    #[cfg(feature = "voice")]
+    fn slot_hotkey_specs(&self) -> Vec<String> {
+        let running_specs = self
+            .running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|running| {
+                running
+                    .slots_meta
+                    .iter()
+                    .map(|slot| slot.hotkey.clone())
+                    .collect::<Vec<_>>()
+            });
+        if let Some(specs) = running_specs {
+            return specs;
+        }
+        // 只读用途：配置异常时仍按能读出的槽位热键校验，真正的写入由 `save_hotkeys` 严格拒绝。
+        app_config::Config::load_from(self.voice.config_path())
+            .sound_entries()
+            .into_iter()
+            .map(|entry| entry.hotkey)
+            .collect()
+    }
+
+    /// 在需要时把绑定动作调度到主线程，并复用宿主唯一的管理器。
+    fn bind_hotkeys_on_main_thread(
+        &self,
+        app: Option<&tauri::AppHandle>,
+        keys: &[String],
+    ) -> Result<(Hotkeys, &'static str)> {
+        bind_hotkeys_with_manager(app, &self.hotkey_manager, keys)
+    }
+
+    /// 未编译变声后端时没有人声效果热键；保留空处理器让轮询线程结构一致。
+    #[cfg(not(feature = "voice"))]
+    fn voice_hotkey_handler(&self) -> Arc<dyn Fn(usize) + Send + Sync> {
+        Arc::new(|_| {})
+    }
+
+    /// 热键线程的事件入口：只调用宿主控制路径，不接触音频回调。
+    ///
+    /// 事件每次读取当前会话代次；0 表示无会话。变声热键跨会话常驻，
+    /// 因此不需要捕获旧代次。
+    #[cfg(feature = "voice")]
+    fn voice_hotkey_handler(&self) -> Arc<dyn Fn(usize) + Send + Sync> {
+        let voice = self.voice.clone();
+        let requests = self.audio_requests.clone();
+        let notice_state = self.voice_notice.clone();
+        Arc::new(move |index| {
+            let action = match index {
+                0 => VoiceHotkeyAction::ToggleBypass,
+                1 => VoiceHotkeyAction::NextPreset,
+                2 => VoiceHotkeyAction::PrevPreset,
+                _ => return,
+            };
+            let generation = requests.generation.load(Ordering::Acquire);
+            match route_voice_hotkey(&voice, generation, action) {
+                Ok(outcome) => {
+                    if let Some(message) = outcome.notice {
+                        set_voice_notice(&notice_state, message);
+                    } else if outcome.acted {
+                        // 动作已生效，之前“音频未启动/变声未开启”的提示不再成立。
+                        clear_voice_notice(&notice_state);
+                    }
+                }
+                Err(error) => {
+                    set_voice_notice(&notice_state, format!("人声效果热键执行失败：{error:#}"));
+                }
+            }
+        })
+    }
+
+    #[cfg(feature = "voice")]
+    fn attach_voice_control(&self, control: Option<VoiceControl>) {
+        let mut slot = self.voice_control.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::mem::replace(&mut *slot, control.clone());
+        drop(previous);
+        drop(slot);
+
+        match control {
+            Some(control) => self.voice.attach(control),
+            None => self.voice.detach(),
+        }
+    }
+
+    /// 发布或释放本会话的试听记录句柄；旧试听立即失效。
+    #[cfg(feature = "voice")]
+    fn attach_voice_preview(&self, control: Option<VoicePreviewControl>) {
+        self.voice.attach_preview(control);
+    }
+
     pub fn record_error(&self, e: impl Into<String>) {
         *self.last_error.lock().unwrap_or_else(|x| x.into_inner()) = Some(e.into());
     }
 }
 
+/// 试听线程所需的全部句柄；音频回调不接触这些状态。
+#[cfg(feature = "voice")]
+struct VoicePreviewJob {
+    service: VoiceService,
+    preview: VoicePreviewControl,
+    phase_control: VoiceControl,
+    generation: u64,
+    epoch: Arc<AtomicU64>,
+    #[cfg(test)]
+    player: Option<VoicePreviewPlayer>,
+}
+
+/// 在控制线程完成准备、录制与回放；任何阶段都按代次丢弃旧结果。
+#[cfg(feature = "voice")]
+fn run_voice_preview(job: VoicePreviewJob) {
+    let VoicePreviewJob {
+        service,
+        preview,
+        phase_control,
+        generation,
+        epoch,
+        #[cfg(test)]
+        player,
+    } = job;
+
+    // 预热与淡出阶段不能写记录区；阶段稳定后自动开始，超时明确失败。
+    let prepare_deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let start = loop {
+        if epoch.load(Ordering::Acquire) != generation {
+            return;
+        }
+        match preview.start() {
+            Ok(start) => break start,
+            Err(PreviewError::Busy) => {
+                if std::time::Instant::now() >= prepare_deadline {
+                    service.preview_unavailable(generation, "变声阶段未稳定，试听已取消");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(PreviewError::AlreadyActive) => {
+                preview.stop();
+                if std::time::Instant::now() >= prepare_deadline {
+                    service.preview_unavailable(generation, "变声阶段未稳定，试听已取消");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(PreviewError::Unavailable) => {
+                service.preview_unavailable(generation, "试听记录区不可用");
+                return;
+            }
+        }
+    };
+    if epoch.load(Ordering::Acquire) != generation {
+        // 取消与启动竞争时立即归还记录区，避免留下无人取走的录制。
+        preview.stop();
+        return;
+    }
+    service.preview_mark_recording(generation);
+
+    let expected_phase = match start.source {
+        audio_core::voice::VoicePreviewSource::Capture => VoicePhase::Off,
+        audio_core::voice::VoicePreviewSource::Render => VoicePhase::Wet,
+    };
+    // 记录区固定三秒；允许半秒的设备回调与轮询余量。
+    let record_deadline = std::time::Instant::now() + Duration::from_millis(3_500);
+    let clip = loop {
+        if epoch.load(Ordering::Acquire) != generation {
+            return;
+        }
+        if preview.is_finished() {
+            match preview.take() {
+                Some(clip) => break clip,
+                None => {
+                    service.preview_unavailable(generation, "没有录到人声，试听已取消");
+                    return;
+                }
+            }
+        }
+        if phase_control.phase() != expected_phase {
+            preview.stop();
+            service.preview_unavailable(generation, "变声阶段已变化，试听已取消");
+            return;
+        }
+        if std::time::Instant::now() >= record_deadline {
+            preview.stop();
+            service.preview_unavailable(generation, "没有录到人声，试听已取消");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    if clip.samples.is_empty() {
+        service.preview_unavailable(generation, "没有录到人声，试听已取消");
+        return;
+    }
+    if epoch.load(Ordering::Acquire) != generation {
+        return;
+    }
+
+    service.preview_mark_playing(generation);
+    #[cfg(test)]
+    let result = match player {
+        Some(player) => player(clip, generation, epoch),
+        None => play_voice_clip(clip, generation, epoch),
+    };
+    #[cfg(not(test))]
+    let result = play_voice_clip(clip, generation, epoch);
+    match result {
+        Ok(()) => service.preview_finish(generation),
+        Err(error) => {
+            service.preview_unavailable(generation, format!("试听输出失败：{error:#}"));
+        }
+    }
+}
+
+/// 试听回放只走本机默认输出；采样率不同时复用现有试听重采样规则。
+#[cfg(feature = "voice")]
+fn play_voice_clip(clip: VoicePreviewClip, generation: u64, epoch: Arc<AtomicU64>) -> Result<()> {
+    anyhow::ensure!(!clip.samples.is_empty(), "没有录到人声，试听已取消");
+    let backend = CpalBackend::new();
+    let device = backend
+        .default_output()
+        .context("系统没有默认输出设备（试听需要它）")?;
+    let format = backend.output_format(&device, Some(StreamFormat::new(48_000, 2)))?;
+    let stereo: Vec<f32> = clip
+        .samples
+        .iter()
+        .flat_map(|sample| [*sample, *sample])
+        .collect();
+    let samples = if clip.sample_rate == format.sample_rate {
+        stereo
+    } else {
+        audio_session::resample_stereo(&stereo, clip.sample_rate, format.sample_rate)
+    };
+    anyhow::ensure!(!samples.is_empty(), "没有录到人声，试听已取消");
+    let audio = Arc::new(PreviewAudioState {
+        gain: AtomicF32::new(1.0),
+        total_gain: Arc::new(AtomicF32::new(1.0)),
+        drained_frames: AtomicU64::new(0),
+        rendered_frames: AtomicU64::new(0),
+        total_frames: AtomicU64::new(0),
+        sample_rate: AtomicU32::new(0),
+        finished: AtomicBool::new(false),
+        previous_playback: None,
+        #[cfg(test)]
+        owner_observed_source_end: Mutex::new(None),
+    });
+    play_samples_with_limit(
+        backend,
+        Arc::new(samples),
+        device,
+        format,
+        audio,
+        generation,
+        epoch,
+        preview_limit_for(clip.post_limiter),
+    )
+}
+
+/// 把一次热键事件路由到当前的变声状态。
+///
+/// 代次为 0 表示没有音频会话：预设热键仍更新待用参数，旁路热键只提示，
+/// 不会建立旁路或启动音频。
+#[cfg(feature = "voice")]
+pub(crate) fn route_voice_hotkey(
+    voice: &VoiceService,
+    session_generation: u64,
+    action: VoiceHotkeyAction,
+) -> Result<VoiceHotkeyOutcome> {
+    voice.handle_hotkey(action, session_generation != 0)
+}
+
 impl Drop for AudioHost {
     fn drop(&mut self) {
         self.release_inner();
+        self.shutdown_hotkeys();
     }
 }
 
@@ -2121,40 +3079,74 @@ pub fn request_mic_permission() {
 
 // ─────────────────────────────────────────── 热键绑定
 
-/// 在**主线程**上绑定热键并在需要时取回结果。
+/// 取得宿主唯一的平台管理器；没有时在**主线程**创建并缓存。
 ///
 /// macOS 的 Carbon 热键要求管理器在主线程创建，而 Tauri 的命令处理器不保证
-/// 跑在主线程，所以这里显式调度过去再等结果回来。
-fn bind_hotkeys_on_main_thread(
+/// 跑在主线程，所以创建动作必须调度过去。创建之后的绑定可以复用同一句柄。
+fn acquire_hotkey_manager(slot: &Mutex<Option<Arc<HotkeyManager>>>) -> Result<Arc<HotkeyManager>> {
+    if let Some(manager) = slot.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        return Ok(manager);
+    }
+    let created = Arc::new(Hotkeys::new_manager()?);
+    let mut guard = slot.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(guard.get_or_insert(created).clone())
+}
+
+/// 在**主线程**上创建/复用管理器并绑定热键，必要时取回结果。
+fn bind_hotkeys_with_manager(
     app: Option<&tauri::AppHandle>,
+    manager_slot: &Arc<Mutex<Option<Arc<HotkeyManager>>>>,
     keys: &[String],
 ) -> Result<(Hotkeys, &'static str)> {
     if hotkeys::is_main_thread() {
-        return Ok((Hotkeys::bind_to_slots(keys)?, "调用方本来就在主线程"));
+        let manager = acquire_hotkey_manager(manager_slot)?;
+        return Ok((Hotkeys::bind_with(manager, keys)?, "调用方本来就在主线程"));
     }
     let Some(app) = app else {
         // 无 GUI 场景（--smoke）：直接绑，让 new_manager 给出明确报错
-        return Ok((Hotkeys::bind_to_slots(keys)?, "无 GUI 上下文"));
+        let manager = acquire_hotkey_manager(manager_slot)?;
+        return Ok((Hotkeys::bind_with(manager, keys)?, "无 GUI 上下文"));
     };
 
     let (tx, rx) = mpsc::channel();
     let keys: Vec<String> = keys.to_vec();
+    let manager_slot = manager_slot.clone();
     app.run_on_main_thread(move || {
-        let _ = tx.send(Hotkeys::bind_to_slots(&keys));
+        let result = acquire_hotkey_manager(&manager_slot)
+            .and_then(|manager| Hotkeys::bind_with(manager, &keys));
+        let _ = tx.send(result);
     })
     .context("把热键绑定调度到主线程失败")?;
 
-    let hk = rx
+    let hotkeys = rx
         .recv_timeout(Duration::from_secs(6))
         .map_err(|_| anyhow::anyhow!("在主线程绑定热键超时（6 秒）"))??;
-    Ok((hk, "已调度到主线程"))
+    Ok((hotkeys, "已调度到主线程"))
 }
 
 // ─────────────────────────────────────────── 试听
 
+/// 试听回放的限幅模式。
+#[derive(Clone, Copy)]
+enum PreviewLimit {
+    /// 片段已通过正式人声路径限幅，不再重复限幅。
+    #[cfg_attr(not(feature = "voice"), allow(dead_code))]
+    None,
+    Ceiling(f32),
+}
+
+#[cfg(feature = "voice")]
+fn preview_limit_for(post_limiter: bool) -> PreviewLimit {
+    if post_limiter {
+        PreviewLimit::None
+    } else {
+        PreviewLimit::Ceiling(-3.0)
+    }
+}
+
 struct PreviewRender {
     cursor: audio_session::SampleCursor,
-    limiter: Limiter,
+    limiter: Option<Limiter>,
 }
 
 struct PreviewCursor(Arc<Mutex<Option<PreviewRender>>>);
@@ -2175,6 +3167,30 @@ fn play_samples(
     my_gen: u64,
     gen: Arc<AtomicU64>,
 ) -> Result<()> {
+    play_samples_with_limit(
+        backend,
+        samples_owned,
+        device,
+        fmt,
+        audio,
+        my_gen,
+        gen,
+        PreviewLimit::Ceiling(-1.0),
+    )
+}
+
+// 回放参数与现有 play_samples 一致，仅额外携带限幅模式；拆结构体会让调用点更长。
+#[allow(clippy::too_many_arguments)]
+fn play_samples_with_limit(
+    backend: impl AudioBackend,
+    samples_owned: Arc<Vec<f32>>,
+    device: DeviceId,
+    fmt: StreamFormat,
+    audio: Arc<PreviewAudioState>,
+    my_gen: u64,
+    gen: Arc<AtomicU64>,
+    limit: PreviewLimit,
+) -> Result<()> {
     if gen.load(Ordering::Acquire) != my_gen {
         return Ok(());
     }
@@ -2184,8 +3200,19 @@ fn play_samples(
     audio
         .total_frames
         .store(total_frames as u64, Ordering::Release);
-    let limiter = Limiter::with_channels(fmt.sample_rate, 2);
-    let latency_frames = limiter.latency_frames() as u64;
+    let limiter = match limit {
+        PreviewLimit::None => None,
+        PreviewLimit::Ceiling(ceiling_db) => Some(Limiter::new_with_channels(
+            fmt.sample_rate,
+            2,
+            ceiling_db,
+            2.0,
+            80.0,
+        )),
+    };
+    let latency_frames = limiter
+        .as_ref()
+        .map_or(0, |limiter| limiter.latency_frames()) as u64;
     let cursor = PreviewCursor(Arc::new(Mutex::new(Some(PreviewRender {
         cursor: audio_session::SampleCursor::new(samples_owned, 0.0),
         limiter,
@@ -2223,7 +3250,9 @@ fn play_samples(
                         render.cursor.render(&mut stereo, 2);
                         stereo[0] *= gain;
                         stereo[1] *= gain;
-                        render.limiter.process_in_place(&mut stereo);
+                        if let Some(limiter) = render.limiter.as_mut() {
+                            limiter.process_in_place(&mut stereo);
+                        }
                         let mono = (stereo[0] + stereo[1]) * 0.5;
                         frame.fill(mono);
                         if frame.len() > 1 {
