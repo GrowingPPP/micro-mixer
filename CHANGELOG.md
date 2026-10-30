@@ -8,6 +8,44 @@
 
 ---
 
+## [0.1.0] — 2026-10-30
+
+首个完整发布：在核心混音闭环上加入变声器、人声延迟指标与按住听原声，
+并建立 Windows NSIS / macOS 通用 DMG 的 tag 发布流程。
+
+### 功能
+
+- 变声器：Signalsmith Stretch 变调/共振峰、噪声门、三段 EQ、软限幅、环形调制、
+  对讲机效果；六个内置预设与用户预设。
+- 人声延迟/处理耗时/溢出/缺口指标；按住听原声 A/B 旁路，与用户旁路和待机互不覆盖。
+- 变声热键、3 秒试听、手机遥控变声卡片、CLI `voice.*` 配置与 `--voice-preset/--voice-off`。
+- 变声与音效混音共用最终安全限幅，但各自独立限幅；麦克风转发不依赖音效播放状态。
+
+### 构建与发布
+
+- macOS 发布包改为通用二进制（arm64 + x86_64），`MIXER_TARGET=universal-apple-darwin`
+  选择 target；ad-hoc 签名也携带 `audio-input` entitlement。
+- 新增 Windows NSIS 打包 workflow，可在 Windows 原生宿主手动构建，也可由 release 复用。
+- `vMAJOR.MINOR.PATCH` tag 触发 release workflow：校验版本/Cargo 锁/master 历史，
+  构建 DMG 与 NSIS，合并 checksum，创建 draft release；不自动发布。
+- 发布资产使用 ASCII 名称；`SHA256SUMS.txt` 可直接校验。
+
+### 修复
+
+- Windows clippy 将仅在 macOS 使用的 `original_default_input` 判为死代码。
+- npm 锁文件的下载地址原先指向内网 registry，GitHub Actions 的 `npm ci` 超时；
+  改为公共 registry，并增加回归。
+- 无证书 macOS 构建的 ad-hoc 签名缺少 `audio-input`，DMG 校验会失败。
+
+### 验收边界
+
+- Windows NSIS 与双端质量门禁已在 GitHub Actions 通过；Windows 真机安装、WASAPI、
+  VB-CABLE 环回与 10 分钟浸泡仍需逐项记录。
+- macOS 通用 DMG 已在本机签名构建并通过挂载校验；Intel 真机与听感未验证。
+- 真机验收未关闭，首个 release 保持 draft，人工验收后发布。
+
+---
+
 ## [0.1.0-m1] — 2026-10-11
 
 **M1「核心闭环」完成**：导入音频 → 按热键播放 → 真实麦克风与音效实时混音 →
