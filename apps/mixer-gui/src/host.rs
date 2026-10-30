@@ -467,6 +467,7 @@ pub struct AudioHost {
     /// 程序启动时的系统默认输入设备 —— 「切回真实麦克风」要还原成它。
     ///
     /// 只在**第一次启动音频之前**记录：之后我们再改默认设备也不会污染这个基准。
+    #[cfg(target_os = "macos")]
     original_default_input: Mutex<Option<(u32, String)>>,
     /// 变声状态与持久化；命令和状态轮询都从这里取快照。
     #[cfg(feature = "voice")]
