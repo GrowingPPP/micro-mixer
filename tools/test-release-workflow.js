@@ -45,6 +45,18 @@ test('release is draft-only and manual runs never publish', () => {
   assert.ok(release.includes('gh release edit "$TAG" --notes-file release-body.md'));
 });
 
+test('package-lock resolved URLs use the public npm registry', () => {
+  const lock = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
+  const urls = Object.values(lock.packages || {})
+    .map((pkg) => pkg.resolved)
+    .filter(Boolean);
+  assert.ok(urls.length > 0, 'package-lock 必须包含已解析的下载地址');
+  for (const url of urls) {
+    assert.match(url, /^https:\/\/registry\.npmjs\.org\//,
+      `CI 无法访问内网 npm registry：${url}`);
+  }
+});
+
 test('Windows package workflow is callable and produces a checksummed installer', () => {
   assert.match(windows, /workflow_dispatch:/);
   assert.match(windows, /workflow_call:/);
